@@ -10,11 +10,11 @@
 #include <cstdint>
 #include <unordered_map>
 #include <mutex>
+#include <libspaznet/platform_io.hpp>
 
 namespace spaznet {
 
 // Forward declarations
-class PlatformIO;
 struct Task;
 
 // Coroutine task handle
@@ -31,7 +31,20 @@ struct TaskPromise {
     }
     
     auto final_suspend() noexcept {
-        return std::suspend_always{};
+        struct FinalAwaiter {
+            std::coroutine_handle<> continuation;
+            
+            bool await_ready() const noexcept { return false; }
+            
+            void await_suspend(std::coroutine_handle<TaskPromise> h) noexcept {
+                if (h.promise().continuation) {
+                    h.promise().continuation.resume();
+                }
+            }
+            
+            void await_resume() noexcept {}
+        };
+        return FinalAwaiter{};
     }
     
     void unhandled_exception() {
@@ -44,6 +57,8 @@ struct TaskPromise {
 struct Task {
     using promise_type = TaskPromise;
     std::coroutine_handle<TaskPromise> handle;
+    
+    Task() : handle{} {}
     
     Task(std::coroutine_handle<TaskPromise> h) : handle(h) {}
     
@@ -81,6 +96,29 @@ struct Task {
     
     bool done() const {
         return !handle || handle.done();
+    }
+    
+    // Make Task awaitable
+    bool await_ready() const noexcept {
+        if (!handle) return true;
+        if (handle.done()) return true;
+        return false;
+    }
+    
+    void await_suspend(std::coroutine_handle<> continuation) const noexcept {
+        if (handle && !handle.done()) {
+            // Store continuation in promise
+            handle.promise().continuation = continuation;
+            // Resume the task
+            handle.resume();
+        } else {
+            // Task already done, resume immediately
+            continuation.resume();
+        }
+    }
+    
+    void await_resume() const noexcept {
+        // Nothing to return for void tasks
     }
 };
 

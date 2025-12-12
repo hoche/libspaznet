@@ -7,6 +7,9 @@
 
 namespace spaznet {
 
+// Forward declaration
+class Socket;
+
 struct UDPPacket {
     std::vector<uint8_t> data;
     std::string address;

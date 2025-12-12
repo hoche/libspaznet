@@ -34,8 +34,8 @@ Task Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
         Socket* socket;
         std::vector<uint8_t>* buffer;
         std::size_t size;
-        ssize_t result = 0;
-        bool ready = false;
+        mutable ssize_t result = 0;
+        mutable bool ready = false;
         
         bool await_ready() const noexcept { 
             // Try to read immediately
@@ -83,9 +83,9 @@ Task Socket::async_write(const std::vector<uint8_t>& data) {
     struct WriteAwaiter {
         Socket* socket;
         const std::vector<uint8_t>* data;
-        std::size_t offset = 0;
-        ssize_t result = 0;
-        bool ready = false;
+        mutable std::size_t offset = 0;
+        mutable ssize_t result = 0;
+        mutable bool ready = false;
         
         bool await_ready() const noexcept { 
             // Try to write immediately

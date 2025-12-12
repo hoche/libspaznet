@@ -2,10 +2,6 @@
 
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/platform_io.hpp>
-#include <libspaznet/udp_handler.hpp>
-#include <libspaznet/http_handler.hpp>
-#include <libspaznet/http2_handler.hpp>
-#include <libspaznet/websocket_handler.hpp>
 #include <memory>
 #include <functional>
 #include <string>
@@ -16,6 +12,12 @@
 #include <coroutine>
 
 namespace spaznet {
+
+// Forward declarations
+class UDPHandler;
+class HTTPHandler;
+class HTTP2Handler;
+class WebSocketHandler;
 
 // Socket wrapper
 class Socket {
@@ -37,6 +39,16 @@ public:
     
     void close();
 };
+
+} // namespace spaznet
+
+// Include handlers after Socket is defined
+#include <libspaznet/udp_handler.hpp>
+#include <libspaznet/http_handler.hpp>
+#include <libspaznet/http2_handler.hpp>
+#include <libspaznet/websocket_handler.hpp>
+
+namespace spaznet {
 
 // Server class
 class Server {

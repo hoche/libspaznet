@@ -8,6 +8,9 @@
 
 namespace spaznet {
 
+// Forward declaration
+class Socket;
+
 struct HTTPRequest {
     std::string method;
     std::string path;

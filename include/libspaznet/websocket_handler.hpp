@@ -7,6 +7,9 @@
 
 namespace spaznet {
 
+// Forward declaration
+class Socket;
+
 enum class WebSocketOpcode : uint8_t {
     Continuation = 0x0,
     Text = 0x1,

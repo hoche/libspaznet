@@ -8,6 +8,9 @@
 
 namespace spaznet {
 
+// Forward declaration
+class Socket;
+
 struct HTTP2Frame {
     uint32_t length;
     uint8_t type;
