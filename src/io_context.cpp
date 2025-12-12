@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <chrono>
+#include <limits>
 #include <iostream>
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/platform_io.hpp>
@@ -31,7 +33,11 @@ void IOContext::run() {
     events.reserve(64);
 
     while (running_.load(std::memory_order_acquire)) {
-        int num_events = platform_io_->wait(events, 100); // 100ms timeout
+        // Process timers that are already due before waiting on I/O
+        process_timers();
+
+        int timeout_ms = compute_wait_timeout_ms();
+        int num_events = platform_io_->wait(events, timeout_ms);
 
         if (num_events < 0) {
             // Error occurred
@@ -40,6 +46,9 @@ void IOContext::run() {
 
         // Process I/O events
         process_io_events(events);
+
+        // Process timers that became due while handling events
+        process_timers();
 
         // Steal work from queues if needed
         for (auto& queue : thread_queues_) {
@@ -183,6 +192,94 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
         auto task_handle = std::coroutine_handle<TaskPromise>::from_address(handle.address());
         schedule(Task{task_handle});
     }
+}
+
+uint64_t IOContext::add_timer(std::chrono::steady_clock::time_point first_fire,
+                              std::chrono::steady_clock::nanoseconds interval,
+                              bool repeat,
+                              std::coroutine_handle<> handle) {
+    uint64_t id = next_timer_id_.fetch_add(1, std::memory_order_relaxed);
+    // Prevent zero-length repeating intervals from spinning
+    if (repeat && interval.count() <= 0) {
+        interval = std::chrono::milliseconds(1);
+    }
+    std::lock_guard<std::mutex> lock(timer_mutex_);
+    timers_.push(TimerEntry{id, first_fire, interval, repeat, handle});
+    return id;
+}
+
+void IOContext::cancel_timer(uint64_t timer_id) {
+    std::lock_guard<std::mutex> lock(timer_mutex_);
+    cancelled_timers_[timer_id] = true;
+}
+
+void IOContext::process_timers() {
+    using namespace std::chrono;
+    auto now = steady_clock::now();
+    std::vector<std::coroutine_handle<>> ready;
+
+    {
+        std::lock_guard<std::mutex> lock(timer_mutex_);
+
+        while (!timers_.empty()) {
+            TimerEntry entry = timers_.top();
+            auto cancelled = cancelled_timers_.find(entry.id);
+            if (cancelled != cancelled_timers_.end()) {
+                timers_.pop();
+                cancelled_timers_.erase(cancelled);
+                continue;
+            }
+
+            if (entry.next_fire > now) {
+                break; // Earliest timer not ready
+            }
+
+            timers_.pop();
+
+            ready.push_back(entry.handle);
+
+            if (entry.repeat) {
+                // Maintain consistent period regardless of processing delay
+                do {
+                    entry.next_fire += entry.interval;
+                } while (entry.next_fire <= now);
+                timers_.push(entry);
+            }
+        }
+    }
+
+    for (auto handle : ready) {
+        auto task_handle = std::coroutine_handle<TaskPromise>::from_address(handle.address());
+        schedule(Task{task_handle});
+    }
+}
+
+int IOContext::compute_wait_timeout_ms() {
+    using namespace std::chrono;
+    std::lock_guard<std::mutex> lock(timer_mutex_);
+
+    while (!timers_.empty()) {
+        auto top = timers_.top();
+        auto cancelled = cancelled_timers_.find(top.id);
+        if (cancelled != cancelled_timers_.end()) {
+            timers_.pop();
+            cancelled_timers_.erase(cancelled);
+            continue;
+        }
+
+        auto now = steady_clock::now();
+        auto next_fire = top.next_fire;
+
+        if (next_fire <= now) {
+            return 0;
+        }
+
+        auto diff = duration_cast<milliseconds>(next_fire - now);
+        auto clamped = std::min<int64_t>(diff.count(), std::numeric_limits<int>::max());
+        return static_cast<int>(clamped);
+    }
+
+    return 100; // Default timeout when no timers are pending
 }
 
 } // namespace spaznet

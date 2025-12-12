@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <coroutine>
 #include <cstdint>
 #include <functional>
@@ -191,6 +192,26 @@ class IOContext {
     std::atomic<std::size_t> next_queue_;
     std::size_t num_threads_;
 
+    // Timer management
+    struct TimerEntry {
+        uint64_t id;
+        std::chrono::steady_clock::time_point next_fire;
+        std::chrono::steady_clock::nanoseconds interval;
+        bool repeat;
+        std::coroutine_handle<> handle;
+    };
+
+    struct TimerCompare {
+        bool operator()(const TimerEntry& lhs, const TimerEntry& rhs) const {
+            return lhs.next_fire > rhs.next_fire; // Min-heap by next fire
+        }
+    };
+
+    std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerCompare> timers_;
+    std::unordered_map<uint64_t, bool> cancelled_timers_;
+    std::mutex timer_mutex_;
+    std::atomic<uint64_t> next_timer_id_{1};
+
     // Map from file descriptor to pending coroutine handles
     // Handles stored as raw addresses for atomic access
     struct PendingIO {
@@ -204,6 +225,12 @@ class IOContext {
 
     void worker_thread(std::size_t queue_index);
     void process_io_events(const std::vector<PlatformIO::Event>& events);
+    void process_timers();
+    int compute_wait_timeout_ms();
+    uint64_t add_timer(std::chrono::steady_clock::time_point first_fire,
+                       std::chrono::steady_clock::nanoseconds interval,
+                       bool repeat,
+                       std::coroutine_handle<> handle);
 
   public:
     explicit IOContext(std::size_t num_threads = std::thread::hardware_concurrency());
@@ -223,6 +250,46 @@ class IOContext {
 
     // Remove I/O registration for a file descriptor
     void remove_io(int fd);
+
+    // Cancel a scheduled timer
+    void cancel_timer(uint64_t timer_id);
+
+    // Awaitables for timers
+    struct TimerAwaiter {
+        IOContext* context;
+        std::chrono::steady_clock::time_point next_fire;
+        std::chrono::steady_clock::nanoseconds interval;
+        bool repeat;
+        uint64_t id{0};
+
+        bool await_ready() const noexcept {
+            return false;
+        }
+
+        void await_suspend(std::coroutine_handle<> h) {
+            id = context->add_timer(next_fire, interval, repeat, h);
+        }
+
+        void await_resume() const noexcept {}
+    };
+
+    TimerAwaiter sleep_for(std::chrono::steady_clock::duration delay) {
+        auto now = std::chrono::steady_clock::now();
+        return TimerAwaiter{this, now + delay, delay, false};
+    }
+
+    TimerAwaiter sleep_until(std::chrono::steady_clock::time_point time_point) {
+        auto delay = std::chrono::steady_clock::duration::zero();
+        if (time_point > std::chrono::steady_clock::now()) {
+            delay = time_point - std::chrono::steady_clock::now();
+        }
+        return TimerAwaiter{this, std::chrono::steady_clock::now() + delay, delay, false};
+    }
+
+    TimerAwaiter interval(std::chrono::steady_clock::duration period) {
+        auto now = std::chrono::steady_clock::now();
+        return TimerAwaiter{this, now + period, period, true};
+    }
 
     // Get platform I/O interface
     PlatformIO& platform_io() {

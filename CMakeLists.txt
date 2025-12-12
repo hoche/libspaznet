@@ -105,6 +105,7 @@ add_executable(test_unit
     tests/unit/test_task_queue.cpp
     tests/unit/test_platform_io.cpp
     tests/unit/test_io_context.cpp
+    tests/unit/test_timer.cpp
     tests/unit/test_http_handler.cpp
     tests/unit/test_websocket_handler.cpp
     tests/unit/test_http2_handler.cpp
