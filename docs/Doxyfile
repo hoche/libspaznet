@@ -35,3 +35,4 @@ JAVADOC_AUTOBRIEF      = YES
 TAB_SIZE               = 4
 EXTRACT_PRIVATE        = NO
 EXTRACT_STATIC         = YES
+

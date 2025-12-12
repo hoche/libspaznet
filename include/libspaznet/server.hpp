@@ -19,6 +19,8 @@ class UDPHandler;
 class HTTPHandler;
 class HTTP2Handler;
 class WebSocketHandler;
+class QUICHandler;
+class HTTP3Handler;
 
 // Socket wrapper
 class Socket {
@@ -81,7 +83,9 @@ class Socket {
 
 // Include handlers after Socket is defined
 #include <libspaznet/handlers/http2_handler.hpp>
+#include <libspaznet/handlers/http3_handler.hpp>
 #include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/handlers/quic_handler.hpp>
 #include <libspaznet/handlers/udp_handler.hpp>
 #include <libspaznet/handlers/websocket_handler.hpp>
 
@@ -95,6 +99,8 @@ class Server {
     std::unique_ptr<HTTPHandler> http_handler_;
     std::unique_ptr<HTTP2Handler> http2_handler_;
     std::unique_ptr<WebSocketHandler> websocket_handler_;
+    std::unique_ptr<QUICHandler> quic_handler_;
+    std::unique_ptr<HTTP3Handler> http3_handler_;
 
     std::unordered_map<int, std::coroutine_handle<>> socket_handles_;
     std::vector<std::thread> accept_threads_;
@@ -117,6 +123,8 @@ class Server {
     void set_http_handler(std::unique_ptr<HTTPHandler> handler);
     void set_http2_handler(std::unique_ptr<HTTP2Handler> handler);
     void set_websocket_handler(std::unique_ptr<WebSocketHandler> handler);
+    void set_quic_handler(std::unique_ptr<QUICHandler> handler);
+    void set_http3_handler(std::unique_ptr<HTTP3Handler> handler);
 
     // Run the server
     void run();
