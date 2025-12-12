@@ -16,4 +16,3 @@ class NumberUtils {
 };
 
 } // namespace spaznet
-

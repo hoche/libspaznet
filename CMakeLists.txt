@@ -146,6 +146,7 @@ add_executable(test_performance
     tests/performance/test_iperf_integration.cpp
     tests/performance/test_rfc9112_performance.cpp
     tests/performance/test_rfc9113_performance.cpp
+    tests/performance/test_websocket_rfc6455_performance.cpp
 )
 
 target_link_libraries(test_performance

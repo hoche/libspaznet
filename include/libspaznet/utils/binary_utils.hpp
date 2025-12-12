@@ -19,4 +19,3 @@ class BinaryUtils {
 };
 
 } // namespace spaznet
-

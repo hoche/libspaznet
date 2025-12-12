@@ -10,9 +10,7 @@ class HeaderUtils {
   public:
     // Case-insensitive header lookup for HTTP/1.x
     static std::optional<std::string> get_header_case_insensitive(
-        const std::unordered_map<std::string, std::string>& headers,
-        const std::string& name);
+        const std::unordered_map<std::string, std::string>& headers, const std::string& name);
 };
 
 } // namespace spaznet
-

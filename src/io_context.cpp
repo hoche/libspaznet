@@ -1,9 +1,9 @@
 #include <algorithm>
 #include <chrono>
-#include <limits>
 #include <iostream>
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/platform_io.hpp>
+#include <limits>
 
 namespace spaznet {
 
@@ -195,8 +195,7 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
 }
 
 uint64_t IOContext::add_timer(std::chrono::steady_clock::time_point first_fire,
-                              std::chrono::steady_clock::nanoseconds interval,
-                              bool repeat,
+                              std::chrono::steady_clock::nanoseconds interval, bool repeat,
                               std::coroutine_handle<> handle) {
     uint64_t id = next_timer_id_.fetch_add(1, std::memory_order_relaxed);
     // Prevent zero-length repeating intervals from spinning

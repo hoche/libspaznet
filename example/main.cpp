@@ -1,8 +1,8 @@
 #include <iostream>
 #include <libspaznet/handlers/http_handler.hpp>
-#include <libspaznet/server.hpp>
 #include <libspaznet/handlers/udp_handler.hpp>
 #include <libspaznet/handlers/websocket_handler.hpp>
+#include <libspaznet/server.hpp>
 #include <string>
 
 // Example HTTP handler
@@ -11,7 +11,8 @@ class ExampleHTTPHandler : public spaznet::HTTPHandler {
     spaznet::Task handle_request(const spaznet::HTTPRequest& request,
                                  spaznet::HTTPResponse& response,
                                  spaznet::Socket& socket) override {
-        std::cout << "HTTP Request: " << request.method << " " << request.request_target << std::endl;
+        std::cout << "HTTP Request: " << request.method << " " << request.request_target
+                  << std::endl;
 
         response.status_code = 200;
         response.reason_phrase = "OK";

@@ -1,6 +1,6 @@
 # Concurrency, Coroutines, and Event Loop
 
-This document explains how `libspaznet` schedules work, how coroutines move between threads, and why coroutine-native handlers cannot be mixed with ad-hoc lambdas. Examples target GitHub Markdown with Mermaid diagrams.
+This document explains how `libspaznet` schedules work, how coroutines move between threads, and why coroutine-native handlers cannot be mixed with ad-hoc lambdas.
 
 ## Core Execution Model
 

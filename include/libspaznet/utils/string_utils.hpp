@@ -14,4 +14,3 @@ class StringUtils {
 };
 
 } // namespace spaznet
-

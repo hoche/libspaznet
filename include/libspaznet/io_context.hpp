@@ -228,8 +228,7 @@ class IOContext {
     void process_timers();
     int compute_wait_timeout_ms();
     uint64_t add_timer(std::chrono::steady_clock::time_point first_fire,
-                       std::chrono::steady_clock::nanoseconds interval,
-                       bool repeat,
+                       std::chrono::steady_clock::nanoseconds interval, bool repeat,
                        std::coroutine_handle<> handle);
 
   public:

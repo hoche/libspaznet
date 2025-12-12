@@ -25,4 +25,3 @@ std::string StringUtils::trim_ows(const std::string& input) {
 }
 
 } // namespace spaznet
-

@@ -87,7 +87,7 @@ TEST(HTTPRequestTest, RequestStructure) {
     HTTPRequest request;
     request.method = "GET";
     request.request_target = "/test";
-    request.version = "1.1";  // Version is just "1.1", not "HTTP/1.1"
+    request.version = "1.1"; // Version is just "1.1", not "HTTP/1.1"
     request.headers["Host"] = "example.com";
     request.headers["User-Agent"] = "test-agent";
     request.body = {'d', 'a', 't', 'a'};

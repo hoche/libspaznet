@@ -160,3 +160,22 @@ TEST(WebSocketFrameTest, ContinuationFrame) {
     EXPECT_FALSE(parsed.fin);
     EXPECT_EQ(parsed.opcode, WebSocketOpcode::Continuation);
 }
+
+TEST(WebSocketFrameTest, SerializeAndParse64BitLength) {
+    WebSocketFrame frame;
+    frame.fin = true;
+    frame.rsv1 = frame.rsv2 = frame.rsv3 = false;
+    frame.opcode = WebSocketOpcode::Binary;
+    frame.masked = false;
+    frame.payload.resize(70000, 0xAA);
+    frame.payload_length = frame.payload.size();
+
+    auto serialized = frame.serialize();
+    EXPECT_EQ(serialized[1] & 0x7F, 127); // Uses 64-bit length path
+
+    auto parsed = WebSocketFrame::parse(serialized);
+    EXPECT_EQ(parsed.payload_length, frame.payload_length);
+    EXPECT_EQ(parsed.payload.size(), frame.payload.size());
+    EXPECT_EQ(parsed.payload.front(), 0xAA);
+    EXPECT_EQ(parsed.payload.back(), 0xAA);
+}

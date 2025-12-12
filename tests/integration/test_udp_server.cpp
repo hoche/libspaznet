@@ -1,8 +1,8 @@
 #include <gtest/gtest.h>
 #include <atomic>
 #include <chrono>
-#include <libspaznet/server.hpp>
 #include <libspaznet/handlers/udp_handler.hpp>
+#include <libspaznet/server.hpp>
 #include <string>
 #include <thread>
 #include <vector>

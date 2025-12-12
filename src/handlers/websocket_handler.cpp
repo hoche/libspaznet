@@ -122,4 +122,3 @@ WebSocketFrame WebSocketFrame::parse(const std::vector<uint8_t>& data) {
 }
 
 } // namespace spaznet
-

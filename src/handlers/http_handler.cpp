@@ -63,35 +63,35 @@ void HTTPResponse::set_chunked() {
 
 std::vector<uint8_t> HTTPResponse::serialize() const {
     std::ostringstream oss;
-    
+
     // Status line per RFC 9112 Section 6.1
     oss << "HTTP/" << version << " " << status_code << " " << reason_phrase << "\r\n";
-    
+
     // Headers per RFC 9112 Section 6.3
     for (const auto& [key, value] : headers) {
         // Field name must be a token
         oss << key << ": " << value << "\r\n";
     }
-    
+
     // Empty line separates headers from body
     oss << "\r\n";
-    
+
     std::string header_str = oss.str();
     std::vector<uint8_t> result;
     result.reserve(header_str.size() + body.size());
-    
+
     result.insert(result.end(), header_str.begin(), header_str.end());
     result.insert(result.end(), body.begin(), body.end());
-    
+
     return result;
 }
 
 std::vector<uint8_t> HTTPResponse::serialize_chunked() const {
     std::ostringstream oss;
-    
+
     // Status line
     oss << "HTTP/" << version << " " << status_code << " " << reason_phrase << "\r\n";
-    
+
     // Headers (ensure Transfer-Encoding: chunked is set)
     bool has_transfer_encoding = false;
     for (const auto& [key, value] : headers) {
@@ -103,15 +103,15 @@ std::vector<uint8_t> HTTPResponse::serialize_chunked() const {
     if (!has_transfer_encoding) {
         oss << "Transfer-Encoding: chunked\r\n";
     }
-    
+
     oss << "\r\n";
-    
+
     std::string header_str = oss.str();
     std::vector<uint8_t> result;
     result.reserve(header_str.size() + body.size() * 1.1); // Estimate for chunk overhead
-    
+
     result.insert(result.end(), header_str.begin(), header_str.end());
-    
+
     // Chunked encoding per RFC 9112 Section 7.1
     if (!body.empty()) {
         // Write chunk size in hex
@@ -119,15 +119,15 @@ std::vector<uint8_t> HTTPResponse::serialize_chunked() const {
         chunk_header << std::hex << body.size() << "\r\n";
         std::string chunk_hdr = chunk_header.str();
         result.insert(result.end(), chunk_hdr.begin(), chunk_hdr.end());
-        
+
         // Write chunk data
         result.insert(result.end(), body.begin(), body.end());
         result.insert(result.end(), {'\r', '\n'});
     }
-    
+
     // Final chunk (size 0)
     result.insert(result.end(), {'0', '\r', '\n', '\r', '\n'});
-    
+
     return result;
 }
 
@@ -137,9 +137,9 @@ bool HTTPParser::is_token_char(char c) {
     // token = 1*tchar
     // tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
     //         "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
-    return std::isalnum(c) || c == '!' || c == '#' || c == '$' || c == '%' ||
-           c == '&' || c == '\'' || c == '*' || c == '+' || c == '-' ||
-           c == '.' || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+    return std::isalnum(c) || c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
+           c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' ||
+           c == '`' || c == '|' || c == '~';
 }
 
 bool HTTPParser::is_field_vchar(char c) {
@@ -151,60 +151,64 @@ bool HTTPParser::is_field_vchar(char c) {
     return c >= 0x21 && c <= 0x7E;
 }
 
-std::string HTTPParser::to_lower(const std::string& str) { return StringUtils::to_lower(str); }
+std::string HTTPParser::to_lower(const std::string& str) {
+    return StringUtils::to_lower(str);
+}
 
-std::string HTTPParser::trim_ows(const std::string& str) { return StringUtils::trim_ows(str); }
+std::string HTTPParser::trim_ows(const std::string& str) {
+    return StringUtils::trim_ows(str);
+}
 
 bool HTTPParser::parse_request_line(const std::string& line, HTTPRequest& request) {
     // Request line per RFC 9112 Section 3.1.1
     // request-line = method SP request-target SP HTTP-version CRLF
-    
+
     size_t first_space = line.find(' ');
     if (first_space == std::string::npos) {
         return false;
     }
-    
+
     request.method = line.substr(0, first_space);
-    
+
     // Validate method is a token
     for (char c : request.method) {
         if (!is_token_char(c)) {
             return false;
         }
     }
-    
+
     size_t second_space = line.find(' ', first_space + 1);
     if (second_space == std::string::npos) {
         return false;
     }
-    
+
     request.request_target = line.substr(first_space + 1, second_space - first_space - 1);
-    
+
     size_t version_start = second_space + 1;
     if (line.substr(version_start, 5) != "HTTP/") {
         return false;
     }
-    
+
     request.version = line.substr(version_start + 5);
-    
+
     return true;
 }
 
 bool HTTPParser::parse_status_line(const std::string& line, HTTPResponse& response) {
     // Status line per RFC 9112 Section 6.1
     // status-line = HTTP-version SP status-code SP [ reason-phrase ] CRLF
-    
+
     if (line.substr(0, 5) != "HTTP/") {
         return false;
     }
-    
+
     size_t first_space = line.find(' ', 5);
     if (first_space == std::string::npos) {
         return false;
     }
-    
+
     response.version = line.substr(5, first_space - 5);
-    
+
     size_t second_space = line.find(' ', first_space + 1);
     if (second_space == std::string::npos) {
         // No reason phrase
@@ -215,14 +219,15 @@ bool HTTPParser::parse_status_line(const std::string& line, HTTPResponse& respon
             return false;
         }
     } else {
-        auto status_opt = NumberUtils::parse_int(line.substr(first_space + 1, second_space - first_space - 1));
+        auto status_opt =
+            NumberUtils::parse_int(line.substr(first_space + 1, second_space - first_space - 1));
         if (!status_opt) {
             return false;
         }
         response.status_code = *status_opt;
         response.reason_phrase = line.substr(second_space + 1);
     }
-    
+
     return true;
 }
 
@@ -230,39 +235,38 @@ bool HTTPParser::parse_header_field(const std::string& line,
                                     std::unordered_map<std::string, std::string>& headers) {
     // Header field per RFC 9112 Section 5.5
     // header-field = field-name ":" OWS field-value OWS
-    
+
     size_t colon = line.find(':');
     if (colon == std::string::npos || colon == 0) {
         return false;
     }
-    
+
     std::string field_name = line.substr(0, colon);
     std::string field_value = line.substr(colon + 1);
-    
+
     // Trim OWS from field name
     field_name = trim_ows(field_name);
-    
+
     // Validate field name is a token
     for (char c : field_name) {
         if (!is_token_char(c)) {
             return false;
         }
     }
-    
+
     // Trim OWS from field value (and handle obs-fold)
     field_value = trim_ows(field_value);
-    
+
     // Store header (preserve original case for field name, but allow case-insensitive lookup)
     headers[field_name] = field_value;
-    
+
     return true;
 }
 
 HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& buffer,
-                                                    HTTPRequest& request,
-                                                    size_t& bytes_consumed) {
+                                                  HTTPRequest& request, size_t& bytes_consumed) {
     bytes_consumed = 0;
-    
+
     // Find end of headers (CRLF CRLF)
     size_t header_end = 0;
     bool found_crlf = false;
@@ -279,47 +283,47 @@ HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& bu
             found_crlf = false;
         }
     }
-    
+
     if (header_end == 0) {
         return ParseResult::Incomplete;
     }
-    
+
     // Parse request line and headers
     std::string request_str(buffer.begin(), buffer.begin() + header_end);
     std::istringstream iss(request_str);
     std::string line;
-    
+
     // Parse request line
     if (!std::getline(iss, line)) {
         return ParseResult::Error;
     }
-    
+
     // Remove trailing CR
     if (!line.empty() && line.back() == '\r') {
         line.pop_back();
     }
-    
+
     if (!parse_request_line(line, request)) {
         return ParseResult::Error;
     }
-    
+
     // Parse headers
     while (std::getline(iss, line)) {
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
         }
-        
+
         if (line.empty()) {
             break; // End of headers
         }
-        
+
         if (!parse_header_field(line, request.headers)) {
             return ParseResult::Error;
         }
     }
-    
+
     bytes_consumed = header_end;
-    
+
     // Parse body if present
     auto content_length = request.get_content_length();
     if (content_length) {
@@ -327,30 +331,27 @@ HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& bu
         if (buffer.size() < header_end + body_size) {
             return ParseResult::Incomplete;
         }
-        request.body.assign(buffer.begin() + header_end,
-                           buffer.begin() + header_end + body_size);
+        request.body.assign(buffer.begin() + header_end, buffer.begin() + header_end + body_size);
         bytes_consumed += body_size;
     } else if (request.is_chunked()) {
         // Parse chunked body
         size_t chunk_bytes = 0;
-        ParseResult chunk_result = parse_chunked_body(
-            std::vector<uint8_t>(buffer.begin() + header_end, buffer.end()),
-            request.body,
-            chunk_bytes);
+        ParseResult chunk_result =
+            parse_chunked_body(std::vector<uint8_t>(buffer.begin() + header_end, buffer.end()),
+                               request.body, chunk_bytes);
         if (chunk_result != ParseResult::Success) {
             return chunk_result;
         }
         bytes_consumed += chunk_bytes;
     }
-    
+
     return ParseResult::Success;
 }
 
 HTTPParser::ParseResult HTTPParser::parse_response(const std::vector<uint8_t>& buffer,
-                                                    HTTPResponse& response,
-                                                    size_t& bytes_consumed) {
+                                                   HTTPResponse& response, size_t& bytes_consumed) {
     bytes_consumed = 0;
-    
+
     // Find end of headers
     size_t header_end = 0;
     bool found_crlf = false;
@@ -366,46 +367,46 @@ HTTPParser::ParseResult HTTPParser::parse_response(const std::vector<uint8_t>& b
             found_crlf = false;
         }
     }
-    
+
     if (header_end == 0) {
         return ParseResult::Incomplete;
     }
-    
+
     // Parse status line and headers
     std::string response_str(buffer.begin(), buffer.begin() + header_end);
     std::istringstream iss(response_str);
     std::string line;
-    
+
     // Parse status line
     if (!std::getline(iss, line)) {
         return ParseResult::Error;
     }
-    
+
     if (!line.empty() && line.back() == '\r') {
         line.pop_back();
     }
-    
+
     if (!parse_status_line(line, response)) {
         return ParseResult::Error;
     }
-    
+
     // Parse headers
     while (std::getline(iss, line)) {
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
         }
-        
+
         if (line.empty()) {
             break;
         }
-        
+
         if (!parse_header_field(line, response.headers)) {
             return ParseResult::Error;
         }
     }
-    
+
     bytes_consumed = header_end;
-    
+
     // Parse body
     auto cl = response.get_header("Content-Length");
     if (cl) {
@@ -417,24 +418,22 @@ HTTPParser::ParseResult HTTPParser::parse_response(const std::vector<uint8_t>& b
         if (buffer.size() < header_end + body_size) {
             return ParseResult::Incomplete;
         }
-        response.body.assign(buffer.begin() + header_end,
-                             buffer.begin() + header_end + body_size);
+        response.body.assign(buffer.begin() + header_end, buffer.begin() + header_end + body_size);
         bytes_consumed += body_size;
     } else {
         auto te = response.get_header("Transfer-Encoding");
         if (te && to_lower(*te).find("chunked") != std::string::npos) {
             size_t chunk_bytes = 0;
-            ParseResult chunk_result = parse_chunked_body(
-                std::vector<uint8_t>(buffer.begin() + header_end, buffer.end()),
-                response.body,
-                chunk_bytes);
+            ParseResult chunk_result =
+                parse_chunked_body(std::vector<uint8_t>(buffer.begin() + header_end, buffer.end()),
+                                   response.body, chunk_bytes);
             if (chunk_result != ParseResult::Success) {
                 return chunk_result;
             }
             bytes_consumed += chunk_bytes;
         }
     }
-    
+
     return ParseResult::Success;
 }
 
@@ -448,13 +447,13 @@ size_t HTTPParser::parse_chunk_size(const std::string& line) {
 }
 
 HTTPParser::ParseResult HTTPParser::parse_chunked_body(const std::vector<uint8_t>& buffer,
-                                                        std::vector<uint8_t>& body,
-                                                        size_t& bytes_consumed) {
+                                                       std::vector<uint8_t>& body,
+                                                       size_t& bytes_consumed) {
     bytes_consumed = 0;
     body.clear();
-    
+
     size_t pos = 0;
-    
+
     while (pos < buffer.size()) {
         // Find chunk size line (ends with CRLF)
         size_t crlf_pos = pos;
@@ -462,41 +461,40 @@ HTTPParser::ParseResult HTTPParser::parse_chunked_body(const std::vector<uint8_t
                !(buffer[crlf_pos] == '\r' && buffer[crlf_pos + 1] == '\n')) {
             crlf_pos++;
         }
-        
+
         if (crlf_pos + 1 >= buffer.size()) {
             return ParseResult::Incomplete;
         }
-        
+
         std::string chunk_size_line(buffer.begin() + pos, buffer.begin() + crlf_pos);
         size_t chunk_size = parse_chunk_size(chunk_size_line);
-        
+
         pos = crlf_pos + 2; // Skip CRLF
-        
+
         if (chunk_size == 0) {
             // Last chunk - check for trailing CRLF
-            if (pos + 1 < buffer.size() &&
-                buffer[pos] == '\r' && buffer[pos + 1] == '\n') {
+            if (pos + 1 < buffer.size() && buffer[pos] == '\r' && buffer[pos + 1] == '\n') {
                 bytes_consumed = pos + 2;
                 return ParseResult::Success;
             }
             return ParseResult::Incomplete;
         }
-        
+
         // Read chunk data
         if (pos + chunk_size + 2 > buffer.size()) {
             return ParseResult::Incomplete;
         }
-        
+
         body.insert(body.end(), buffer.begin() + pos, buffer.begin() + pos + chunk_size);
         pos += chunk_size;
-        
+
         // Skip CRLF after chunk data
         if (pos + 1 >= buffer.size() || buffer[pos] != '\r' || buffer[pos + 1] != '\n') {
             return ParseResult::Error;
         }
         pos += 2;
     }
-    
+
     return ParseResult::Incomplete;
 }
 

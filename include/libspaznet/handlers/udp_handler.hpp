@@ -25,4 +25,3 @@ class UDPHandler {
 };
 
 } // namespace spaznet
-

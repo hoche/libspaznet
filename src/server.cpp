@@ -6,12 +6,15 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <algorithm>
-#include <chrono>
+#include <array>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/server.hpp>
+#include <map>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -30,6 +33,202 @@
 #endif
 
 namespace spaznet {
+
+namespace {
+
+inline uint32_t rotl(uint32_t value, uint32_t bits) {
+    return (value << bits) | (value >> (32 - bits));
+}
+
+std::array<uint8_t, 20> sha1(const uint8_t* data, std::size_t len) {
+    uint64_t total_bits = static_cast<uint64_t>(len) * 8;
+    std::vector<uint8_t> msg(data, data + len);
+    msg.push_back(0x80);
+    while ((msg.size() + 8) % 64 != 0) {
+        msg.push_back(0x00);
+    }
+    for (int i = 7; i >= 0; --i) {
+        msg.push_back(static_cast<uint8_t>((total_bits >> (i * 8)) & 0xFF));
+    }
+
+    uint32_t h0 = 0x67452301;
+    uint32_t h1 = 0xEFCDAB89;
+    uint32_t h2 = 0x98BADCFE;
+    uint32_t h3 = 0x10325476;
+    uint32_t h4 = 0xC3D2E1F0;
+
+    for (std::size_t chunk = 0; chunk < msg.size(); chunk += 64) {
+        uint32_t w[80]{};
+        for (int i = 0; i < 16; ++i) {
+            w[i] = (msg[chunk + i * 4] << 24) | (msg[chunk + i * 4 + 1] << 16) |
+                   (msg[chunk + i * 4 + 2] << 8) | (msg[chunk + i * 4 + 3]);
+        }
+        for (int i = 16; i < 80; ++i) {
+            w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+        }
+
+        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
+
+        for (int i = 0; i < 80; ++i) {
+            uint32_t f = 0;
+            uint32_t k = 0;
+            if (i < 20) {
+                f = (b & c) | ((~b) & d);
+                k = 0x5A827999;
+            } else if (i < 40) {
+                f = b ^ c ^ d;
+                k = 0x6ED9EBA1;
+            } else if (i < 60) {
+                f = (b & c) | (b & d) | (c & d);
+                k = 0x8F1BBCDC;
+            } else {
+                f = b ^ c ^ d;
+                k = 0xCA62C1D6;
+            }
+
+            uint32_t temp = rotl(a, 5) + f + e + k + w[i];
+            e = d;
+            d = c;
+            c = rotl(b, 30);
+            b = a;
+            a = temp;
+        }
+
+        h0 += a;
+        h1 += b;
+        h2 += c;
+        h3 += d;
+        h4 += e;
+    }
+
+    std::array<uint8_t, 20> digest{};
+    uint32_t hs[5] = {h0, h1, h2, h3, h4};
+    for (int i = 0; i < 5; ++i) {
+        digest[i * 4 + 0] = static_cast<uint8_t>((hs[i] >> 24) & 0xFF);
+        digest[i * 4 + 1] = static_cast<uint8_t>((hs[i] >> 16) & 0xFF);
+        digest[i * 4 + 2] = static_cast<uint8_t>((hs[i] >> 8) & 0xFF);
+        digest[i * 4 + 3] = static_cast<uint8_t>(hs[i] & 0xFF);
+    }
+    return digest;
+}
+
+std::string base64_encode(const std::vector<uint8_t>& data) {
+    static constexpr char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((data.size() + 2) / 3) * 4);
+
+    std::size_t i = 0;
+    while (i + 2 < data.size()) {
+        uint32_t triple = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
+        out.push_back(kAlphabet[(triple >> 18) & 0x3F]);
+        out.push_back(kAlphabet[(triple >> 12) & 0x3F]);
+        out.push_back(kAlphabet[(triple >> 6) & 0x3F]);
+        out.push_back(kAlphabet[triple & 0x3F]);
+        i += 3;
+    }
+
+    if (i < data.size()) {
+        uint32_t triple = data[i] << 16;
+        if (i + 1 < data.size()) {
+            triple |= data[i + 1] << 8;
+        }
+        out.push_back(kAlphabet[(triple >> 18) & 0x3F]);
+        out.push_back(kAlphabet[(triple >> 12) & 0x3F]);
+        if (i + 1 < data.size()) {
+            out.push_back(kAlphabet[(triple >> 6) & 0x3F]);
+        } else {
+            out.push_back('=');
+        }
+        out.push_back('=');
+    }
+
+    return out;
+}
+
+std::string to_lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+bool header_has_token(const std::string& value, const std::string& token) {
+    std::string lower = to_lower(value);
+    std::string lower_token = to_lower(token);
+    std::istringstream iss(lower);
+    std::string part;
+    while (std::getline(iss, part, ',')) {
+        // trim spaces
+        part.erase(part.begin(), std::find_if(part.begin(), part.end(),
+                                              [](unsigned char ch) { return !std::isspace(ch); }));
+        part.erase(std::find_if(part.rbegin(), part.rend(),
+                                [](unsigned char ch) { return !std::isspace(ch); })
+                       .base(),
+                   part.end());
+        if (part == lower_token) {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct WebSocketHandshakeRequest {
+    std::string method;
+    std::map<std::string, std::string> headers;
+};
+
+std::optional<WebSocketHandshakeRequest> parse_websocket_request(const std::string& request) {
+    auto header_end = request.find("\r\n\r\n");
+    if (header_end == std::string::npos) {
+        return std::nullopt;
+    }
+
+    std::istringstream iss(request.substr(0, header_end));
+    std::string line;
+    WebSocketHandshakeRequest req;
+
+    if (!std::getline(iss, line)) {
+        return std::nullopt;
+    }
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    std::istringstream start_line(line);
+    start_line >> req.method;
+    if (req.method.empty()) {
+        return std::nullopt;
+    }
+
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.empty()) {
+            break;
+        }
+        auto colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        std::string name = to_lower(line.substr(0, colon));
+        std::string value = line.substr(colon + 1);
+        value.erase(value.begin(), std::find_if(value.begin(), value.end(), [](unsigned char ch) {
+                        return !std::isspace(ch);
+                    }));
+        req.headers[name] = value;
+    }
+
+    return req;
+}
+
+std::string compute_websocket_accept(const std::string& key) {
+    static constexpr char kGuid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    std::string concat = key + kGuid;
+    auto digest = sha1(reinterpret_cast<const uint8_t*>(concat.data()), concat.size());
+    return base64_encode(std::vector<uint8_t>(digest.begin(), digest.end()));
+}
+
+} // namespace
 
 // Socket implementation
 Task Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
@@ -320,49 +519,66 @@ Task Server::handle_connection(Socket socket) {
 
     try {
         std::vector<uint8_t> buffer;
-        co_await socket.async_read(buffer, 8192);  // Increased buffer for larger requests
+        co_await socket.async_read(buffer, 2048);
 
         if (buffer.empty()) {
             socket.close();
             co_return;
         }
 
-        // Try to parse as HTTP/1.1 per RFC 9112
-        if (http_handler_) {
+        std::string request_str(buffer.begin(), buffer.end());
+        auto ws_request = websocket_handler_ ? parse_websocket_request(request_str)
+                                             : std::optional<WebSocketHandshakeRequest>{};
+        bool websocket_upgrade = false;
+
+        if (ws_request) {
+            const auto& hdrs = ws_request->headers;
+            auto upgrade_it = hdrs.find("upgrade");
+            auto conn_it = hdrs.find("connection");
+            auto key_it = hdrs.find("sec-websocket-key");
+            auto version_it = hdrs.find("sec-websocket-version");
+
+            if (upgrade_it != hdrs.end() && conn_it != hdrs.end() && key_it != hdrs.end() &&
+                version_it != hdrs.end() && ws_request->method == "GET" &&
+                header_has_token(upgrade_it->second, "websocket") &&
+                header_has_token(conn_it->second, "upgrade") &&
+                to_lower(version_it->second) == "13") {
+                websocket_upgrade = true;
+            }
+        }
+
+        if (!websocket_upgrade && http_handler_) {
             HTTPRequest request;
             size_t bytes_consumed = 0;
-            HTTPParser::ParseResult parse_result = HTTPParser::parse_request(buffer, request, bytes_consumed);
-            
+            HTTPParser::ParseResult parse_result =
+                HTTPParser::parse_request(buffer, request, bytes_consumed);
+
             if (parse_result == HTTPParser::ParseResult::Incomplete) {
-                // Need more data - read more
                 std::vector<uint8_t> more_data;
                 co_await socket.async_read(more_data, 8192);
                 buffer.insert(buffer.end(), more_data.begin(), more_data.end());
-                
+
                 parse_result = HTTPParser::parse_request(buffer, request, bytes_consumed);
             }
-            
+
             if (parse_result == HTTPParser::ParseResult::Success) {
                 HTTPResponse response;
                 response.version = "1.1";
-                
-                // Handle request
+
                 co_await http_handler_->handle_request(request, response, socket);
-                
-                // Set Connection header based on request
+
                 if (!request.should_keep_alive()) {
                     response.set_header("Connection", "close");
                 } else {
                     response.set_header("Connection", "keep-alive");
                 }
-                
-                // Serialize and send response
+
                 std::vector<uint8_t> response_data;
                 auto te = response.get_header("Transfer-Encoding");
                 if (te) {
                     std::string te_lower = *te;
                     std::transform(te_lower.begin(), te_lower.end(), te_lower.begin(),
-                                 [](unsigned char c) { return std::tolower(c); });
+                                   [](unsigned char c) { return std::tolower(c); });
                     if (te_lower.find("chunked") != std::string::npos) {
                         response_data = response.serialize_chunked();
                     } else {
@@ -371,72 +587,211 @@ Task Server::handle_connection(Socket socket) {
                 } else {
                     response_data = response.serialize();
                 }
-                
+
                 co_await socket.async_write(response_data);
-                
-                // Close connection if Connection: close
+
                 if (!request.should_keep_alive()) {
                     socket.close();
                 }
             } else {
-                // Parse error - send 400 Bad Request
                 HTTPResponse error_response;
                 error_response.version = "1.1";
                 error_response.status_code = 400;
                 error_response.reason_phrase = "Bad Request";
                 error_response.set_header("Connection", "close");
                 error_response.set_header("Content-Length", "0");
-                
+
                 auto error_data = error_response.serialize();
                 co_await socket.async_write(error_data);
                 socket.close();
             }
-        } else if (websocket_handler_) {
-            // Check if this looks like a WebSocket upgrade request
-            std::string request_str(buffer.begin(), buffer.end());
-            std::istringstream iss(request_str);
-            std::string line;
-            
-            if (std::getline(iss, line)) {
-                if (!line.empty() && line.back() == '\r') {
-                    line.pop_back();
+        } else if (websocket_upgrade && websocket_handler_) {
+            auto& hdrs = ws_request->headers;
+            std::string client_key = hdrs.at("sec-websocket-key");
+            std::string accept_key = compute_websocket_accept(client_key);
+
+            std::ostringstream resp;
+            resp << "HTTP/1.1 101 Switching Protocols\r\n";
+            resp << "Upgrade: websocket\r\n";
+            resp << "Connection: Upgrade\r\n";
+            resp << "Sec-WebSocket-Accept: " << accept_key << "\r\n\r\n";
+            std::string resp_str = resp.str();
+            std::vector<uint8_t> resp_bytes(resp_str.begin(), resp_str.end());
+            co_await socket.async_write(resp_bytes);
+
+            co_await websocket_handler_->on_open(socket);
+
+            auto read_exact = [&](std::size_t n, std::vector<uint8_t>& out) -> Task {
+                out.clear();
+                std::size_t remaining = n;
+                while (remaining > 0) {
+                    std::vector<uint8_t> tmp;
+                    co_await socket.async_read(tmp, remaining);
+                    if (tmp.empty()) {
+                        out.clear();
+                        co_return;
+                    }
+                    out.insert(out.end(), tmp.begin(), tmp.end());
+                    remaining -= tmp.size();
                 }
-                
-                if (line.find("GET") == 0 || line.find("POST") == 0) {
-                    // WebSocket upgrade request
-                    if (websocket_handler_) {
-                        // Handle WebSocket upgrade
-                        co_await websocket_handler_->on_open(socket);
+            };
 
-                        // Read WebSocket frames
-                        while (true) {
-                            std::vector<uint8_t> frame_data;
-                            co_await socket.async_read(frame_data, 4096);
+            auto send_frame = [&](WebSocketOpcode opcode, const std::vector<uint8_t>& payload,
+                                  uint16_t close_code = 0) -> Task {
+                WebSocketFrame frame;
+                frame.fin = true;
+                frame.rsv1 = frame.rsv2 = frame.rsv3 = false;
+                frame.opcode = opcode;
+                frame.masked = false;
+                frame.payload = payload;
+                if (opcode == WebSocketOpcode::Close && close_code != 0) {
+                    std::vector<uint8_t> body;
+                    body.push_back(static_cast<uint8_t>((close_code >> 8) & 0xFF));
+                    body.push_back(static_cast<uint8_t>(close_code & 0xFF));
+                    body.insert(body.end(), payload.begin(), payload.end());
+                    frame.payload.swap(body);
+                }
+                frame.payload_length = frame.payload.size();
+                auto data = frame.serialize();
+                co_await socket.async_write(data);
+            };
 
-                            if (frame_data.empty()) {
-                                break;
-                            }
+            bool sent_close = false;
+            auto fail_close = [&](uint16_t code) -> Task {
+                if (!sent_close) {
+                    sent_close = true;
+                    co_await send_frame(WebSocketOpcode::Close, {}, code);
+                }
+            };
 
-                            try {
-                                auto frame = WebSocketFrame::parse(frame_data);
-                                WebSocketMessage msg;
-                                msg.opcode = frame.opcode;
-                                msg.data = frame.payload;
+            std::vector<uint8_t> message_buffer;
+            WebSocketOpcode current_message_opcode = WebSocketOpcode::Continuation;
+            bool fragmented = false;
 
-                                co_await websocket_handler_->handle_message(msg, socket);
+            while (true) {
+                std::vector<uint8_t> header;
+                co_await read_exact(2, header);
+                if (header.size() < 2) {
+                    break;
+                }
 
-                                if (frame.opcode == WebSocketOpcode::Close) {
-                                    break;
-                                }
-                            } catch (...) {
-                                break;
-                            }
+                bool fin = (header[0] & 0x80) != 0;
+                bool rsv1 = (header[0] & 0x40) != 0;
+                bool rsv2 = (header[0] & 0x20) != 0;
+                bool rsv3 = (header[0] & 0x10) != 0;
+                WebSocketOpcode opcode = static_cast<WebSocketOpcode>(header[0] & 0x0F);
+                bool masked = (header[1] & 0x80) != 0;
+                uint64_t payload_len = header[1] & 0x7F;
+
+                if (rsv1 || rsv2 || rsv3) {
+                    co_await fail_close(1002);
+                    break;
+                }
+                if (!masked) {
+                    co_await fail_close(1002);
+                    break;
+                }
+
+                if (payload_len == 126) {
+                    std::vector<uint8_t> ext;
+                    co_await read_exact(2, ext);
+                    if (ext.size() != 2) {
+                        break;
+                    }
+                    payload_len = (static_cast<uint64_t>(ext[0]) << 8) | ext[1];
+                } else if (payload_len == 127) {
+                    std::vector<uint8_t> ext;
+                    co_await read_exact(8, ext);
+                    if (ext.size() != 8) {
+                        break;
+                    }
+                    payload_len = 0;
+                    for (int i = 0; i < 8; ++i) {
+                        payload_len = (payload_len << 8) | ext[i];
+                    }
+                    if (payload_len & (1ULL << 63)) {
+                        co_await fail_close(1002);
+                        break;
+                    }
+                }
+
+                std::vector<uint8_t> mask_key_buf;
+                co_await read_exact(4, mask_key_buf);
+                if (mask_key_buf.size() != 4) {
+                    break;
+                }
+                uint32_t masking_key = (mask_key_buf[0] << 24) | (mask_key_buf[1] << 16) |
+                                       (mask_key_buf[2] << 8) | mask_key_buf[3];
+
+                std::vector<uint8_t> payload(static_cast<std::size_t>(payload_len));
+                if (payload_len > 0) {
+                    std::vector<uint8_t> payload_buf;
+                    co_await read_exact(static_cast<std::size_t>(payload_len), payload_buf);
+                    if (payload_buf.size() != payload_len) {
+                        break;
+                    }
+                    for (std::size_t i = 0; i < payload_len; ++i) {
+                        payload[i] = payload_buf[i] ^ ((masking_key >> ((3 - (i % 4)) * 8)) & 0xFF);
+                    }
+                }
+
+                bool is_control = opcode == WebSocketOpcode::Close ||
+                                  opcode == WebSocketOpcode::Ping ||
+                                  opcode == WebSocketOpcode::Pong;
+                if (is_control) {
+                    if (!fin || payload_len > 125) {
+                        co_await fail_close(1002);
+                        break;
+                    }
+                    if (opcode == WebSocketOpcode::Close) {
+                        if (!sent_close) {
+                            sent_close = true;
+                            WebSocketFrame close_frame;
+                            close_frame.fin = true;
+                            close_frame.rsv1 = close_frame.rsv2 = close_frame.rsv3 = false;
+                            close_frame.opcode = WebSocketOpcode::Close;
+                            close_frame.masked = false;
+                            close_frame.payload = payload;
+                            close_frame.payload_length = close_frame.payload.size();
+                            auto data = close_frame.serialize();
+                            co_await socket.async_write(data);
                         }
+                        break;
+                    } else if (opcode == WebSocketOpcode::Ping) {
+                        co_await send_frame(WebSocketOpcode::Pong, payload);
+                        continue;
+                    } else if (opcode == WebSocketOpcode::Pong) {
+                        continue;
+                    }
+                } else {
+                    if (opcode != WebSocketOpcode::Continuation) {
+                        if (fragmented) {
+                            co_await fail_close(1002);
+                            break;
+                        }
+                        current_message_opcode = opcode;
+                        message_buffer = payload;
+                        fragmented = !fin;
+                    } else {
+                        if (!fragmented) {
+                            co_await fail_close(1002);
+                            break;
+                        }
+                        message_buffer.insert(message_buffer.end(), payload.begin(), payload.end());
+                    }
 
-                        co_await websocket_handler_->on_close(socket);
+                    if ((fin && !fragmented) || (fin && fragmented)) {
+                        WebSocketMessage msg;
+                        msg.opcode = current_message_opcode;
+                        msg.data = message_buffer;
+                        fragmented = false;
+                        message_buffer.clear();
+                        co_await websocket_handler_->handle_message(msg, socket);
                     }
                 }
             }
+
+            co_await websocket_handler_->on_close(socket);
         }
     } catch (...) {
         // Catch any exceptions to prevent coroutine crashes

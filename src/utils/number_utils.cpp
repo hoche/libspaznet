@@ -22,4 +22,3 @@ std::optional<int> NumberUtils::parse_int(const std::string& value) {
 }
 
 } // namespace spaznet
-
