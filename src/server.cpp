@@ -375,6 +375,14 @@ void Server::set_websocket_handler(std::unique_ptr<WebSocketHandler> handler) {
     websocket_handler_ = std::move(handler);
 }
 
+void Server::set_quic_handler(std::unique_ptr<QUICHandler> handler) {
+    quic_handler_ = std::move(handler);
+}
+
+void Server::set_http3_handler(std::unique_ptr<HTTP3Handler> handler) {
+    http3_handler_ = std::move(handler);
+}
+
 void Server::listen_tcp(uint16_t port) {
     // Use getaddrinfo for IPv4/IPv6 compatibility
     struct addrinfo hints {

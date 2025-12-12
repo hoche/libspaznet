@@ -105,3 +105,4 @@ void on_external_ready(IOContext& ctx, ExternalEvent ev) {
 - Handler vtables are violated, so HTTP/WebSocket/TCP dispatch cannot call your handler at all.
 
 Keep coroutine boundaries clean: once you start with `Task`, stay with coroutines and let the `IOContext` scheduler be the only component that moves work across threads.
+
