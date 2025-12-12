@@ -82,7 +82,12 @@ class HTTPServerTest : public ::testing::Test {
         request << "\r\n";
 
         std::string req_str = request.str();
-        send(sock, req_str.c_str(), req_str.size(), 0);
+#ifdef _WIN32
+        send(sock, req_str.c_str(), static_cast<int>(req_str.size()), 0);
+#else
+        // Use MSG_NOSIGNAL to prevent SIGPIPE on closed sockets
+        send(sock, req_str.c_str(), req_str.size(), MSG_NOSIGNAL);
+#endif
 
         char buffer[4096];
         int received = recv(sock, buffer, sizeof(buffer) - 1, 0);
