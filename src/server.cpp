@@ -789,7 +789,8 @@ Task Server::handle_connection(Socket socket) {
                         message_buffer.insert(message_buffer.end(), payload.begin(), payload.end());
                     }
 
-                    if ((fin && !fragmented) || (fin && fragmented)) {
+                    if (fin) {
+                        // Message is complete (either single frame or last fragment)
                         WebSocketMessage msg;
                         msg.opcode = current_message_opcode;
                         msg.data = message_buffer;

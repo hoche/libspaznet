@@ -24,22 +24,26 @@ struct HTTPRequest {
     std::vector<uint8_t> body; // Message body per RFC 9112 Section 6
 
     // Helper to get header (case-insensitive per RFC 9112 Section 5.1)
-    std::optional<std::string> get_header(const std::string& name) const;
+    auto get_header(const std::string& name) const -> std::optional<std::string>;
 
     // Check if connection should be kept alive per RFC 9112 Section 9.6
-    bool should_keep_alive() const;
+    auto should_keep_alive() const -> bool;
 
     // Get Content-Length if present per RFC 9112 Section 8.6
-    std::optional<size_t> get_content_length() const;
+    auto get_content_length() const -> std::optional<size_t>;
 
     // Check if request has chunked transfer encoding per RFC 9112 Section 7.1
-    bool is_chunked() const;
+    auto is_chunked() const -> bool;
 };
+
+namespace {
+constexpr int DEFAULT_HTTP_STATUS_CODE = 200;
+}
 
 // HTTP/1.1 Response structure per RFC 9112
 struct HTTPResponse {
     std::string version = "1.1";                          // HTTP version
-    int status_code = 200;                                // Status code
+    int status_code = DEFAULT_HTTP_STATUS_CODE;           // Status code
     std::string reason_phrase = "OK";                     // Reason phrase
     std::unordered_map<std::string, std::string> headers; // Header fields
     std::vector<uint8_t> body;                            // Message body
@@ -49,61 +53,68 @@ struct HTTPResponse {
     }
 
     // Helper to get header (case-insensitive)
-    std::optional<std::string> get_header(const std::string& name) const;
+    auto get_header(const std::string& name) const -> std::optional<std::string>;
 
     // Set Content-Length header
-    void set_content_length(size_t length);
+    auto set_content_length(size_t length) -> void;
 
     // Set chunked transfer encoding
-    void set_chunked();
+    auto set_chunked() -> void;
 
     // Serialize response per RFC 9112
-    std::vector<uint8_t> serialize() const;
+    auto serialize() const -> std::vector<uint8_t>;
 
     // Serialize with chunked encoding
-    std::vector<uint8_t> serialize_chunked() const;
+    auto serialize_chunked() const -> std::vector<uint8_t>;
 };
 
 // HTTP/1.1 Parser per RFC 9112
 class HTTPParser {
   public:
-    enum class ParseResult {
+    enum class ParseResult : uint8_t {
         Success,
         Incomplete, // Need more data
         Error       // Parse error
     };
 
     // Parse HTTP request from buffer
-    static ParseResult parse_request(const std::vector<uint8_t>& buffer, HTTPRequest& request,
-                                     size_t& bytes_consumed);
+    static auto parse_request(const std::vector<uint8_t>& buffer, HTTPRequest& request,
+                              size_t& bytes_consumed) -> ParseResult;
 
     // Parse HTTP response from buffer
-    static ParseResult parse_response(const std::vector<uint8_t>& buffer, HTTPResponse& response,
-                                      size_t& bytes_consumed);
+    static auto parse_response(const std::vector<uint8_t>& buffer, HTTPResponse& response,
+                               size_t& bytes_consumed) -> ParseResult;
 
     // Parse chunked message body
-    static ParseResult parse_chunked_body(const std::vector<uint8_t>& buffer,
-                                          std::vector<uint8_t>& body, size_t& bytes_consumed);
+    static auto parse_chunked_body(const std::vector<uint8_t>& buffer, std::vector<uint8_t>& body,
+                                   size_t& bytes_consumed) -> ParseResult;
 
     // Helper functions for parsing (public for testing)
-    static bool is_token_char(char c);
-    static bool is_field_vchar(char c);
-    static std::string to_lower(const std::string& str);
-    static std::string trim_ows(const std::string& str); // Trim obs-fold and OWS
-    static bool parse_request_line(const std::string& line, HTTPRequest& request);
-    static bool parse_status_line(const std::string& line, HTTPResponse& response);
-    static bool parse_header_field(const std::string& line,
-                                   std::unordered_map<std::string, std::string>& headers);
-    static size_t parse_chunk_size(const std::string& line);
+    static auto is_token_char(char character) -> bool;
+    static auto is_field_vchar(char character) -> bool;
+    static auto to_lower(const std::string& str) -> std::string;
+    static auto trim_ows(const std::string& str) -> std::string; // Trim obs-fold and OWS
+    static auto parse_request_line(const std::string& line, HTTPRequest& request) -> bool;
+    static auto parse_status_line(const std::string& line, HTTPResponse& response) -> bool;
+    static auto parse_header_field(const std::string& line,
+                                   std::unordered_map<std::string, std::string>& headers) -> bool;
+    static auto parse_chunk_size(const std::string& line) -> size_t;
 };
 
 class HTTPHandler {
   public:
+    HTTPHandler() = default;
     virtual ~HTTPHandler() = default;
 
+    // Delete copy and move operations
+    HTTPHandler(const HTTPHandler&) = delete;
+    auto operator=(const HTTPHandler&) -> HTTPHandler& = delete;
+    HTTPHandler(HTTPHandler&&) = delete;
+    auto operator=(HTTPHandler&&) -> HTTPHandler& = delete;
+
     // Handle HTTP request
-    virtual Task handle_request(const HTTPRequest& request, HTTPResponse& response,
-                                Socket& socket) = 0;
+    virtual auto handle_request(const HTTPRequest& request, HTTPResponse& response,
+                                Socket& socket) -> Task = 0;
 };
 
 } // namespace spaznet

@@ -44,8 +44,11 @@ TEST(QUICPacketParsingTest, ParseShortHeader) {
 
 TEST(QUICPacketParsingTest, ParseLongHeaderInitial) {
     // Long header INITIAL packet
+    // Format per RFC9000: bit 7 (0x80) = 0 for long header, 1 for short header
+    //                     bits 6-4 = packet type (0 = Initial, 1 = 0-RTT, 2 = Handshake, 3 = Retry)
+    // For Initial: bit 7 = 0, bits 6-4 = 000, so first byte = 0x00
     std::vector<uint8_t> packet = {
-        0xC0,                   // Long header, INITIAL
+        0x00,                   // Long header (bit 7=0), INITIAL (bits 6-4=000)
         0x00, 0x00, 0x00, 0x01, // Version 1
         0x04,                   // Dest CID length
         0x01, 0x02, 0x03, 0x04, // Dest CID
@@ -54,7 +57,9 @@ TEST(QUICPacketParsingTest, ParseLongHeaderInitial) {
     };
 
     EXPECT_GE(packet.size(), 2);
-    EXPECT_TRUE((packet[0] & 0x80) == 0); // Long header bit not set
+    EXPECT_TRUE((packet[0] & 0x80) == 0); // Long header bit NOT set (bit 7 = 0)
+    // Extract packet type from bits 6-4: (packet[0] >> 4) & 0x07
+    // For 0x00: (0x00 >> 4) & 0x07 = 0x00 = Initial
     uint8_t packet_type = (packet[0] >> 4) & 0x07;
     EXPECT_EQ(packet_type, static_cast<uint8_t>(QUICPacketType::Initial));
 }

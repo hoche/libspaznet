@@ -2,9 +2,9 @@
 #ifndef USE_KQUEUE
 #ifndef USE_IOCP
 
-#include <errno.h>
 #include <poll.h>
 #include <unistd.h>
+#include <cerrno>
 #include <libspaznet/platform_io.hpp>
 #include <unordered_map>
 #include <vector>
@@ -19,49 +19,59 @@ class PlatformIOPoll : public PlatformIO {
   public:
     PlatformIOPoll() = default;
 
+    // Delete copy and move operations
+    PlatformIOPoll(const PlatformIOPoll&) = delete;
+    auto operator=(const PlatformIOPoll&) -> PlatformIOPoll& = delete;
+    PlatformIOPoll(PlatformIOPoll&&) = delete;
+    auto operator=(PlatformIOPoll&&) -> PlatformIOPoll& = delete;
+
     ~PlatformIOPoll() override {
         cleanup();
     }
 
-    bool init() override {
+    auto init() -> bool override {
         return true;
     }
 
-    bool add_fd(int fd, uint32_t events, void* user_data) override {
-        if (fd_info_.find(fd) != fd_info_.end()) {
+    auto add_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
+        if (fd_info_.find(file_descriptor) != fd_info_.end()) {
             return false; // Already exists
         }
 
         pollfd pfd{};
-        pfd.fd = fd;
+        pfd.fd = file_descriptor;
         pfd.events = 0;
-        if (events & EVENT_READ)
+        if ((events & EVENT_READ) != 0U) {
             pfd.events |= POLLIN;
-        if (events & EVENT_WRITE)
+        }
+        if ((events & EVENT_WRITE) != 0U) {
             pfd.events |= POLLOUT;
+        }
         pfd.revents = 0;
 
         pollfds_.push_back(pfd);
-        fd_info_[fd] = {user_data, events};
+        fd_info_[file_descriptor] = {user_data, events};
 
         return true;
     }
 
-    bool modify_fd(int fd, uint32_t events, void* user_data) override {
-        auto it = fd_info_.find(fd);
+    auto modify_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
+        auto it = fd_info_.find(file_descriptor);
         if (it == fd_info_.end()) {
-            return add_fd(fd, events, user_data);
+            return add_fd(file_descriptor, events, user_data);
         }
 
         it->second = {user_data, events};
 
         for (auto& pfd : pollfds_) {
-            if (pfd.fd == fd) {
+            if (pfd.fd == file_descriptor) {
                 pfd.events = 0;
-                if (events & EVENT_READ)
+                if ((events & EVENT_READ) != 0U) {
                     pfd.events |= POLLIN;
-                if (events & EVENT_WRITE)
+                }
+                if ((events & EVENT_WRITE) != 0U) {
                     pfd.events |= POLLOUT;
+                }
                 break;
             }
         }
@@ -69,8 +79,8 @@ class PlatformIOPoll : public PlatformIO {
         return true;
     }
 
-    bool remove_fd(int fd) override {
-        auto it = fd_info_.find(fd);
+    auto remove_fd(int file_descriptor) -> bool override {
+        auto it = fd_info_.find(file_descriptor);
         if (it == fd_info_.end()) {
             return false;
         }
@@ -78,7 +88,7 @@ class PlatformIOPoll : public PlatformIO {
         fd_info_.erase(it);
 
         for (auto pfd_it = pollfds_.begin(); pfd_it != pollfds_.end(); ++pfd_it) {
-            if (pfd_it->fd == fd) {
+            if (pfd_it->fd == file_descriptor) {
                 pollfds_.erase(pfd_it);
                 break;
             }
@@ -87,7 +97,7 @@ class PlatformIOPoll : public PlatformIO {
         return true;
     }
 
-    int wait(std::vector<Event>& events, int timeout_ms) override {
+    auto wait(std::vector<Event>& events, int timeout_ms) -> int override {
         if (pollfds_.empty()) {
             return 0;
         }
@@ -106,25 +116,28 @@ class PlatformIOPoll : public PlatformIO {
                 continue;
             }
 
-            Event ev{};
-            ev.fd = pfd.fd;
-            ev.events = 0;
+            Event event{};
+            event.fd = pfd.fd;
+            event.events = 0;
 
-            if (pfd.revents & POLLIN)
-                ev.events |= EVENT_READ;
-            if (pfd.revents & POLLOUT)
-                ev.events |= EVENT_WRITE;
-            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
-                ev.events |= EVENT_ERROR;
+            if ((pfd.revents & POLLIN) != 0U) {
+                event.events |= EVENT_READ;
+            }
+            if ((pfd.revents & POLLOUT) != 0U) {
+                event.events |= EVENT_WRITE;
+            }
+            if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0U) {
+                event.events |= EVENT_ERROR;
+            }
 
             auto it = fd_info_.find(pfd.fd);
             if (it != fd_info_.end()) {
-                ev.user_data = it->second.first;
+                event.user_data = it->second.first;
             } else {
-                ev.user_data = nullptr;
+                event.user_data = nullptr;
             }
 
-            events.push_back(ev);
+            events.push_back(event);
         }
 
         return nfds;

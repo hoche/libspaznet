@@ -16,7 +16,7 @@ class Socket;
 struct ConnectionID {
     std::vector<uint8_t> bytes;
 
-    bool operator==(const ConnectionID& other) const {
+    auto operator==(const ConnectionID& other) const -> bool {
         return bytes == other.bytes;
     }
 };
@@ -39,7 +39,7 @@ struct QUICStreamFrame {
 };
 
 // QUIC Connection State
-enum class QUICConnectionState {
+enum class QUICConnectionState : uint8_t {
     Idle,
     Handshake,
     Established,
@@ -48,7 +48,7 @@ enum class QUICConnectionState {
 };
 
 // QUIC Stream State
-enum class QUICStreamState {
+enum class QUICStreamState : uint8_t {
     Idle,
     Open,
     HalfClosedLocal,
@@ -62,28 +62,34 @@ class QUICStream {
     QUICStream(uint64_t stream_id, bool bidirectional);
     ~QUICStream() = default;
 
-    uint64_t stream_id() const {
+    // Delete copy and move operations
+    QUICStream(const QUICStream&) = delete;
+    auto operator=(const QUICStream&) -> QUICStream& = delete;
+    QUICStream(QUICStream&&) = delete;
+    auto operator=(QUICStream&&) -> QUICStream& = delete;
+
+    [[nodiscard]] auto stream_id() const -> uint64_t {
         return stream_id_;
     }
-    bool bidirectional() const {
+    [[nodiscard]] auto bidirectional() const -> bool {
         return bidirectional_;
     }
-    QUICStreamState state() const {
+    [[nodiscard]] auto state() const -> QUICStreamState {
         return state_;
     }
 
     // Read data from stream
-    Task read(std::vector<uint8_t>& buffer, std::size_t max_size);
+    auto read(std::vector<uint8_t>& buffer, std::size_t max_size) -> Task;
 
     // Write data to stream
-    Task write(const std::vector<uint8_t>& data, bool fin = false);
+    auto write(const std::vector<uint8_t>& data, bool fin = false) -> Task;
 
     // Close stream
-    void close();
+    auto close() -> void;
 
     // Set stream state (for QUICConnection)
-    void set_state(QUICStreamState state) {
-        state_ = state;
+    auto set_state(QUICStreamState new_state) -> void {
+        state_ = new_state;
     }
 
     // Internal access for QUICConnection
@@ -106,27 +112,34 @@ class QUICConnection {
     QUICConnection(ConnectionID dest_conn_id, ConnectionID src_conn_id, Socket& socket);
     ~QUICConnection() = default;
 
-    ConnectionID destination_connection_id() const {
+    // Delete copy and move operations
+    QUICConnection(const QUICConnection&) = delete;
+    auto operator=(const QUICConnection&) -> QUICConnection& = delete;
+    QUICConnection(QUICConnection&&) = delete;
+    auto operator=(QUICConnection&&) -> QUICConnection& = delete;
+
+    auto destination_connection_id() const -> ConnectionID {
         return dest_conn_id_;
     }
-    ConnectionID source_connection_id() const {
+    auto source_connection_id() const -> ConnectionID {
         return src_conn_id_;
     }
-    QUICConnectionState state() const {
+    auto state() const -> QUICConnectionState {
         return state_;
     }
 
     // Get or create stream
-    std::shared_ptr<QUICStream> get_stream(uint64_t stream_id);
+    auto get_stream(uint64_t stream_id) -> std::shared_ptr<QUICStream>;
 
     // Process incoming QUIC packet
-    Task process_packet(const std::vector<uint8_t>& packet);
+    auto process_packet(const std::vector<uint8_t>& packet) -> Task;
 
     // Send data on stream
-    Task send_stream_data(uint64_t stream_id, const std::vector<uint8_t>& data, bool fin = false);
+    auto send_stream_data(uint64_t stream_id, const std::vector<uint8_t>& data,
+                          bool fin = false) -> Task;
 
     // Close connection
-    Task close();
+    auto close() -> Task;
 
   private:
     ConnectionID dest_conn_id_;
@@ -138,27 +151,34 @@ class QUICConnection {
     uint64_t max_stream_id_;
 
     // Parse QUIC packet
-    bool parse_packet(const std::vector<uint8_t>& packet, QUICPacketType& type,
+    auto parse_packet(const std::vector<uint8_t>& packet, QUICPacketType& type,
                       ConnectionID& dest_conn_id, ConnectionID& src_conn_id,
-                      std::vector<QUICStreamFrame>& frames);
+                      std::vector<QUICStreamFrame>& frames) -> bool;
 
     // Serialize QUIC packet
-    std::vector<uint8_t> serialize_packet(QUICPacketType type,
-                                          const std::vector<QUICStreamFrame>& frames);
+    auto serialize_packet(QUICPacketType type,
+                          const std::vector<QUICStreamFrame>& frames) -> std::vector<uint8_t>;
 };
 
 // QUIC Handler interface
 class QUICHandler {
   public:
+    QUICHandler() = default;
     virtual ~QUICHandler() = default;
 
+    // Delete copy and move operations
+    QUICHandler(const QUICHandler&) = delete;
+    auto operator=(const QUICHandler&) -> QUICHandler& = delete;
+    QUICHandler(QUICHandler&&) = delete;
+    auto operator=(QUICHandler&&) -> QUICHandler& = delete;
+
     // Handle new QUIC connection
-    virtual Task on_connection(std::shared_ptr<QUICConnection> connection) = 0;
+    virtual auto on_connection(std::shared_ptr<QUICConnection> connection) -> Task = 0;
 
     // Handle stream data
-    virtual Task on_stream_data(std::shared_ptr<QUICConnection> connection,
+    virtual auto on_stream_data(std::shared_ptr<QUICConnection> connection,
                                 std::shared_ptr<QUICStream> stream,
-                                const std::vector<uint8_t>& data, bool fin) = 0;
+                                const std::vector<uint8_t>& data, bool fin) -> Task = 0;
 };
 
 } // namespace spaznet

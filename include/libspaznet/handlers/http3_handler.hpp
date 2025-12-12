@@ -15,7 +15,7 @@ namespace spaznet {
 class Socket;
 
 // HTTP/3 Frame Types (RFC9114 Section 7.2)
-enum class HTTP3FrameType : uint64_t {
+enum class HTTP3FrameType : uint8_t {
     Data = 0x00,
     Headers = 0x01,
     CancelPush = 0x03,
@@ -37,7 +37,7 @@ struct HTTP3Request {
 
 // HTTP/3 Response (RFC9114)
 struct HTTP3Response {
-    int status_code = 200;
+    int status_code = DEFAULT_HTTP_STATUS_CODE; // Defined in http_handler.hpp
     std::string reason_phrase = "OK";
     std::unordered_map<std::string, std::string> headers;
     std::vector<uint8_t> body;
@@ -46,10 +46,10 @@ struct HTTP3Response {
         headers[key] = value;
     }
 
-    std::optional<std::string> get_header(const std::string& name) const {
-        auto it = headers.find(name);
-        if (it != headers.end()) {
-            return it->second;
+    auto get_header(const std::string& name) const -> std::optional<std::string> {
+        auto iterator = headers.find(name);
+        if (iterator != headers.end()) {
+            return iterator->second;
         }
         return std::nullopt;
     }
@@ -58,11 +58,18 @@ struct HTTP3Response {
 // HTTP/3 Handler interface
 class HTTP3Handler {
   public:
+    HTTP3Handler() = default;
     virtual ~HTTP3Handler() = default;
 
+    // Delete copy and move operations
+    HTTP3Handler(const HTTP3Handler&) = delete;
+    auto operator=(const HTTP3Handler&) -> HTTP3Handler& = delete;
+    HTTP3Handler(HTTP3Handler&&) = delete;
+    auto operator=(HTTP3Handler&&) -> HTTP3Handler& = delete;
+
     // Handle HTTP/3 request
-    virtual Task handle_request(const HTTP3Request& request, HTTP3Response& response,
-                                std::shared_ptr<QUICStream> stream) = 0;
+    virtual auto handle_request(const HTTP3Request& request, HTTP3Response& response,
+                                std::shared_ptr<QUICStream> stream) -> Task = 0;
 };
 
 } // namespace spaznet

@@ -23,7 +23,7 @@ struct TaskPromise {
     std::coroutine_handle<> continuation{std::noop_coroutine()};
 
     // Declaration - implementation after Task is defined
-    Task get_return_object();
+    auto get_return_object() -> Task;
 
     auto initial_suspend() noexcept {
         return std::suspend_always{};
@@ -31,11 +31,11 @@ struct TaskPromise {
 
     auto final_suspend() noexcept {
         struct FinalAwaiter {
-            bool await_ready() const noexcept {
+            [[nodiscard]] auto await_ready() const noexcept -> bool {
                 return false;
             }
-            void await_suspend(std::coroutine_handle<TaskPromise> h) noexcept {
-                auto cont = h.promise().continuation;
+            void await_suspend(std::coroutine_handle<TaskPromise> handle) noexcept {
+                auto cont = handle.promise().continuation;
                 if (cont) {
                     cont.resume();
                 }
@@ -55,58 +55,71 @@ struct TaskPromise {
 struct Task {
     using promise_type = TaskPromise;
     std::coroutine_handle<TaskPromise> handle;
+    bool owns_handle{true}; // Track if this Task owns the coroutine (can destroy it)
 
-    Task() : handle{} {}
+    Task() = default;
 
-    Task(std::coroutine_handle<TaskPromise> h) : handle(h) {}
+    Task(std::coroutine_handle<TaskPromise> handle_param)
+        : handle(handle_param), owns_handle(true) {}
 
     ~Task() {
-        if (handle) {
+        if (handle && owns_handle) {
             handle.destroy();
         }
     }
 
     Task(const Task&) = delete;
-    Task& operator=(const Task&) = delete;
+    auto operator=(const Task&) -> Task& = delete;
 
-    Task(Task&& other) noexcept : handle(other.handle) {
+    Task(Task&& other) noexcept : handle(other.handle), owns_handle(other.owns_handle) {
         other.handle = {};
+        other.owns_handle = false;
     }
 
-    Task& operator=(Task&& other) noexcept {
+    auto operator=(Task&& other) noexcept -> Task& {
         if (this != &other) {
-            if (handle) {
+            if (handle && owns_handle) {
                 handle.destroy();
             }
             handle = other.handle;
+            owns_handle = other.owns_handle;
             other.handle = {};
+            other.owns_handle = false;
         }
         return *this;
     }
 
-    bool resume() {
-        if (!handle || handle.done()) {
+    // Create a non-owning Task view (for timers)
+    static auto from_handle(std::coroutine_handle<TaskPromise> handle_param) -> Task {
+        Task task;
+        task.handle = handle_param;
+        task.owns_handle = false;
+        return task;
+    }
+
+    auto resume() -> bool {
+        if ((handle == nullptr) || handle.done()) {
             return false;
         }
         handle.resume();
         return !handle.done();
     }
 
-    bool done() const {
-        return !handle || handle.done();
+    [[nodiscard]] auto done() const -> bool {
+        return (handle == nullptr) || handle.done();
     }
 
     // Make Task awaitable
     auto operator co_await() const noexcept {
         struct Awaiter {
-            std::coroutine_handle<TaskPromise> h;
-            bool await_ready() const noexcept {
-                return !h || h.done();
+            std::coroutine_handle<TaskPromise> handle;
+            [[nodiscard]] auto await_ready() const noexcept -> bool {
+                return (handle == nullptr) || handle.done();
             }
             void await_suspend(std::coroutine_handle<> cont) const noexcept {
-                h.promise().continuation = cont;
-                if (h && !h.done()) {
-                    h.resume();
+                handle.promise().continuation = cont;
+                if ((handle != nullptr) && !handle.done()) {
+                    handle.resume();
                 } else {
                     cont.resume();
                 }
@@ -118,7 +131,7 @@ struct Task {
 };
 
 // Implement TaskPromise::get_return_object after Task is defined
-inline Task TaskPromise::get_return_object() {
+inline auto TaskPromise::get_return_object() -> Task {
     return Task{std::coroutine_handle<TaskPromise>::from_promise(*this)};
 }
 
@@ -130,7 +143,7 @@ class TaskQueue {
         Task task;
         std::atomic<Node*> next;
 
-        Node(Task t) : task(std::move(t)), next(nullptr) {}
+        Node(Task task_param) : task(std::move(task_param)), next(nullptr) {}
     };
 
     std::atomic<Node*> head_;
@@ -145,9 +158,15 @@ class TaskQueue {
         tail_.store(dummy);
     }
 
+    // Delete copy and move operations
+    TaskQueue(const TaskQueue&) = delete;
+    auto operator=(const TaskQueue&) -> TaskQueue& = delete;
+    TaskQueue(TaskQueue&&) = delete;
+    auto operator=(TaskQueue&&) -> TaskQueue& = delete;
+
     ~TaskQueue() {
         Node* node = head_.load();
-        while (node) {
+        while (node != nullptr) {
             Node* next = node->next.load();
             delete node;
             node = next;
@@ -160,7 +179,7 @@ class TaskQueue {
         prev_tail->next.store(node, std::memory_order_release);
     }
 
-    bool dequeue(Task& task) {
+    auto dequeue(Task& task) -> bool {
         std::lock_guard<std::mutex> lock(dequeue_mutex_);
 
         Node* head = head_.load(std::memory_order_acquire);
@@ -176,7 +195,7 @@ class TaskQueue {
         return true;
     }
 
-    bool empty() const {
+    [[nodiscard]] auto empty() const -> bool {
         Node* head = head_.load(std::memory_order_acquire);
         return head->next.load(std::memory_order_acquire) == nullptr;
     }
@@ -198,7 +217,7 @@ class IOContext {
         std::chrono::steady_clock::time_point next_fire;
         std::chrono::nanoseconds interval;
         bool repeat;
-        std::coroutine_handle<> handle;
+        std::shared_ptr<Task> task_ptr; // Store shared_ptr to keep Task and coroutine alive
     };
 
     struct TimerCompare {
@@ -209,6 +228,8 @@ class IOContext {
 
     std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerCompare> timers_;
     std::unordered_map<uint64_t, bool> cancelled_timers_;
+    std::unordered_map<void*, std::shared_ptr<Task>>
+        suspended_tasks_; // Track tasks suspended on timers
     std::mutex timer_mutex_;
     std::atomic<uint64_t> next_timer_id_{1};
 
@@ -229,29 +250,35 @@ class IOContext {
     int compute_wait_timeout_ms();
     uint64_t add_timer(std::chrono::steady_clock::time_point first_fire,
                        std::chrono::nanoseconds interval, bool repeat,
-                       std::coroutine_handle<> handle);
+                       std::shared_ptr<Task> task_ptr);
 
   public:
     explicit IOContext(std::size_t num_threads = std::thread::hardware_concurrency());
     ~IOContext();
 
+    // Delete copy and move operations
+    IOContext(const IOContext&) = delete;
+    auto operator=(const IOContext&) -> IOContext& = delete;
+    IOContext(IOContext&&) = delete;
+    auto operator=(IOContext&&) -> IOContext& = delete;
+
     // Run the event loop (blocking)
-    void run();
+    auto run() -> void;
 
     // Stop the event loop
-    void stop();
+    auto stop() -> void;
 
     // Schedule a coroutine task
-    void schedule(Task task);
+    auto schedule(Task task) -> void;
 
     // Register I/O operation
-    void register_io(int fd, uint32_t events, std::coroutine_handle<> handle);
+    auto register_io(int file_descriptor, uint32_t events, std::coroutine_handle<> handle) -> void;
 
     // Remove I/O registration for a file descriptor
-    void remove_io(int fd);
+    auto remove_io(int file_descriptor) -> void;
 
     // Cancel a scheduled timer
-    void cancel_timer(uint64_t timer_id);
+    auto cancel_timer(uint64_t timer_id) -> void;
 
     // Awaitables for timers
     struct TimerAwaiter {
@@ -261,12 +288,21 @@ class IOContext {
         bool repeat;
         uint64_t id{0};
 
-        bool await_ready() const noexcept {
+        [[nodiscard]] auto await_ready() const noexcept -> bool {
             return false;
         }
 
-        void await_suspend(std::coroutine_handle<> h) {
-            id = context->add_timer(next_fire, interval_duration, repeat, h);
+        void await_suspend(std::coroutine_handle<> handle_param) {
+            // Create a Task to keep the coroutine alive while suspended on timer
+            if (handle_param) {
+                auto task_handle =
+                    std::coroutine_handle<TaskPromise>::from_address(handle_param.address());
+                if (task_handle) {
+                    // Create shared_ptr to Task to keep it alive
+                    auto task_ptr = std::make_shared<Task>(task_handle);
+                    id = context->add_timer(next_fire, interval_duration, repeat, task_ptr);
+                }
+            }
         }
 
         void await_resume() const noexcept {}
@@ -305,12 +341,12 @@ class IOContext {
         std::coroutine_handle<> continuation;
         bool ready = false;
 
-        bool await_ready() const noexcept {
+        [[nodiscard]] auto await_ready() const noexcept -> bool {
             return ready;
         }
 
-        void await_suspend(std::coroutine_handle<> h) {
-            continuation = h;
+        void await_suspend(std::coroutine_handle<> handle) {
+            continuation = handle;
         }
 
         T await_resume() noexcept {

@@ -54,6 +54,36 @@ void IOContext::run() {
         for (auto& queue : thread_queues_) {
             Task task;
             while (queue.dequeue(task)) {
+                // Check if task handle is valid before accessing it
+                if (!task.handle) {
+                    continue;
+                }
+
+                // Check if this task is suspended on a timer BEFORE checking done()
+                // This avoids accessing potentially destroyed coroutine frame
+                void* handle_addr = task.handle.address();
+                bool is_suspended_on_timer = false;
+                {
+                    std::lock_guard<std::mutex> timer_lock(timer_mutex_);
+                    auto it = suspended_tasks_.find(handle_addr);
+                    if (it != suspended_tasks_.end()) {
+                        is_suspended_on_timer = true;
+                    }
+                }
+
+                // If suspended on timer, don't check done() or resume - timer will handle it
+                if (is_suspended_on_timer) {
+                    // Make Task non-owning - timer will handle resumption
+                    task.owns_handle = false;
+                    {
+                        std::lock_guard<std::mutex> timer_lock(timer_mutex_);
+                        suspended_tasks_.erase(handle_addr);
+                    }
+                    // Don't reschedule - timer will do it
+                    continue;
+                }
+
+                // Not suspended on timer - proceed normally
                 if (!task.done()) {
                     task.resume();
                     if (!task.done()) {
@@ -89,11 +119,34 @@ void IOContext::worker_thread(std::size_t queue_index) {
     while (running_.load(std::memory_order_acquire)) {
         Task task;
         if (queue.dequeue(task)) {
+            // Check if task handle is valid before accessing it
+            if (!task.handle) {
+                continue;
+            }
+
             if (!task.done()) {
                 task.resume();
                 if (!task.done()) {
-                    // Task not done, reschedule
-                    schedule(std::move(task));
+                    // Check if this task is suspended on a timer
+                    // by looking it up in the suspended_tasks_ map
+                    void* handle_addr = task.handle.address();
+                    bool is_suspended_on_timer = false;
+                    {
+                        std::lock_guard<std::mutex> timer_lock(timer_mutex_);
+                        auto it = suspended_tasks_.find(handle_addr);
+                        if (it != suspended_tasks_.end()) {
+                            is_suspended_on_timer = true;
+                            // Task is suspended on a timer - make it non-owning
+                            // The timer will handle resumption
+                            task.owns_handle = false;
+                            // Don't reschedule - timer will do it
+                            suspended_tasks_.erase(it);
+                        }
+                    }
+                    if (!is_suspended_on_timer) {
+                        // Task not done and not on timer, reschedule
+                        schedule(std::move(task));
+                    }
                 }
             }
         } else {
@@ -188,15 +241,22 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
 
     // Now schedule all handles without holding the lock
     for (auto handle : handles_to_resume) {
+        // Check if handle is valid before converting
+        if (!handle || handle.done()) {
+            continue;
+        }
         // Convert to TaskPromise handle
         auto task_handle = std::coroutine_handle<TaskPromise>::from_address(handle.address());
-        schedule(Task{task_handle});
+        // Additional validation - ensure handle is still valid
+        if (task_handle && !task_handle.done()) {
+            schedule(Task{task_handle});
+        }
     }
 }
 
 uint64_t IOContext::add_timer(std::chrono::steady_clock::time_point first_fire,
                               std::chrono::nanoseconds interval, bool repeat,
-                              std::coroutine_handle<> handle) {
+                              std::shared_ptr<Task> task_ptr) {
     uint64_t id = next_timer_id_.fetch_add(1, std::memory_order_relaxed);
     // Prevent zero-length repeating intervals from spinning
     if (repeat && interval.count() <= 0) {
@@ -208,7 +268,11 @@ uint64_t IOContext::add_timer(std::chrono::steady_clock::time_point first_fire,
         first_fire = now + std::chrono::milliseconds(1);
     }
     std::lock_guard<std::mutex> lock(timer_mutex_);
-    timers_.push(TimerEntry{id, first_fire, interval, repeat, handle});
+    // Track this task as suspended on a timer
+    if (task_ptr && task_ptr->handle) {
+        suspended_tasks_[task_ptr->handle.address()] = task_ptr;
+    }
+    timers_.push(TimerEntry{id, first_fire, interval, repeat, task_ptr});
     return id;
 }
 
@@ -219,8 +283,14 @@ void IOContext::cancel_timer(uint64_t timer_id) {
 
 void IOContext::process_timers() {
     using namespace std::chrono;
+
+    // Don't process timers if we're stopping
+    if (!running_.load(std::memory_order_acquire)) {
+        return;
+    }
+
     auto now = steady_clock::now();
-    std::vector<std::coroutine_handle<>> ready;
+    std::vector<std::shared_ptr<Task>> ready_tasks;
 
     {
         std::lock_guard<std::mutex> lock(timer_mutex_);
@@ -240,21 +310,59 @@ void IOContext::process_timers() {
 
             timers_.pop();
 
-            ready.push_back(entry.handle);
+            // Store task for later resumption
+            ready_tasks.push_back(entry.task_ptr);
 
             if (entry.repeat) {
                 // Maintain consistent period regardless of processing delay
                 do {
                     entry.next_fire += entry.interval;
                 } while (entry.next_fire <= now);
+                // Re-add the entry with the same task_ptr
                 timers_.push(entry);
             }
         }
     }
 
-    for (auto handle : ready) {
-        auto task_handle = std::coroutine_handle<TaskPromise>::from_address(handle.address());
-        schedule(Task{task_handle});
+    // Check again before processing - context might have stopped
+    if (!running_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    for (auto& task_ptr : ready_tasks) {
+        // Check if context is still running before scheduling
+        if (!running_.load(std::memory_order_acquire)) {
+            continue;
+        }
+
+        // Check if task_ptr is valid
+        if (!task_ptr) {
+            continue;
+        }
+
+        // Extract the handle first
+        auto handle = task_ptr->handle;
+        if (!handle) {
+            continue;
+        }
+
+        // Remove from suspended_tasks_ map since timer is firing
+        {
+            std::lock_guard<std::mutex> lock(timer_mutex_);
+            suspended_tasks_.erase(handle.address());
+        }
+
+        // Clear the handle in the shared Task and make it non-owning
+        // This transfers ownership to the new Task we'll create
+        task_ptr->handle = {};
+        task_ptr->owns_handle = false;
+
+        // Create new Task with ownership of the handle
+        Task task_to_schedule{handle};
+        task_to_schedule.owns_handle = true;
+
+        // Schedule the task - Task::resume() will check if handle is done
+        schedule(std::move(task_to_schedule));
     }
 }
 

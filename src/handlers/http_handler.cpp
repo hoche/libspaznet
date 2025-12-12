@@ -74,6 +74,13 @@ std::vector<uint8_t> HTTPResponse::serialize() const {
         oss << key << ": " << value << "\r\n";
     }
 
+    // Automatically add Content-Length if body is present and not already set
+    // and not using chunked transfer encoding
+    if (!body.empty() && headers.find("Content-Length") == headers.end() &&
+        headers.find("Transfer-Encoding") == headers.end()) {
+        oss << "Content-Length: " << body.size() << "\r\n";
+    }
+
     // Empty line separates headers from body
     oss << "\r\n";
 

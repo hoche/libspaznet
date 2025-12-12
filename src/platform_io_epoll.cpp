@@ -1,8 +1,9 @@
 #ifdef USE_EPOLL
 
-#include <errno.h>
 #include <sys/epoll.h>
 #include <unistd.h>
+#include <array>
+#include <cerrno>
 #include <cstring>
 #include <libspaznet/platform_io.hpp>
 
@@ -10,61 +11,75 @@ namespace spaznet {
 
 class PlatformIOEpoll : public PlatformIO {
   private:
-    int epoll_fd_;
+    int epoll_fd_{-1};
     static constexpr int MAX_EVENTS = 64;
 
   public:
-    PlatformIOEpoll() : epoll_fd_(-1) {}
+    PlatformIOEpoll() = default;
+
+    // Delete copy and move operations
+    PlatformIOEpoll(const PlatformIOEpoll&) = delete;
+    auto operator=(const PlatformIOEpoll&) -> PlatformIOEpoll& = delete;
+    PlatformIOEpoll(PlatformIOEpoll&&) = delete;
+    auto operator=(PlatformIOEpoll&&) -> PlatformIOEpoll& = delete;
 
     ~PlatformIOEpoll() override {
         cleanup();
     }
 
-    bool init() override {
+    auto init() -> bool override {
         epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
         return epoll_fd_ >= 0;
     }
 
-    bool add_fd(int fd, uint32_t events, void* user_data) override {
-        epoll_event ev{};
-        ev.events = 0;
-        if (events & EVENT_READ)
-            ev.events |= EPOLLIN;
-        if (events & EVENT_WRITE)
-            ev.events |= EPOLLOUT;
-        if (events & EVENT_ERROR)
-            ev.events |= EPOLLERR | EPOLLHUP;
-        if (events & EVENT_EDGE_TRIGGER)
-            ev.events |= EPOLLET;
-        ev.data.ptr = user_data;
+    auto add_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
+        epoll_event event{};
+        event.events = 0;
+        if ((events & EVENT_READ) != 0U) {
+            event.events |= EPOLLIN;
+        }
+        if ((events & EVENT_WRITE) != 0U) {
+            event.events |= EPOLLOUT;
+        }
+        if ((events & EVENT_ERROR) != 0U) {
+            event.events |= EPOLLERR | EPOLLHUP;
+        }
+        if ((events & EVENT_EDGE_TRIGGER) != 0U) {
+            event.events |= EPOLLET;
+        }
+        event.data.ptr = user_data;
 
-        return epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) == 0;
+        return epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, file_descriptor, &event) == 0;
     }
 
-    bool modify_fd(int fd, uint32_t events, void* user_data) override {
-        epoll_event ev{};
-        ev.events = 0;
-        if (events & EVENT_READ)
-            ev.events |= EPOLLIN;
-        if (events & EVENT_WRITE)
-            ev.events |= EPOLLOUT;
-        if (events & EVENT_ERROR)
-            ev.events |= EPOLLERR | EPOLLHUP;
-        if (events & EVENT_EDGE_TRIGGER)
-            ev.events |= EPOLLET;
-        ev.data.ptr = user_data;
+    auto modify_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
+        epoll_event event{};
+        event.events = 0;
+        if ((events & EVENT_READ) != 0U) {
+            event.events |= EPOLLIN;
+        }
+        if ((events & EVENT_WRITE) != 0U) {
+            event.events |= EPOLLOUT;
+        }
+        if ((events & EVENT_ERROR) != 0U) {
+            event.events |= EPOLLERR | EPOLLHUP;
+        }
+        if ((events & EVENT_EDGE_TRIGGER) != 0U) {
+            event.events |= EPOLLET;
+        }
+        event.data.ptr = user_data;
 
-        return epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) == 0;
+        return epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, file_descriptor, &event) == 0;
     }
 
-    bool remove_fd(int fd) override {
-        epoll_event ev{};
-        return epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, &ev) == 0;
+    auto remove_fd(int file_descriptor) -> bool override {
+        epoll_event event{};
+        return epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, file_descriptor, &event) == 0;
     }
 
-    int wait(std::vector<Event>& events, int timeout_ms) override {
-        epoll_event epoll_events[MAX_EVENTS];
-        int nfds = epoll_wait(epoll_fd_, epoll_events, MAX_EVENTS, timeout_ms);
+    auto wait(std::vector<Event>& events, int timeout_ms) -> int override {
+        std::array<epoll_event, MAX_EVENTS> epoll_events{};
+        int nfds = epoll_wait(epoll_fd_, epoll_events.data(), MAX_EVENTS, timeout_ms);
 
         if (nfds < 0) {
             return -1;
@@ -73,21 +88,26 @@ class PlatformIOEpoll : public PlatformIO {
         events.clear();
         events.reserve(nfds);
 
+        // NOLINTBEGIN(cppcoreguidelines-pro-bounds-constant-array-index)
         for (int i = 0; i < nfds; ++i) {
-            Event ev{};
-            ev.fd = -1; // We use user_data to identify the socket
-            ev.user_data = epoll_events[i].data.ptr;
-            ev.events = 0;
+            Event event{};
+            event.fd = -1; // We use user_data to identify the socket
+            event.user_data = epoll_events[i].data.ptr;
+            event.events = 0;
 
-            if (epoll_events[i].events & EPOLLIN)
-                ev.events |= EVENT_READ;
-            if (epoll_events[i].events & EPOLLOUT)
-                ev.events |= EVENT_WRITE;
-            if (epoll_events[i].events & (EPOLLERR | EPOLLHUP))
-                ev.events |= EVENT_ERROR;
+            if ((epoll_events[i].events & EPOLLIN) != 0U) {
+                event.events |= EVENT_READ;
+            }
+            if ((epoll_events[i].events & EPOLLOUT) != 0U) {
+                event.events |= EVENT_WRITE;
+            }
+            if ((epoll_events[i].events & (EPOLLERR | EPOLLHUP)) != 0U) {
+                event.events |= EVENT_ERROR;
+            }
 
-            events.push_back(ev);
+            events.push_back(event);
         }
+        // NOLINTEND(cppcoreguidelines-pro-bounds-constant-array-index)
 
         return nfds;
     }

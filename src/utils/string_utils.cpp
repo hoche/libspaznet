@@ -5,14 +5,15 @@
 
 namespace spaznet {
 
-std::string StringUtils::to_lower(const std::string& input) {
+auto StringUtils::to_lower(const std::string& input) -> std::string {
     std::string result = input;
-    std::transform(result.begin(), result.end(), result.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
     return result;
 }
 
-std::string StringUtils::trim_ows(const std::string& input) {
+auto StringUtils::trim_ows(const std::string& input) -> std::string {
     size_t start = 0;
     while (start < input.size() && (input[start] == ' ' || input[start] == '\t')) {
         ++start;
