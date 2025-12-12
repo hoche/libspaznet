@@ -10,6 +10,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
+#include <format>
 #include <iostream>
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/server.hpp>
@@ -391,7 +392,7 @@ void Server::listen_tcp(uint16_t port) {
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE; // For wildcard bind address
 
-    std::string port_str = std::to_string(port);
+    std::string port_str = std::format("{}", port);
     if (getaddrinfo(nullptr, port_str.c_str(), &hints, &result) != 0) {
         throw std::runtime_error("Failed to resolve address");
     }
@@ -446,7 +447,7 @@ void Server::listen_udp(uint16_t port) {
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_flags = AI_PASSIVE;
 
-    std::string port_str = std::to_string(port);
+    std::string port_str = std::format("{}", port);
     if (getaddrinfo(nullptr, port_str.c_str(), &hints, &result) != 0) {
         throw std::runtime_error("Failed to resolve address for UDP");
     }
