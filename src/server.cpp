@@ -5,7 +5,9 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstring>
 #include <iostream>
 #include <libspaznet/io_context.hpp>
@@ -318,94 +320,121 @@ Task Server::handle_connection(Socket socket) {
 
     try {
         std::vector<uint8_t> buffer;
-        co_await socket.async_read(buffer, 4096);
+        co_await socket.async_read(buffer, 8192);  // Increased buffer for larger requests
 
         if (buffer.empty()) {
             socket.close();
             co_return;
         }
 
-        // Try to parse as HTTP
-        std::string request_str(buffer.begin(), buffer.end());
-        std::istringstream iss(request_str);
-        std::string line;
-
-        if (std::getline(iss, line)) {
-            // Remove trailing \r if present
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
+        // Try to parse as HTTP/1.1 per RFC 9112
+        if (http_handler_) {
+            HTTPRequest request;
+            size_t bytes_consumed = 0;
+            HTTPParser::ParseResult parse_result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+            
+            if (parse_result == HTTPParser::ParseResult::Incomplete) {
+                // Need more data - read more
+                std::vector<uint8_t> more_data;
+                co_await socket.async_read(more_data, 8192);
+                buffer.insert(buffer.end(), more_data.begin(), more_data.end());
+                
+                parse_result = HTTPParser::parse_request(buffer, request, bytes_consumed);
             }
-
-            if (line.find("HTTP/") != std::string::npos) {
-                // HTTP request - parse the request line
-                if (http_handler_) {
-                    HTTPRequest request;
-                    HTTPResponse response;
-
-                    // Simple parsing (in production, use a proper parser)
-                    std::istringstream line_stream(line);
-                    line_stream >> request.method >> request.path >> request.version;
-
-                    // Parse headers
-                    while (std::getline(iss, line)) {
-                        // Remove trailing \r
-                        if (!line.empty() && line.back() == '\r') {
-                            line.pop_back();
-                        }
-                        // Empty line marks end of headers
-                        if (line.empty()) {
-                            break;
-                        }
-
-                        size_t colon = line.find(':');
-                        if (colon != std::string::npos) {
-                            std::string key = line.substr(0, colon);
-                            std::string value = line.substr(colon + 1);
-                            // Trim leading whitespace from value
-                            while (!value.empty() && value[0] == ' ') {
-                                value.erase(0, 1);
-                            }
-                            request.headers[key] = value;
-                        }
-                    }
-
-                    co_await http_handler_->handle_request(request, response, socket);
-
-                    auto response_data = response.serialize();
-                    co_await socket.async_write(response_data);
+            
+            if (parse_result == HTTPParser::ParseResult::Success) {
+                HTTPResponse response;
+                response.version = "1.1";
+                
+                // Handle request
+                co_await http_handler_->handle_request(request, response, socket);
+                
+                // Set Connection header based on request
+                if (!request.should_keep_alive()) {
+                    response.set_header("Connection", "close");
+                } else {
+                    response.set_header("Connection", "keep-alive");
                 }
-            } else if (websocket_handler_ && (line.find("GET") == 0 || line.find("POST") == 0)) {
-                // WebSocket upgrade request
-                if (websocket_handler_) {
-                    // Handle WebSocket upgrade
-                    co_await websocket_handler_->on_open(socket);
+                
+                // Serialize and send response
+                std::vector<uint8_t> response_data;
+                auto te = response.get_header("Transfer-Encoding");
+                if (te) {
+                    std::string te_lower = *te;
+                    std::transform(te_lower.begin(), te_lower.end(), te_lower.begin(),
+                                 [](unsigned char c) { return std::tolower(c); });
+                    if (te_lower.find("chunked") != std::string::npos) {
+                        response_data = response.serialize_chunked();
+                    } else {
+                        response_data = response.serialize();
+                    }
+                } else {
+                    response_data = response.serialize();
+                }
+                
+                co_await socket.async_write(response_data);
+                
+                // Close connection if Connection: close
+                if (!request.should_keep_alive()) {
+                    socket.close();
+                }
+            } else {
+                // Parse error - send 400 Bad Request
+                HTTPResponse error_response;
+                error_response.version = "1.1";
+                error_response.status_code = 400;
+                error_response.reason_phrase = "Bad Request";
+                error_response.set_header("Connection", "close");
+                error_response.set_header("Content-Length", "0");
+                
+                auto error_data = error_response.serialize();
+                co_await socket.async_write(error_data);
+                socket.close();
+            }
+        } else if (websocket_handler_) {
+            // Check if this looks like a WebSocket upgrade request
+            std::string request_str(buffer.begin(), buffer.end());
+            std::istringstream iss(request_str);
+            std::string line;
+            
+            if (std::getline(iss, line)) {
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+                
+                if (line.find("GET") == 0 || line.find("POST") == 0) {
+                    // WebSocket upgrade request
+                    if (websocket_handler_) {
+                        // Handle WebSocket upgrade
+                        co_await websocket_handler_->on_open(socket);
 
-                    // Read WebSocket frames
-                    while (true) {
-                        std::vector<uint8_t> frame_data;
-                        co_await socket.async_read(frame_data, 4096);
+                        // Read WebSocket frames
+                        while (true) {
+                            std::vector<uint8_t> frame_data;
+                            co_await socket.async_read(frame_data, 4096);
 
-                        if (frame_data.empty()) {
-                            break;
-                        }
-
-                        try {
-                            auto frame = WebSocketFrame::parse(frame_data);
-                            WebSocketMessage msg;
-                            msg.opcode = frame.opcode;
-                            msg.data = frame.payload;
-
-                            co_await websocket_handler_->handle_message(msg, socket);
-
-                            if (frame.opcode == WebSocketOpcode::Close) {
+                            if (frame_data.empty()) {
                                 break;
                             }
-                        } catch (...) {
-                            break;
-                        }
-                    }
 
-                    co_await websocket_handler_->on_close(socket);
+                            try {
+                                auto frame = WebSocketFrame::parse(frame_data);
+                                WebSocketMessage msg;
+                                msg.opcode = frame.opcode;
+                                msg.data = frame.payload;
+
+                                co_await websocket_handler_->handle_message(msg, socket);
+
+                                if (frame.opcode == WebSocketOpcode::Close) {
+                                    break;
+                                }
+                            } catch (...) {
+                                break;
+                            }
+                        }
+
+                        co_await websocket_handler_->on_close(socket);
+                    }
                 }
             }
         }

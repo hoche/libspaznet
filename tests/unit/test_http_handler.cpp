@@ -8,7 +8,7 @@ using namespace spaznet;
 TEST(HTTPResponseTest, SerializeBasic) {
     HTTPResponse response;
     response.status_code = 200;
-    response.status_message = "OK";
+    response.reason_phrase = "OK";
     response.set_header("Content-Type", "text/plain");
     response.body = {'H', 'e', 'l', 'l', 'o'};
 
@@ -24,7 +24,7 @@ TEST(HTTPResponseTest, SerializeBasic) {
 TEST(HTTPResponseTest, SerializeWithCustomHeaders) {
     HTTPResponse response;
     response.status_code = 404;
-    response.status_message = "Not Found";
+    response.reason_phrase = "Not Found";
     response.set_header("Content-Type", "text/html");
     response.set_header("X-Custom-Header", "custom-value");
     response.body = {'<', 'h', '1', '>', '4', '0', '4', '<', '/', 'h', '1', '>'};
@@ -40,7 +40,7 @@ TEST(HTTPResponseTest, SerializeWithCustomHeaders) {
 TEST(HTTPResponseTest, SerializeEmptyBody) {
     HTTPResponse response;
     response.status_code = 204;
-    response.status_message = "No Content";
+    response.reason_phrase = "No Content";
 
     auto serialized = response.serialize();
     std::string result(serialized.begin(), serialized.end());
@@ -52,7 +52,7 @@ TEST(HTTPResponseTest, SerializeEmptyBody) {
 TEST(HTTPResponseTest, SerializeLargeBody) {
     HTTPResponse response;
     response.status_code = 200;
-    response.status_message = "OK";
+    response.reason_phrase = "OK";
     response.set_header("Content-Type", "application/octet-stream");
 
     // Create a large body
@@ -86,15 +86,15 @@ TEST(HTTPResponseTest, OverwriteHeader) {
 TEST(HTTPRequestTest, RequestStructure) {
     HTTPRequest request;
     request.method = "GET";
-    request.path = "/test";
-    request.version = "HTTP/1.1";
+    request.request_target = "/test";
+    request.version = "1.1";  // Version is just "1.1", not "HTTP/1.1"
     request.headers["Host"] = "example.com";
     request.headers["User-Agent"] = "test-agent";
     request.body = {'d', 'a', 't', 'a'};
 
     EXPECT_EQ(request.method, "GET");
-    EXPECT_EQ(request.path, "/test");
-    EXPECT_EQ(request.version, "HTTP/1.1");
+    EXPECT_EQ(request.request_target, "/test");
+    EXPECT_EQ(request.version, "1.1");
     EXPECT_EQ(request.headers["Host"], "example.com");
     EXPECT_EQ(request.headers["User-Agent"], "test-agent");
     EXPECT_EQ(request.body.size(), 4);

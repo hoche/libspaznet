@@ -31,7 +31,7 @@ class LatencyHTTPHandler : public HTTPHandler {
     Task handle_request(const HTTPRequest& request, HTTPResponse& response,
                         Socket& socket) override {
         response.status_code = 200;
-        response.status_message = "OK";
+        response.reason_phrase = "OK";
         response.set_header("Content-Type", "text/plain");
         response.body = {'O', 'K'};
         co_return;

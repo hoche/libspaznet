@@ -38,7 +38,7 @@ class ThroughputHTTPHandler : public HTTPHandler {
         request_count.fetch_add(1);
 
         response.status_code = 200;
-        response.status_message = "OK";
+        response.reason_phrase = "OK";
         response.set_header("Content-Type", "text/plain");
         response.body = {'O', 'K'};
 

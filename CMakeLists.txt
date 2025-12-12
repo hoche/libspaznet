@@ -27,6 +27,10 @@ set(SOURCES
     src/handlers/http_handler.cpp
     src/handlers/http2_handler.cpp
     src/handlers/websocket_handler.cpp
+    src/utils/string_utils.cpp
+    src/utils/number_utils.cpp
+    src/utils/binary_utils.cpp
+    src/utils/header_utils.cpp
     src/server.cpp
 )
 
@@ -38,6 +42,10 @@ set(HEADERS
     include/libspaznet/handlers/http_handler.hpp
     include/libspaznet/handlers/http2_handler.hpp
     include/libspaznet/handlers/websocket_handler.hpp
+    include/libspaznet/utils/string_utils.hpp
+    include/libspaznet/utils/number_utils.hpp
+    include/libspaznet/utils/binary_utils.hpp
+    include/libspaznet/utils/header_utils.hpp
     include/libspaznet/server.hpp
 )
 
@@ -100,6 +108,8 @@ add_executable(test_unit
     tests/unit/test_http_handler.cpp
     tests/unit/test_websocket_handler.cpp
     tests/unit/test_http2_handler.cpp
+    tests/unit/test_rfc9112_parser.cpp
+    tests/unit/test_rfc9113_parser.cpp
 )
 
 target_link_libraries(test_unit
@@ -116,6 +126,8 @@ add_executable(test_integration
     tests/integration/test_websocket_server.cpp
     tests/integration/test_udp_server.cpp
     tests/integration/test_concurrent_connections.cpp
+    tests/integration/test_rfc9112_compliance.cpp
+    tests/integration/test_rfc9113_compliance.cpp
 )
 
 target_link_libraries(test_integration
@@ -131,6 +143,8 @@ add_executable(test_performance
     tests/performance/test_latency.cpp
     tests/performance/test_concurrent_performance.cpp
     tests/performance/test_iperf_integration.cpp
+    tests/performance/test_rfc9112_performance.cpp
+    tests/performance/test_rfc9113_performance.cpp
 )
 
 target_link_libraries(test_performance

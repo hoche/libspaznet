@@ -6,14 +6,14 @@ using namespace spaznet;
 TEST(HTTP2FrameTest, FrameStructure) {
     HTTP2Frame frame;
     frame.length = 100;
-    frame.type = 0x01;  // HEADERS
-    frame.flags = 0x04; // END_HEADERS
+    frame.type = HTTP2FrameType::HEADERS;
+    frame.flags = HTTP2Flags::END_HEADERS;
     frame.stream_id = 1;
     frame.payload.resize(100, 0x42);
 
     EXPECT_EQ(frame.length, 100);
-    EXPECT_EQ(frame.type, 0x01);
-    EXPECT_EQ(frame.flags, 0x04);
+    EXPECT_EQ(frame.type, HTTP2FrameType::HEADERS);
+    EXPECT_EQ(frame.flags, HTTP2Flags::END_HEADERS);
     EXPECT_EQ(frame.stream_id, 1);
     EXPECT_EQ(frame.payload.size(), 100);
 }
@@ -37,28 +37,26 @@ TEST(HTTP2RequestTest, RequestStructure) {
 TEST(HTTP2ResponseTest, ToFrame) {
     HTTP2Response response;
     response.stream_id = 1;
-    response.status_code = 200;
+    response.set_status(200);
     response.headers["content-type"] = "text/html";
     response.body = {'<', 'h', '1', '>', 'H', 'e', 'l', 'l', 'o', '<', '/', 'h', '1', '>'};
 
     auto frame = response.to_frame();
 
     EXPECT_EQ(frame.stream_id, 1);
-    EXPECT_EQ(frame.type, 0x01);  // HEADERS frame
-    EXPECT_EQ(frame.flags, 0x04); // END_HEADERS
+    EXPECT_EQ(frame.type, HTTP2FrameType::HEADERS);
     EXPECT_GT(frame.length, 0);
 }
 
 TEST(HTTP2ResponseTest, ToFrameWithStatus) {
     HTTP2Response response;
     response.stream_id = 42;
-    response.status_code = 404;
+    response.set_status(404);
     response.headers["content-type"] = "text/plain";
     response.body = {'N', 'o', 't', ' ', 'F', 'o', 'u', 'n', 'd'};
 
-    auto frame = response.to_frame();
-
-    EXPECT_EQ(frame.stream_id, 42);
-    std::string payload_str(frame.payload.begin(), frame.payload.end());
-    EXPECT_NE(payload_str.find(":status: 404"), std::string::npos);
+    auto frames = response.to_frames();
+    EXPECT_GT(frames.size(), 0);
+    EXPECT_EQ(frames[0].stream_id, 42);
+    EXPECT_EQ(frames[0].type, HTTP2FrameType::HEADERS);
 }

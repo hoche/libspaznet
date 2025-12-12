@@ -125,7 +125,7 @@ Or run tests individually:
 - Throughput benchmarks (requests per second)
 - Latency measurements (min, max, mean, median, P95, P99)
 - Concurrent connection performance
-- iperf3 integration for bandwidth testing
+- iperf/iperf3 integration for bandwidth testing
 
 ### Performance Benchmarking
 
@@ -182,7 +182,7 @@ make lint
 
 ```cpp
 #include <libspaznet/server.hpp>
-#include <libspaznet/http_handler.hpp>
+#include <libspaznet/handlers/http_handler.hpp>
 
 class MyHTTPHandler : public spaznet::HTTPHandler {
 public:
@@ -242,6 +242,3 @@ make test        # Run tests
 make build       # Build
 ```
 
-## License
-
-This project is provided as-is for educational and development purposes.

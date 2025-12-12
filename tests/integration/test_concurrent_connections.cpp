@@ -35,7 +35,7 @@ class ConcurrentHTTPHandler : public HTTPHandler {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
         response.status_code = 200;
-        response.status_message = "OK";
+        response.reason_phrase = "OK";
         response.set_header("Content-Type", "text/plain");
         response.body = {'O', 'K'};
 
