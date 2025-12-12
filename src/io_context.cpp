@@ -202,6 +202,11 @@ uint64_t IOContext::add_timer(std::chrono::steady_clock::time_point first_fire,
     if (repeat && interval.count() <= 0) {
         interval = std::chrono::milliseconds(1);
     }
+    // Ensure the timer fires at least 1ms in the future to avoid immediate firing
+    auto now = std::chrono::steady_clock::now();
+    if (first_fire <= now) {
+        first_fire = now + std::chrono::milliseconds(1);
+    }
     std::lock_guard<std::mutex> lock(timer_mutex_);
     timers_.push(TimerEntry{id, first_fire, interval, repeat, handle});
     return id;
