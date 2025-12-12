@@ -100,10 +100,10 @@ Task QUICConnection::process_packet(const std::vector<uint8_t>& packet) {
             stream->receive_offset_ += frame.data.size();
             if (frame.fin) {
                 stream->receive_fin_ = true;
-                if (stream->state_ == QUICStreamState::Open) {
-                    stream->state_ = QUICStreamState::HalfClosedRemote;
-                } else if (stream->state_ == QUICStreamState::HalfClosedLocal) {
-                    stream->state_ = QUICStreamState::Closed;
+                if (stream->state() == QUICStreamState::Open) {
+                    stream->set_state(QUICStreamState::HalfClosedRemote);
+                } else if (stream->state() == QUICStreamState::HalfClosedLocal) {
+                    stream->set_state(QUICStreamState::Closed);
                 }
             }
         }
@@ -144,6 +144,7 @@ Task QUICConnection::close() {
     state_ = QUICConnectionState::Closing;
     // Send CONNECTION_CLOSE frame
     state_ = QUICConnectionState::Closed;
+    co_return;
 }
 
 bool QUICConnection::parse_packet(const std::vector<uint8_t>& packet, QUICPacketType& type,

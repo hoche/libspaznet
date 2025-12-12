@@ -196,7 +196,7 @@ class IOContext {
     struct TimerEntry {
         uint64_t id;
         std::chrono::steady_clock::time_point next_fire;
-        std::chrono::steady_clock::nanoseconds interval;
+        std::chrono::nanoseconds interval;
         bool repeat;
         std::coroutine_handle<> handle;
     };
@@ -228,7 +228,7 @@ class IOContext {
     void process_timers();
     int compute_wait_timeout_ms();
     uint64_t add_timer(std::chrono::steady_clock::time_point first_fire,
-                       std::chrono::steady_clock::nanoseconds interval, bool repeat,
+                       std::chrono::nanoseconds interval, bool repeat,
                        std::coroutine_handle<> handle);
 
   public:
@@ -257,7 +257,7 @@ class IOContext {
     struct TimerAwaiter {
         IOContext* context;
         std::chrono::steady_clock::time_point next_fire;
-        std::chrono::steady_clock::nanoseconds interval;
+        std::chrono::nanoseconds interval_duration;
         bool repeat;
         uint64_t id{0};
 
@@ -266,7 +266,7 @@ class IOContext {
         }
 
         void await_suspend(std::coroutine_handle<> h) {
-            id = context->add_timer(next_fire, interval, repeat, h);
+            id = context->add_timer(next_fire, interval_duration, repeat, h);
         }
 
         void await_resume() const noexcept {}
@@ -274,20 +274,24 @@ class IOContext {
 
     TimerAwaiter sleep_for(std::chrono::steady_clock::duration delay) {
         auto now = std::chrono::steady_clock::now();
-        return TimerAwaiter{this, now + delay, delay, false};
+        auto delay_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(delay);
+        return TimerAwaiter{this, now + delay, delay_ns, false};
     }
 
     TimerAwaiter sleep_until(std::chrono::steady_clock::time_point time_point) {
+        auto now = std::chrono::steady_clock::now();
         auto delay = std::chrono::steady_clock::duration::zero();
-        if (time_point > std::chrono::steady_clock::now()) {
-            delay = time_point - std::chrono::steady_clock::now();
+        if (time_point > now) {
+            delay = time_point - now;
         }
-        return TimerAwaiter{this, std::chrono::steady_clock::now() + delay, delay, false};
+        auto delay_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(delay);
+        return TimerAwaiter{this, now + delay, delay_ns, false};
     }
 
     TimerAwaiter interval(std::chrono::steady_clock::duration period) {
         auto now = std::chrono::steady_clock::now();
-        return TimerAwaiter{this, now + period, period, true};
+        auto period_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(period);
+        return TimerAwaiter{this, now + period, period_ns, true};
     }
 
     // Get platform I/O interface
