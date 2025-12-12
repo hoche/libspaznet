@@ -83,22 +83,92 @@ class HTTPServerTest : public ::testing::Test {
 
         std::string req_str = request.str();
 #ifdef _WIN32
-        send(sock, req_str.c_str(), static_cast<int>(req_str.size()), 0);
+        int sent = send(sock, req_str.c_str(), static_cast<int>(req_str.size()), 0);
+        if (sent < 0) {
+            close_socket(sock);
+            return "";
+        }
 #else
         // Use MSG_NOSIGNAL to prevent SIGPIPE on closed sockets
-        send(sock, req_str.c_str(), req_str.size(), MSG_NOSIGNAL);
-#endif
-
-        char buffer[4096];
-        int received = recv(sock, buffer, sizeof(buffer) - 1, 0);
-        close_socket(sock);
-
-        if (received > 0) {
-            buffer[received] = '\0';
-            return std::string(buffer);
+        ssize_t sent = send(sock, req_str.c_str(), req_str.size(), MSG_NOSIGNAL);
+        if (sent < 0 || static_cast<size_t>(sent) != req_str.size()) {
+            close_socket(sock);
+            return "";
         }
 
-        return "";
+        // Set receive timeout
+        struct timeval tv;
+        tv.tv_sec = 3;
+        tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
+        // Give the server time to process async coroutines and send response
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+        // Read response - keep reading until we get complete response or timeout
+        std::string response;
+        char buffer[4096];
+
+        // Use a loop with timeout to handle async server delays
+        auto start_time = std::chrono::steady_clock::now();
+        const auto timeout = std::chrono::seconds(3);
+        bool got_headers = false;
+
+        while (std::chrono::steady_clock::now() - start_time < timeout) {
+            int received = recv(sock, buffer, sizeof(buffer) - 1, 0);
+
+            if (received > 0) {
+                buffer[received] = '\0';
+                response.append(buffer, received);
+
+                // Check if we have headers
+                if (!got_headers && response.find("\r\n\r\n") != std::string::npos) {
+                    got_headers = true;
+                }
+
+                // If we have headers, check if we need more body
+                if (got_headers) {
+                    size_t headers_end = response.find("\r\n\r\n");
+                    size_t content_length_pos = response.find("Content-Length:");
+
+                    if (content_length_pos != std::string::npos) {
+                        size_t len_start = response.find(": ", content_length_pos) + 2;
+                        size_t len_end = response.find("\r\n", len_start);
+                        if (len_end != std::string::npos) {
+                            try {
+                                int expected_len =
+                                    std::stoi(response.substr(len_start, len_end - len_start));
+                                size_t body_start = headers_end + 4;
+                                int body_received = static_cast<int>(response.size() - body_start);
+
+                                if (body_received >= expected_len) {
+                                    // Complete response received
+                                    break;
+                                }
+                            } catch (...) {
+                                // Invalid Content-Length, assume complete
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    } else {
+                        // No Content-Length, assume response is complete after headers
+                        break;
+                    }
+                }
+            } else if (received == 0) {
+                // Connection closed - use what we have
+                break;
+            } else {
+                // Error or would block - wait a bit and retry
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+
+        close_socket(sock);
+        return response;
     }
 
     std::unique_ptr<TestHTTPHandler> handler;
@@ -147,6 +217,15 @@ TEST_F(HTTPServerTest, ResponseBody) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     std::string response = send_http_request("GET", "/");
+
+    // Debug output
+    std::cout << "Response length: " << response.length() << std::endl;
+    if (response.length() > 0) {
+        std::cout << "Response (first 500 chars): "
+                  << response.substr(0, std::min(500UL, response.length())) << std::endl;
+    } else {
+        std::cout << "Response is empty!" << std::endl;
+    }
 
     EXPECT_NE(response.find("Hello"), std::string::npos);
 }

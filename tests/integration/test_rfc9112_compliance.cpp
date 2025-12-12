@@ -1,8 +1,4 @@
-#include <arpa/inet.h>
 #include <gtest/gtest.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 #include <atomic>
 #include <chrono>
 #include <libspaznet/handlers/http_handler.hpp>
@@ -15,6 +11,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #define close_socket closesocket
+#define inet_addr(x) inet_addr(x)
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -64,9 +61,14 @@ class RFC9112TestHandler : public HTTPHandler {
 class RFC9112IntegrationTest : public ::testing::Test {
   protected:
     void SetUp() override {
-        handler = std::make_unique<RFC9112TestHandler>();
+        // Create handler first and keep a raw pointer for test assertions
+        auto handler_unique = std::make_unique<RFC9112TestHandler>();
+        handler = handler_unique.get();
+
         server = std::make_unique<Server>(2);
-        server->set_http_handler(std::make_unique<RFC9112TestHandler>());
+        // Transfer ownership to server
+        server->set_http_handler(std::move(handler_unique));
+
         server->listen_tcp(9996);
 
         server_thread = std::thread([this]() { server->run(); });
@@ -103,7 +105,28 @@ class RFC9112IntegrationTest : public ::testing::Test {
         if (sock < 0)
             return "";
 
-        send(sock, request.c_str(), request.size(), 0);
+#ifdef _WIN32
+        int sent = send(sock, request.c_str(), static_cast<int>(request.size()), 0);
+        if (sent < 0) {
+            close_socket(sock);
+            return "";
+        }
+#else
+        ssize_t sent = send(sock, request.c_str(), request.size(), MSG_NOSIGNAL);
+        if (sent < 0 || static_cast<size_t>(sent) != request.size()) {
+            close_socket(sock);
+            return "";
+        }
+
+        // Set receive timeout
+        struct timeval tv;
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
+        // Give server time to process
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
         char buffer[4096];
         int received = recv(sock, buffer, sizeof(buffer) - 1, 0);
@@ -117,7 +140,7 @@ class RFC9112IntegrationTest : public ::testing::Test {
         return "";
     }
 
-    std::unique_ptr<RFC9112TestHandler> handler;
+    RFC9112TestHandler* handler; // Raw pointer since server owns the unique_ptr
     std::unique_ptr<Server> server;
     std::thread server_thread;
 };

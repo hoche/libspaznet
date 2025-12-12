@@ -1,10 +1,10 @@
 #ifdef USE_KQUEUE
 
-#include <errno.h>
 #include <sys/event.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <cerrno>
 #include <cstring>
 #include <libspaznet/platform_io.hpp>
 #include <unordered_map>
@@ -20,26 +20,34 @@ class PlatformIOKqueue : public PlatformIO {
   public:
     PlatformIOKqueue() : kqueue_fd_(-1) {}
 
+    // Delete copy and move operations
+    PlatformIOKqueue(const PlatformIOKqueue&) = delete;
+    auto operator=(const PlatformIOKqueue&) -> PlatformIOKqueue& = delete;
+    PlatformIOKqueue(PlatformIOKqueue&&) = delete;
+    auto operator=(PlatformIOKqueue&&) -> PlatformIOKqueue& = delete;
+
     ~PlatformIOKqueue() override {
         cleanup();
     }
 
-    bool init() override {
+    auto init() -> bool override {
         kqueue_fd_ = kqueue();
         return kqueue_fd_ >= 0;
     }
 
-    bool add_fd(int fd, uint32_t events, void* user_data) override {
+    auto add_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
         struct kevent changes[2];
         int nchanges = 0;
 
-        if (events & EVENT_READ) {
-            EV_SET(&changes[nchanges], fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, user_data);
+        if ((events & EVENT_READ) != 0U) {
+            EV_SET(&changes[nchanges], file_descriptor, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0,
+                   user_data);
             nchanges++;
         }
 
-        if (events & EVENT_WRITE) {
-            EV_SET(&changes[nchanges], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, user_data);
+        if ((events & EVENT_WRITE) != 0U) {
+            EV_SET(&changes[nchanges], file_descriptor, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0,
+                   user_data);
             nchanges++;
         }
 
@@ -47,42 +55,42 @@ class PlatformIOKqueue : public PlatformIO {
             return false;
         }
 
-        fd_to_user_data_[fd] = user_data;
+        fd_to_user_data_[file_descriptor] = user_data;
 
         return kevent(kqueue_fd_, changes, nchanges, nullptr, 0, nullptr) == 0;
     }
 
-    bool modify_fd(int fd, uint32_t events, void* user_data) override {
+    auto modify_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
         // Remove existing filters
         struct kevent changes[2];
         int nchanges = 0;
 
-        if (fd_to_user_data_.find(fd) != fd_to_user_data_.end()) {
-            EV_SET(&changes[nchanges], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+        if (fd_to_user_data_.find(file_descriptor) != fd_to_user_data_.end()) {
+            EV_SET(&changes[nchanges], file_descriptor, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
             nchanges++;
-            EV_SET(&changes[nchanges], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+            EV_SET(&changes[nchanges], file_descriptor, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
             nchanges++;
             kevent(kqueue_fd_, changes, nchanges, nullptr, 0, nullptr);
         }
 
-        return add_fd(fd, events, user_data);
+        return add_fd(file_descriptor, events, user_data);
     }
 
-    bool remove_fd(int fd) override {
+    auto remove_fd(int file_descriptor) -> bool override {
         struct kevent changes[2];
         int nchanges = 0;
 
-        EV_SET(&changes[nchanges], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+        EV_SET(&changes[nchanges], file_descriptor, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
         nchanges++;
-        EV_SET(&changes[nchanges], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+        EV_SET(&changes[nchanges], file_descriptor, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
         nchanges++;
 
-        fd_to_user_data_.erase(fd);
+        fd_to_user_data_.erase(file_descriptor);
 
         return kevent(kqueue_fd_, changes, nchanges, nullptr, 0, nullptr) == 0;
     }
 
-    int wait(std::vector<Event>& events, int timeout_ms) override {
+    auto wait(std::vector<Event>& events, int timeout_ms) -> int override {
         struct kevent kevents[MAX_EVENTS];
         struct timespec timeout;
         struct timespec* timeout_ptr = nullptr;
@@ -103,22 +111,22 @@ class PlatformIOKqueue : public PlatformIO {
         events.reserve(nfds);
 
         for (int i = 0; i < nfds; ++i) {
-            Event ev{};
-            ev.fd = static_cast<int>(kevents[i].ident);
-            ev.user_data = kevents[i].udata;
-            ev.events = 0;
+            Event event{};
+            event.fd = static_cast<int>(kevents[i].ident);
+            event.user_data = kevents[i].udata;
+            event.events = 0;
 
             if (kevents[i].filter == EVFILT_READ) {
-                ev.events |= EVENT_READ;
+                event.events |= EVENT_READ;
             } else if (kevents[i].filter == EVFILT_WRITE) {
-                ev.events |= EVENT_WRITE;
+                event.events |= EVENT_WRITE;
             }
 
-            if (kevents[i].flags & EV_EOF) {
-                ev.events |= EVENT_ERROR;
+            if ((kevents[i].flags & EV_EOF) != 0U) {
+                event.events |= EVENT_ERROR;
             }
 
-            events.push_back(ev);
+            events.push_back(event);
         }
 
         return nfds;

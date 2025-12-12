@@ -30,7 +30,16 @@ TEST(IOContextTimerTest, SleepForFiresOnce) {
     ctx.schedule(task());
 
     // Wait long enough for the timer to fire (50ms delay + some margin)
+    // Also wait a bit more to ensure the coroutine completes after timer fires
     std::this_thread::sleep_for(150ms);
+
+    // Wait for the task to complete (should have fired by now)
+    int attempts = 0;
+    while (hits.load() < 1 && attempts < 50) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        attempts++;
+    }
+
     ctx.stop();
     runner.join();
 

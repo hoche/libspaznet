@@ -579,8 +579,14 @@ HTTP2Frame HTTP2Parser::build_settings_frame(const HTTP2Settings& settings, bool
     frame.type = HTTP2FrameType::SETTINGS;
     frame.flags = ack ? HTTP2Flags::ACK : 0;
     frame.stream_id = 0; // Connection-level frame
-    frame.payload = settings.serialize();
-    frame.length = frame.payload.size();
+    // ACK frames must have no payload per RFC 9113 Section 6.5
+    if (ack) {
+        frame.payload.clear();
+        frame.length = 0;
+    } else {
+        frame.payload = settings.serialize();
+        frame.length = frame.payload.size();
+    }
 
     return frame;
 }

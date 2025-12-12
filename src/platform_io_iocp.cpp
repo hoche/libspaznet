@@ -28,17 +28,23 @@ class PlatformIOIOCP : public PlatformIO {
   public:
     PlatformIOIOCP() : iocp_handle_(INVALID_HANDLE_VALUE) {}
 
+    // Delete copy and move operations
+    PlatformIOIOCP(const PlatformIOIOCP&) = delete;
+    auto operator=(const PlatformIOIOCP&) -> PlatformIOIOCP& = delete;
+    PlatformIOIOCP(PlatformIOIOCP&&) = delete;
+    auto operator=(PlatformIOIOCP&&) -> PlatformIOIOCP& = delete;
+
     ~PlatformIOIOCP() override {
         cleanup();
     }
 
-    bool init() override {
+    auto init() -> bool override {
         iocp_handle_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
         return iocp_handle_ != INVALID_HANDLE_VALUE;
     }
 
-    bool add_fd(int fd, uint32_t events, void* user_data) override {
-        HANDLE handle = reinterpret_cast<HANDLE>(static_cast<intptr_t>(fd));
+    auto add_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
+        HANDLE handle = reinterpret_cast<HANDLE>(static_cast<intptr_t>(file_descriptor));
 
         // Associate socket with IOCP
         if (CreateIoCompletionPort(handle, iocp_handle_, reinterpret_cast<ULONG_PTR>(user_data),
@@ -49,19 +55,19 @@ class PlatformIOIOCP : public PlatformIO {
         handle_to_user_data_[handle] = user_data;
 
         // Start async operations
-        if (events & EVENT_READ) {
+        if ((events & EVENT_READ) != 0U) {
             // Post a read operation
             WSABUF buf{};
             DWORD flags = 0;
             OverlappedContext* ctx = new OverlappedContext{};
             ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
             ctx->user_data = user_data;
-            ctx->fd = fd;
+            ctx->fd = file_descriptor;
             ctx->events = EVENT_READ;
 
             DWORD bytes_received;
-            if (WSARecv(fd, &buf, 1, &bytes_received, &flags, &ctx->overlapped, nullptr) ==
-                SOCKET_ERROR) {
+            if (WSARecv(file_descriptor, &buf, 1, &bytes_received, &flags, &ctx->overlapped,
+                        nullptr) == SOCKET_ERROR) {
                 int error = WSAGetLastError();
                 if (error != WSA_IO_PENDING) {
                     delete ctx;
@@ -73,34 +79,34 @@ class PlatformIOIOCP : public PlatformIO {
         return true;
     }
 
-    bool modify_fd(int fd, uint32_t events, void* user_data) override {
-        HANDLE handle = reinterpret_cast<HANDLE>(static_cast<intptr_t>(fd));
+    auto modify_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
+        HANDLE handle = reinterpret_cast<HANDLE>(static_cast<intptr_t>(file_descriptor));
         handle_to_user_data_[handle] = user_data;
 
         // For IOCP, we need to post new operations
-        if (events & EVENT_READ) {
+        if ((events & EVENT_READ) != 0U) {
             WSABUF buf{};
             DWORD flags = 0;
             OverlappedContext* ctx = new OverlappedContext{};
             ZeroMemory(&ctx->overlapped, sizeof(OVERLAPPED));
             ctx->user_data = user_data;
-            ctx->fd = fd;
+            ctx->fd = file_descriptor;
             ctx->events = EVENT_READ;
 
             DWORD bytes_received;
-            WSARecv(fd, &buf, 1, &bytes_received, &flags, &ctx->overlapped, nullptr);
+            WSARecv(file_descriptor, &buf, 1, &bytes_received, &flags, &ctx->overlapped, nullptr);
         }
 
         return true;
     }
 
-    bool remove_fd(int fd) override {
-        HANDLE handle = reinterpret_cast<HANDLE>(static_cast<intptr_t>(fd));
+    auto remove_fd(int file_descriptor) -> bool override {
+        HANDLE handle = reinterpret_cast<HANDLE>(static_cast<intptr_t>(file_descriptor));
         handle_to_user_data_.erase(handle);
         return true;
     }
 
-    int wait(std::vector<Event>& events, int timeout_ms) override {
+    auto wait(std::vector<Event>& events, int timeout_ms) -> int override {
         DWORD bytes_transferred;
         ULONG_PTR completion_key;
         OVERLAPPED* overlapped;
@@ -123,17 +129,17 @@ class PlatformIOIOCP : public PlatformIO {
 
         OverlappedContext* ctx = reinterpret_cast<OverlappedContext*>(overlapped);
 
-        Event ev{};
-        ev.fd = ctx->fd;
-        ev.user_data = ctx->user_data;
-        ev.events = ctx->events;
+        Event event{};
+        event.fd = ctx->fd;
+        event.user_data = ctx->user_data;
+        event.events = ctx->events;
 
-        if (bytes_transferred == 0 && ctx->events & EVENT_READ) {
-            ev.events |= EVENT_ERROR; // Connection closed
+        if (bytes_transferred == 0 && (ctx->events & EVENT_READ) != 0u) {
+            event.events |= EVENT_ERROR; // Connection closed
         }
 
         events.clear();
-        events.push_back(ev);
+        events.push_back(event);
 
         delete ctx;
 

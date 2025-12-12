@@ -1,7 +1,7 @@
 # Makefile for libspaznet
 # Provides convenient targets for building, testing, and code quality checks
 
-.PHONY: all build clean test format check-tidy check-cppcheck check-format check lint help install
+.PHONY: all build clean test format tidy cppcheck check help install
 .PHONY: build-asan build-tsan build-msan build-ubsan build-debug
 .PHONY: test-asan test-tsan test-msan test-ubsan test-valgrind
 .PHONY: sanitizers help-sanitizers
@@ -38,10 +38,8 @@ help:
 	@echo "  make test-integration - Run integration tests only"
 	@echo "  make test-performance - Run performance tests only"
 	@echo "  make format       - Format code with clang-format"
-	@echo "  make check-format - Check code formatting"
-	@echo "  make check-tidy   - Run clang-tidy static analysis"
-	@echo "  make check-cppcheck - Run cppcheck static analysis"
-	@echo "  make lint         - Run all code quality checks"
+	@echo "  make tidy   - Run clang-tidy static analysis"
+	@echo "  make cppcheck - Run cppcheck static analysis"
 	@echo "  make install      - Install the library"
 	@echo "  make help         - Show this help message"
 	@echo ""
@@ -84,7 +82,7 @@ clean:
 # Test targets
 test: build
 	@echo "Running all tests..."
-	@cd $(BUILD_DIR) && ctest --output-on-failure
+	@cd $(BUILD_DIR) && ctest --verbose
 
 test-unit: build
 	@echo "Running unit tests..."
@@ -122,12 +120,12 @@ check-format:
 	@echo "All files are properly formatted."
 
 # Clang-tidy target
-check-tidy: build
-	@echo "Running clang-tidy..."
+tidy: build
+	@echo "Running clang-tidy with $(NPROC) parallel jobs..."
 	@which clang-tidy > /dev/null 2>&1 || (echo "clang-tidy not found. Install it to use this target." && exit 1)
 	@cd $(BUILD_DIR) && \
 		$(CMAKE) -DCMAKE_EXPORT_COMPILE_COMMANDS=ON . && \
-		run-clang-tidy -p . \
+		run-clang-tidy -j$(NPROC) -p . \
 			-header-filter='include/.*' \
 			-checks='-*,readability-*,performance-*,modernize-*,cppcoreguidelines-*' \
 			-quiet \
@@ -140,10 +138,10 @@ check-tidy: build
 	@echo "Clang-tidy analysis complete. See output above."
 
 # Cppcheck target
-check-cppcheck:
-	@echo "Running cppcheck..."
+cppcheck:
+	@echo "Running cppcheck with $(NPROC) parallel jobs..."
 	@which cppcheck > /dev/null 2>&1 || (echo "cppcheck not found. Install it to use this target." && exit 1)
-	@cppcheck \
+	@cppcheck -j$(NPROC) \
 		--enable=all \
 		--suppress=missingIncludeSystem \
 		--suppress=unusedFunction \
@@ -152,16 +150,11 @@ check-cppcheck:
 		--std=c++20 \
 		--project=$(BUILD_DIR)/compile_commands.json \
 		--output-file=$(BUILD_DIR)/cppcheck-report.txt \
-		--xml --xml-version=2 \
 		2>&1 | tee $(BUILD_DIR)/cppcheck-output.txt || true
 	@if [ -f $(BUILD_DIR)/cppcheck-report.txt ]; then \
 		echo "Cppcheck report saved to $(BUILD_DIR)/cppcheck-report.txt"; \
 	fi
 	@echo "Cppcheck analysis complete."
-
-# Combined lint target
-lint: check-format check-tidy check-cppcheck
-	@echo "All code quality checks complete."
 
 # Install target
 install: build
@@ -176,14 +169,6 @@ dev-setup: build
 		ln -s $(BUILD_DIR)/compile_commands.json .; \
 		echo "Created symlink to compile_commands.json"; \
 	fi
-
-# Quick check (format + build + test)
-quick-check: check-format build test
-	@echo "Quick check complete."
-
-# Full CI check (all checks + tests)
-ci: clean format check-format build test check-tidy check-cppcheck
-	@echo "CI checks complete."
 
 # Coverage target (requires gcov/lcov)
 coverage: build

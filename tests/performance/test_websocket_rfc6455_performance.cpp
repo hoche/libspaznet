@@ -16,6 +16,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <cerrno>
 #define close_socket ::close
 #endif
 
@@ -38,7 +39,12 @@ int connect_client(uint16_t port) {
 bool send_all(int fd, const std::vector<uint8_t>& data) {
     size_t sent = 0;
     while (sent < data.size()) {
-        ssize_t n = send(fd, data.data() + sent, data.size() - sent, 0);
+#ifdef _WIN32
+        ssize_t n = send(fd, reinterpret_cast<const char*>(data.data() + sent),
+                         static_cast<int>(data.size() - sent), 0);
+#else
+        ssize_t n = send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+#endif
         if (n <= 0) {
             return false;
         }
@@ -49,16 +55,44 @@ bool send_all(int fd, const std::vector<uint8_t>& data) {
 
 bool recv_exact(int fd, std::vector<uint8_t>& out, size_t n) {
     out.clear();
-    while (out.size() < n) {
+    out.reserve(n);
+    size_t total_received = 0;
+    const int max_attempts = 50;
+    int attempts = 0;
+
+    while (total_received < n && attempts < max_attempts) {
         uint8_t buf[512];
-        size_t want = std::min(n - out.size(), sizeof(buf));
+        size_t want = std::min(n - total_received, sizeof(buf));
+
+#ifdef _WIN32
+        ssize_t r = recv(fd, reinterpret_cast<char*>(buf), static_cast<int>(want), 0);
+#else
         ssize_t r = recv(fd, buf, want, 0);
-        if (r <= 0) {
+#endif
+        if (r > 0) {
+            out.insert(out.end(), buf, buf + r);
+            total_received += static_cast<size_t>(r);
+            attempts = 0; // Reset attempts on successful read
+        } else if (r == 0) {
+            // Connection closed
+            return false;
+        } else {
+            // Error - wait and retry (might be EAGAIN or async delay)
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEWOULDBLOCK) {
+#else
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+#endif
+                attempts++;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
+            // Other error
             return false;
         }
-        out.insert(out.end(), buf, buf + r);
     }
-    return true;
+
+    return total_received == n;
 }
 
 std::vector<uint8_t> make_masked_frame(const std::vector<uint8_t>& payload, uint32_t mask) {
@@ -149,12 +183,15 @@ TEST(WebSocketPerformance, EchoesHundredsOfFramesQuickly) {
     server.set_websocket_handler(std::make_unique<EchoWebSocketHandler>());
     server.listen_tcp(port);
     std::thread t([&]() { server.run(); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     int fd = connect_client(port);
     ASSERT_GE(fd, 0);
     auto req = handshake_request("dGhlIHNhbXBsZSBub25jZQ==");
     ASSERT_TRUE(send_all(fd, std::vector<uint8_t>(req.begin(), req.end())));
+
+    // Wait for handshake response
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     char resp[256]{};
     recv(fd, resp, sizeof(resp), 0);
 
@@ -165,8 +202,16 @@ TEST(WebSocketPerformance, EchoesHundredsOfFramesQuickly) {
         uint32_t mask = 0x11111111 ^ static_cast<uint32_t>(i);
         auto frame = make_masked_frame(payload, mask);
         ASSERT_TRUE(send_all(fd, frame));
+
+        // Small delay to allow async server to process and send response
+        if (i % 10 == 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+
         auto echoed = read_frame_payload(fd);
-        ASSERT_EQ(echoed.size(), payload.size());
+        ASSERT_EQ(echoed.size(), payload.size())
+            << "Frame " << i << " failed - expected " << payload.size() << " bytes, got "
+            << echoed.size();
     }
     auto end = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();

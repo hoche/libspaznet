@@ -12,7 +12,7 @@
 
 namespace spaznet {
 
-std::unique_ptr<PlatformIO> create_platform_io() {
+auto create_platform_io() -> std::unique_ptr<PlatformIO> {
 #ifdef USE_EPOLL
     return std::make_unique<PlatformIOEpoll>();
 #elif defined(USE_KQUEUE)

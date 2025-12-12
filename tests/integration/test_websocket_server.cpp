@@ -19,6 +19,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <cerrno>
 #define close_socket ::close
 #endif
 
@@ -41,7 +42,12 @@ int connect_client(uint16_t port) {
 bool send_all(int fd, const std::vector<uint8_t>& data) {
     size_t sent = 0;
     while (sent < data.size()) {
-        ssize_t n = send(fd, data.data() + sent, data.size() - sent, 0);
+#ifdef _WIN32
+        ssize_t n = send(fd, reinterpret_cast<const char*>(data.data() + sent),
+                         static_cast<int>(data.size() - sent), 0);
+#else
+        ssize_t n = send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+#endif
         if (n <= 0) {
             return false;
         }
@@ -53,16 +59,43 @@ bool send_all(int fd, const std::vector<uint8_t>& data) {
 bool recv_exact(int fd, std::vector<uint8_t>& out, size_t n) {
     out.clear();
     out.reserve(n);
-    while (out.size() < n) {
+    size_t total_received = 0;
+    const int max_attempts = 50;
+    int attempts = 0;
+
+    while (total_received < n && attempts < max_attempts) {
         uint8_t buf[256];
-        size_t want = std::min(n - out.size(), sizeof(buf));
+        size_t want = std::min(n - total_received, sizeof(buf));
+
+#ifdef _WIN32
+        ssize_t r = recv(fd, reinterpret_cast<char*>(buf), static_cast<int>(want), 0);
+#else
         ssize_t r = recv(fd, buf, want, 0);
-        if (r <= 0) {
+#endif
+        if (r > 0) {
+            out.insert(out.end(), buf, buf + r);
+            total_received += static_cast<size_t>(r);
+            attempts = 0; // Reset attempts on successful read
+        } else if (r == 0) {
+            // Connection closed
+            return false;
+        } else {
+            // Error - wait and retry (might be EAGAIN on non-blocking socket or async delay)
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEWOULDBLOCK) {
+#else
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+#endif
+                attempts++;
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                continue;
+            }
+            // Other error
             return false;
         }
-        out.insert(out.end(), buf, buf + r);
     }
-    return true;
+
+    return total_received == n;
 }
 
 std::vector<uint8_t> make_masked_frame(WebSocketOpcode opcode, const std::vector<uint8_t>& payload,
@@ -220,6 +253,10 @@ TEST_F(WebSocketServerTest, EchoesMaskedTextFrame) {
     std::string key = "dGhlIHNhbXBsZSBub25jZQ==";
     auto req = handshake_request(key);
     ASSERT_TRUE(send_all(fd, std::vector<uint8_t>(req.begin(), req.end())));
+
+    // Wait for handshake response
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
     char resp[256]{};
     recv(fd, resp, sizeof(resp), 0); // ignore handshake body
 
@@ -227,6 +264,9 @@ TEST_F(WebSocketServerTest, EchoesMaskedTextFrame) {
     auto frame = make_masked_frame(
         WebSocketOpcode::Text, std::vector<uint8_t>(message.begin(), message.end()), 0x11223344);
     ASSERT_TRUE(send_all(fd, frame));
+
+    // Wait for echo
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     auto echoed = read_frame(fd);
     EXPECT_EQ(echoed.opcode, WebSocketOpcode::Text);
@@ -240,12 +280,15 @@ TEST_F(WebSocketServerTest, RespondsToPingWithPong) {
     ASSERT_GE(fd, 0);
     auto req = handshake_request("dGhlIHNhbXBsZSBub25jZQ==");
     ASSERT_TRUE(send_all(fd, std::vector<uint8_t>(req.begin(), req.end())));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     char resp[256]{};
     recv(fd, resp, sizeof(resp), 0);
 
     std::vector<uint8_t> payload = {'p', 'i', 'n', 'g'};
     auto ping = make_masked_frame(WebSocketOpcode::Ping, payload, 0xA1B2C3D4);
     ASSERT_TRUE(send_all(fd, ping));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     auto frame = read_frame(fd);
     EXPECT_EQ(frame.opcode, WebSocketOpcode::Pong);
@@ -258,6 +301,7 @@ TEST_F(WebSocketServerTest, HandlesFragmentedMessage) {
     ASSERT_GE(fd, 0);
     auto req = handshake_request("dGhlIHNhbXBsZSBub25jZQ==");
     ASSERT_TRUE(send_all(fd, std::vector<uint8_t>(req.begin(), req.end())));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     char resp[256]{};
     recv(fd, resp, sizeof(resp), 0);
 
@@ -287,7 +331,10 @@ TEST_F(WebSocketServerTest, HandlesFragmentedMessage) {
     auto bytes2 = f2.serialize();
 
     ASSERT_TRUE(send_all(fd, bytes1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10)); // Small delay between frames
     ASSERT_TRUE(send_all(fd, bytes2));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Wait for server to process
 
     auto echoed = read_frame(fd);
     EXPECT_EQ(echoed.opcode, WebSocketOpcode::Text);
@@ -301,6 +348,7 @@ TEST_F(WebSocketServerTest, RejectsUnmaskedClientFrame) {
     ASSERT_GE(fd, 0);
     auto req = handshake_request("dGhlIHNhbXBsZSBub25jZQ==");
     ASSERT_TRUE(send_all(fd, std::vector<uint8_t>(req.begin(), req.end())));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     char resp[256]{};
     recv(fd, resp, sizeof(resp), 0);
 
@@ -314,6 +362,8 @@ TEST_F(WebSocketServerTest, RejectsUnmaskedClientFrame) {
     bad.payload_length = bad.payload.size();
     auto bytes = bad.serialize();
     ASSERT_TRUE(send_all(fd, bytes));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // Server should respond with Close
     auto close_frame = read_frame(fd);

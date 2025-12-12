@@ -18,24 +18,33 @@ class PlatformIO {
 
     virtual ~PlatformIO() = default;
 
+    // Default constructor
+    PlatformIO() = default;
+
+    // Delete copy and move operations
+    PlatformIO(const PlatformIO&) = delete;
+    auto operator=(const PlatformIO&) -> PlatformIO& = delete;
+    PlatformIO(PlatformIO&&) = delete;
+    auto operator=(PlatformIO&&) -> PlatformIO& = delete;
+
     // Initialize the I/O system
-    virtual bool init() = 0;
+    virtual auto init() -> bool = 0;
 
     // Register a file descriptor for events
-    virtual bool add_fd(int fd, uint32_t events, void* user_data) = 0;
+    virtual auto add_fd(int file_descriptor, uint32_t events, void* user_data) -> bool = 0;
 
     // Modify events for a file descriptor
-    virtual bool modify_fd(int fd, uint32_t events, void* user_data) = 0;
+    virtual auto modify_fd(int file_descriptor, uint32_t events, void* user_data) -> bool = 0;
 
     // Remove a file descriptor
-    virtual bool remove_fd(int fd) = 0;
+    virtual auto remove_fd(int file_descriptor) -> bool = 0;
 
     // Wait for events (blocking)
     // Returns number of events, or -1 on error
-    virtual int wait(std::vector<Event>& events, int timeout_ms) = 0;
+    virtual auto wait(std::vector<Event>& events, int timeout_ms) -> int = 0;
 
     // Cleanup
-    virtual void cleanup() = 0;
+    virtual auto cleanup() -> void = 0;
 
     // Event flags
     static constexpr uint32_t EVENT_READ = 0x01;
@@ -45,6 +54,6 @@ class PlatformIO {
 };
 
 // Factory function
-std::unique_ptr<PlatformIO> create_platform_io();
+auto create_platform_io() -> std::unique_ptr<PlatformIO>;
 
 } // namespace spaznet

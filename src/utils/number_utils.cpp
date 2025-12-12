@@ -5,7 +5,7 @@
 
 namespace spaznet {
 
-std::optional<uint64_t> NumberUtils::parse_uint64(const std::string& value) {
+auto NumberUtils::parse_uint64(const std::string& value) -> std::optional<uint64_t> {
     try {
         return static_cast<uint64_t>(std::stoull(value));
     } catch (...) {
@@ -13,7 +13,7 @@ std::optional<uint64_t> NumberUtils::parse_uint64(const std::string& value) {
     }
 }
 
-std::optional<int> NumberUtils::parse_int(const std::string& value) {
+auto NumberUtils::parse_int(const std::string& value) -> std::optional<int> {
     try {
         return std::stoi(value);
     } catch (...) {

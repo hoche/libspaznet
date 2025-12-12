@@ -6,13 +6,17 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <io.h>
+#include <process.h>
 #include <windows.h>
 #define popen _popen
 #define pclose _pclose
 #else
+#include <fcntl.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -33,53 +37,147 @@ class IperfIntegrationTest : public ::testing::Test {
         return "";
     }
 
-    bool run_iperf_server(int port, int duration_seconds) {
-        std::string iperf = find_iperf_executable();
-        if (iperf.empty()) {
+    bool is_iperf3(const std::string& iperf) {
+        return iperf.find("iperf3") != std::string::npos;
+    }
+
+    void SetUp() override {
+        iperf_executable_ = find_iperf_executable();
+        if (iperf_executable_.empty()) {
+            GTEST_SKIP() << "iperf/iperf3 not found. Install iperf3 for bandwidth testing.";
+        }
+
+        server_port_ = 5201;
+        server_process_id_ = 0;
+        server_running_ = false;
+    }
+
+    void TearDown() override {
+        stop_iperf_server();
+    }
+
+    bool start_iperf_server(int port, int duration_seconds = 300) {
+        if (iperf_executable_.empty()) {
             return false;
         }
 
+        stop_iperf_server(); // Stop any existing server
+
         std::ostringstream cmd;
-        cmd << iperf << " -s -p " << port << " -t " << duration_seconds;
+        if (is_iperf3(iperf_executable_)) {
+            // iperf3 syntax
+            cmd << iperf_executable_ << " -s -p " << port;
+        } else {
+            // iperf2 syntax (uses -t for time, but server doesn't need it)
+            cmd << iperf_executable_ << " -s -p " << port;
+        }
 
         std::cout << "\n[IPERF] Starting server: " << cmd.str() << std::endl;
 
 #ifdef _WIN32
         STARTUPINFOA si = {sizeof(si)};
         PROCESS_INFORMATION pi;
-        if (!CreateProcessA(nullptr, const_cast<char*>(cmd.str().c_str()), nullptr, nullptr, FALSE,
-                            0, nullptr, nullptr, &si, &pi)) {
-            return false;
-        }
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        return true;
-#else
-        int pid = fork();
-        if (pid == 0) {
-            // Child process
-            execlp("/bin/sh", "sh", "-c", cmd.str().c_str(), nullptr);
-            exit(1);
-        } else if (pid > 0) {
-            // Parent process
+        std::string cmd_str = cmd.str();
+        char* cmd_cstr = new char[cmd_str.length() + 1];
+        std::strcpy(cmd_cstr, cmd_str.c_str());
+
+        if (CreateProcessA(nullptr, cmd_cstr, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                           nullptr, &si, &pi)) {
+            server_process_id_ = pi.dwProcessId;
+            server_handle_ = pi.hProcess;
+            CloseHandle(pi.hThread);
+            server_running_ = true;
+            delete[] cmd_cstr;
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             return true;
+        }
+        delete[] cmd_cstr;
+        return false;
+#else
+        pid_t pid = fork();
+        if (pid == 0) {
+            // Child process - redirect output to /dev/null
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDOUT_FILENO);
+                dup2(devnull, STDERR_FILENO);
+                close(devnull);
+            }
+            execlp("/bin/sh", "sh", "-c", cmd.str().c_str(), nullptr);
+            _exit(1); // Use _exit in child to avoid flushing buffers
+        } else if (pid > 0) {
+            // Parent process
+            server_process_id_ = pid;
+            server_running_ = true;
+            // Wait a moment for server to start
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            // Check if process is still running
+            if (waitpid(pid, nullptr, WNOHANG) == 0) {
+                return true;
+            }
+            // Process exited immediately
+            server_running_ = false;
+            server_process_id_ = 0;
+            return false;
         }
         return false;
 #endif
     }
 
+    void stop_iperf_server() {
+        if (!server_running_ || server_process_id_ == 0) {
+            return;
+        }
+
+        std::cout << "\n[IPERF] Stopping server (PID: " << server_process_id_ << ")" << std::endl;
+
+#ifdef _WIN32
+        if (server_handle_) {
+            TerminateProcess(server_handle_, 0);
+            CloseHandle(server_handle_);
+            server_handle_ = nullptr;
+        }
+#else
+        kill(server_process_id_, SIGTERM);
+        // Wait for process to terminate
+        int status;
+        for (int i = 0; i < 10; ++i) {
+            if (waitpid(server_process_id_, &status, WNOHANG) == server_process_id_) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        // Force kill if still running
+        kill(server_process_id_, SIGKILL);
+        waitpid(server_process_id_, nullptr, 0);
+#endif
+
+        server_running_ = false;
+        server_process_id_ = 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
     std::string run_iperf_client(const std::string& host, int port, int duration_seconds,
                                  bool udp = false) {
-        std::string iperf = find_iperf_executable();
-        if (iperf.empty()) {
+        if (iperf_executable_.empty()) {
             return "";
         }
 
         std::ostringstream cmd;
-        cmd << iperf << " -c " << host << " -p " << port << " -t " << duration_seconds;
-        if (udp) {
-            cmd << " -u";
+        if (is_iperf3(iperf_executable_)) {
+            // iperf3 syntax
+            cmd << iperf_executable_ << " -c " << host << " -p " << port << " -t "
+                << duration_seconds;
+            if (udp) {
+                cmd << " -u -b 100M";
+            }
+        } else {
+            // iperf2 syntax
+            cmd << iperf_executable_ << " -c " << host << " -p " << port << " -t "
+                << duration_seconds;
+            if (udp) {
+                cmd << " -u -b 100M";
+            }
         }
 
 #ifdef _WIN32
@@ -108,58 +206,57 @@ class IperfIntegrationTest : public ::testing::Test {
 
         return result;
     }
+
+    std::string iperf_executable_;
+    int server_port_;
+#ifdef _WIN32
+    DWORD server_process_id_;
+    HANDLE server_handle_{nullptr};
+#else
+    pid_t server_process_id_;
+#endif
+    bool server_running_;
 };
 
 TEST_F(IperfIntegrationTest, IperfAvailable) {
-    std::string iperf = find_iperf_executable();
-
-    if (iperf.empty()) {
-        GTEST_SKIP() << "iperf/iperf3 not found. Install iperf3 for bandwidth testing.";
-    }
-
-    std::cout << "\n[IPERF] Found: " << iperf << std::endl;
-    EXPECT_FALSE(iperf.empty());
+    std::cout << "\n[IPERF] Found: " << iperf_executable_ << std::endl;
+    EXPECT_FALSE(iperf_executable_.empty());
 }
 
 TEST_F(IperfIntegrationTest, TCPBandwidthTest) {
-    std::string iperf = find_iperf_executable();
-    if (iperf.empty()) {
-        GTEST_SKIP() << "iperf/iperf3 not found";
-    }
-
-    const int port = 5201;
     const int duration = 3;
 
-    // Note: This test requires iperf server to be running separately
-    // or we could start it in a separate thread/process
+    // Automatically start iperf server
+    ASSERT_TRUE(start_iperf_server(server_port_)) << "Failed to start iperf server";
 
     std::cout << "\n[IPERF] TCP Bandwidth Test:" << std::endl;
-    std::cout << "  Note: This test requires an iperf server running on port " << port << std::endl;
-    std::cout << "  Run: iperf3 -s -p " << port << std::endl;
+    std::cout << "  Server: " << iperf_executable_ << " on port " << server_port_ << std::endl;
 
-    // For now, just verify we can run the command
-    std::string result = run_iperf_client("127.0.0.1", port, duration, false);
+    std::string result = run_iperf_client("127.0.0.1", server_port_, duration, false);
 
     if (!result.empty()) {
         std::cout << "  Result: " << result << std::endl;
+        EXPECT_NE(result.find("connected"), std::string::npos);
+    } else {
+        FAIL() << "iperf client failed to connect or produce output";
     }
 }
 
 TEST_F(IperfIntegrationTest, UDPBandwidthTest) {
-    std::string iperf = find_iperf_executable();
-    if (iperf.empty()) {
-        GTEST_SKIP() << "iperf/iperf3 not found";
-    }
-
-    const int port = 5201;
     const int duration = 3;
 
-    std::cout << "\n[IPERF] UDP Bandwidth Test:" << std::endl;
-    std::cout << "  Note: This test requires an iperf server running on port " << port << std::endl;
+    // Automatically start iperf server
+    ASSERT_TRUE(start_iperf_server(server_port_)) << "Failed to start iperf server";
 
-    std::string result = run_iperf_client("127.0.0.1", port, duration, true);
+    std::cout << "\n[IPERF] UDP Bandwidth Test:" << std::endl;
+    std::cout << "  Server: " << iperf_executable_ << " on port " << server_port_ << std::endl;
+
+    std::string result = run_iperf_client("127.0.0.1", server_port_, duration, true);
 
     if (!result.empty()) {
         std::cout << "  Result: " << result << std::endl;
+        EXPECT_NE(result.find("connected"), std::string::npos);
+    } else {
+        FAIL() << "iperf client failed to connect or produce output";
     }
 }

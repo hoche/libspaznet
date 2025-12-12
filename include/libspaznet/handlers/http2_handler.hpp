@@ -39,17 +39,18 @@ constexpr uint8_t ACK = 0x1; // For SETTINGS and PING
 
 // HTTP/2 Frame per RFC 9113 Section 4.1
 struct HTTP2Frame {
-    uint32_t length;     // Frame payload length (24 bits, max 16384)
-    HTTP2FrameType type; // Frame type
-    uint8_t flags;       // Frame flags
-    uint32_t stream_id;  // Stream identifier (31 bits, 0 for connection-level)
+    uint32_t length{};     // Frame payload length (24 bits, max 16384)
+    HTTP2FrameType type{}; // Frame type
+    uint8_t flags{};       // Frame flags
+    uint32_t stream_id{};  // Stream identifier (31 bits, 0 for connection-level)
     std::vector<uint8_t> payload;
 
     // Serialize frame to binary format per RFC 9113 Section 4.1
-    std::vector<uint8_t> serialize() const;
+    [[nodiscard]] auto serialize() const -> std::vector<uint8_t>;
 
     // Parse frame from binary format
-    static std::optional<HTTP2Frame> parse(const std::vector<uint8_t>& data, size_t& offset);
+    static auto parse(const std::vector<uint8_t>& data,
+                      size_t& offset) -> std::optional<HTTP2Frame>;
 };
 
 // HTTP/2 Settings per RFC 9113 Section 6.5.2
@@ -62,14 +63,14 @@ struct HTTP2Settings {
     uint32_t max_header_list_size = 0;    // SETTINGS_MAX_HEADER_LIST_SIZE (0 = unlimited)
 
     // Serialize to SETTINGS frame payload
-    std::vector<uint8_t> serialize() const;
+    [[nodiscard]] auto serialize() const -> std::vector<uint8_t>;
 
     // Parse from SETTINGS frame payload
-    static HTTP2Settings parse(const std::vector<uint8_t>& payload);
+    static auto parse(const std::vector<uint8_t>& payload) -> HTTP2Settings;
 };
 
 // HTTP/2 Stream State per RFC 9113 Section 5.1
-enum class HTTP2StreamState {
+enum class HTTP2StreamState : uint8_t {
     IDLE,
     RESERVED_LOCAL,
     RESERVED_REMOTE,
@@ -88,24 +89,29 @@ struct HTTP2Request {
     std::vector<uint8_t> body;
 
     // Extract pseudo-headers
-    std::optional<std::string> get_pseudo_header(const std::string& name) const;
+    auto get_pseudo_header(const std::string& name) const -> std::optional<std::string>;
 
     // Get regular headers (non-pseudo)
-    std::unordered_map<std::string, std::string> get_regular_headers() const;
+    auto get_regular_headers() const -> std::unordered_map<std::string, std::string>;
 };
+
+namespace {
+constexpr uint32_t DEFAULT_MAX_FRAME_SIZE = 16384;
+}
 
 // HTTP/2 Response per RFC 9113 Section 8.1
 struct HTTP2Response {
     uint32_t stream_id;
-    int status_code = 200;
+    int status_code = DEFAULT_HTTP_STATUS_CODE; // Defined in http_handler.hpp
     std::unordered_map<std::string, std::string> headers;
     std::vector<uint8_t> body;
 
     // Convert to HTTP2Frame(s) - may require multiple frames for large responses
-    std::vector<HTTP2Frame> to_frames(uint32_t max_frame_size = 16384) const;
+    auto to_frames(uint32_t max_frame_size = DEFAULT_MAX_FRAME_SIZE) const
+        -> std::vector<HTTP2Frame>;
 
     // Backward compatibility: convert to single frame (HEADERS only, no body)
-    HTTP2Frame to_frame() const {
+    auto to_frame() const -> HTTP2Frame {
         auto frames = to_frames();
         if (!frames.empty()) {
             return frames[0];
@@ -124,62 +130,65 @@ struct HTTP2Response {
 class HPACK {
   public:
     // Encode headers to HPACK format
-    static std::vector<uint8_t> encode_headers(
-        const std::unordered_map<std::string, std::string>& headers);
+    static auto encode_headers(const std::unordered_map<std::string, std::string>& headers)
+        -> std::vector<uint8_t>;
 
     // Decode headers from HPACK format
-    static std::unordered_map<std::string, std::string> decode_headers(
-        const std::vector<uint8_t>& data);
+    static auto decode_headers(const std::vector<uint8_t>& data)
+        -> std::unordered_map<std::string, std::string>;
 
     // Get static header table entry
-    static const std::pair<std::string, std::string>& get_static_table_entry(size_t index);
-    static size_t get_static_table_size();
+    static auto get_static_table_entry(size_t index) -> const std::pair<std::string, std::string>&;
+    static auto get_static_table_size() -> size_t;
 };
 
 // HTTP/2 Parser per RFC 9113
 class HTTP2Parser {
   public:
-    enum class ParseResult { Success, Incomplete, Error, NeedMoreData };
+    enum class ParseResult : uint8_t { Success, Incomplete, Error, NeedMoreData };
 
     // Parse HTTP/2 connection preface (RFC 9113 Section 3.5)
-    static bool parse_connection_preface(const std::vector<uint8_t>& data, size_t& offset);
+    static auto parse_connection_preface(const std::vector<uint8_t>& data, size_t& offset) -> bool;
 
     // Parse HTTP/2 frame
-    static ParseResult parse_frame(const std::vector<uint8_t>& data, size_t& offset,
-                                   HTTP2Frame& frame);
+    static auto parse_frame(const std::vector<uint8_t>& data, size_t& offset,
+                            HTTP2Frame& frame) -> ParseResult;
 
     // Parse HEADERS frame payload into request
-    static ParseResult parse_headers_frame(const HTTP2Frame& frame, HTTP2Request& request);
+    static auto parse_headers_frame(const HTTP2Frame& frame, HTTP2Request& request) -> ParseResult;
 
     // Parse HEADERS frame payload into response
-    static ParseResult parse_headers_frame(const HTTP2Frame& frame, HTTP2Response& response);
+    static auto parse_headers_frame(const HTTP2Frame& frame,
+                                    HTTP2Response& response) -> ParseResult;
 
     // Build HEADERS frame from request
-    static HTTP2Frame build_headers_frame(const HTTP2Request& request, uint32_t stream_id,
-                                          bool end_headers = true, bool end_stream = false);
+    static auto build_headers_frame(const HTTP2Request& request, uint32_t stream_id,
+                                    bool end_headers = true, bool end_stream = false) -> HTTP2Frame;
 
     // Build HEADERS frame from response
-    static HTTP2Frame build_headers_frame(const HTTP2Response& response, uint32_t stream_id,
-                                          bool end_headers = true, bool end_stream = false);
+    static auto build_headers_frame(const HTTP2Response& response, uint32_t stream_id,
+                                    bool end_headers = true, bool end_stream = false) -> HTTP2Frame;
 
     // Build DATA frame
-    static HTTP2Frame build_data_frame(uint32_t stream_id, const std::vector<uint8_t>& data,
-                                       bool end_stream = false);
+    static auto build_data_frame(uint32_t stream_id, const std::vector<uint8_t>& data,
+                                 bool end_stream = false) -> HTTP2Frame;
 
     // Build SETTINGS frame
-    static HTTP2Frame build_settings_frame(const HTTP2Settings& settings, bool ack = false);
+    static auto build_settings_frame(const HTTP2Settings& settings, bool ack = false) -> HTTP2Frame;
 
     // Build GOAWAY frame
-    static HTTP2Frame build_goaway_frame(uint32_t last_stream_id, uint32_t error_code);
+    static auto build_goaway_frame(uint32_t last_stream_id, uint32_t error_code) -> HTTP2Frame;
 
     // Build RST_STREAM frame
-    static HTTP2Frame build_rst_stream_frame(uint32_t stream_id, uint32_t error_code);
+    static auto build_rst_stream_frame(uint32_t stream_id, uint32_t error_code) -> HTTP2Frame;
 
     // Build WINDOW_UPDATE frame
-    static HTTP2Frame build_window_update_frame(uint32_t stream_id, uint32_t window_size_increment);
+    static auto build_window_update_frame(uint32_t stream_id,
+                                          uint32_t window_size_increment) -> HTTP2Frame;
 
     // Build PING frame
-    static HTTP2Frame build_ping_frame(const std::vector<uint8_t>& opaque_data, bool ack = false);
+    static auto build_ping_frame(const std::vector<uint8_t>& opaque_data,
+                                 bool ack = false) -> HTTP2Frame;
 };
 
 // HTTP/2 Connection Manager
@@ -188,27 +197,27 @@ class HTTP2Connection {
     HTTP2Connection();
 
     // Process incoming frame
-    HTTP2Parser::ParseResult process_frame(const HTTP2Frame& frame);
+    auto process_frame(const HTTP2Frame& frame) -> HTTP2Parser::ParseResult;
 
     // Get current settings
-    const HTTP2Settings& get_settings() const {
+    auto get_settings() const -> const HTTP2Settings& {
         return settings_;
     }
 
     // Update settings
-    void update_settings(const HTTP2Settings& settings);
+    auto update_settings(const HTTP2Settings& settings) -> void;
 
     // Get stream state
-    HTTP2StreamState get_stream_state(uint32_t stream_id) const;
+    auto get_stream_state(uint32_t stream_id) const -> HTTP2StreamState;
 
     // Check if stream is valid
-    bool is_valid_stream(uint32_t stream_id) const;
+    auto is_valid_stream(uint32_t stream_id) const -> bool;
 
   private:
     HTTP2Settings settings_;
     std::unordered_map<uint32_t, HTTP2StreamState> streams_;
-    uint32_t next_stream_id_;
-    bool client_preface_received_;
+    uint32_t next_stream_id_{};
+    bool client_preface_received_{};
 
     void initialize_stream(uint32_t stream_id);
     void close_stream(uint32_t stream_id);
@@ -216,17 +225,24 @@ class HTTP2Connection {
 
 class HTTP2Handler {
   public:
+    HTTP2Handler() = default;
     virtual ~HTTP2Handler() = default;
 
+    // Delete copy and move operations
+    HTTP2Handler(const HTTP2Handler&) = delete;
+    auto operator=(const HTTP2Handler&) -> HTTP2Handler& = delete;
+    HTTP2Handler(HTTP2Handler&&) = delete;
+    auto operator=(HTTP2Handler&&) -> HTTP2Handler& = delete;
+
     // Handle HTTP/2 request
-    virtual Task handle_request(const HTTP2Request& request, HTTP2Response& response,
-                                Socket& socket) = 0;
+    virtual auto handle_request(const HTTP2Request& request, HTTP2Response& response,
+                                Socket& socket) -> Task = 0;
 
     // Handle HTTP/2 frame (for advanced frame handling)
-    virtual Task handle_frame(const HTTP2Frame& frame, Socket& socket) = 0;
+    virtual auto handle_frame(const HTTP2Frame& frame, Socket& socket) -> Task = 0;
 
     // Handle connection-level frames (SETTINGS, PING, GOAWAY, etc.)
-    virtual Task handle_connection_frame(const HTTP2Frame& frame, Socket& socket) {
+    virtual auto handle_connection_frame(const HTTP2Frame& frame, Socket& socket) -> Task {
         co_return; // Default: no-op
     }
 };

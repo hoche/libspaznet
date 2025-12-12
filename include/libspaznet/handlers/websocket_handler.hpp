@@ -20,18 +20,18 @@ enum class WebSocketOpcode : uint8_t {
 };
 
 struct WebSocketFrame {
-    bool fin;
-    bool rsv1;
-    bool rsv2;
-    bool rsv3;
-    WebSocketOpcode opcode;
-    bool masked;
-    uint64_t payload_length;
-    uint32_t masking_key;
+    bool fin{};
+    bool rsv1{};
+    bool rsv2{};
+    bool rsv3{};
+    WebSocketOpcode opcode{};
+    bool masked{};
+    uint64_t payload_length{};
+    uint32_t masking_key{};
     std::vector<uint8_t> payload;
 
-    std::vector<uint8_t> serialize() const;
-    static WebSocketFrame parse(const std::vector<uint8_t>& data);
+    [[nodiscard]] auto serialize() const -> std::vector<uint8_t>;
+    static auto parse(const std::vector<uint8_t>& data) -> WebSocketFrame;
 };
 
 struct WebSocketMessage {
@@ -41,16 +41,23 @@ struct WebSocketMessage {
 
 class WebSocketHandler {
   public:
+    WebSocketHandler() = default;
     virtual ~WebSocketHandler() = default;
 
+    // Delete copy and move operations
+    WebSocketHandler(const WebSocketHandler&) = delete;
+    auto operator=(const WebSocketHandler&) -> WebSocketHandler& = delete;
+    WebSocketHandler(WebSocketHandler&&) = delete;
+    auto operator=(WebSocketHandler&&) -> WebSocketHandler& = delete;
+
     // Handle WebSocket message
-    virtual Task handle_message(const WebSocketMessage& message, Socket& socket) = 0;
+    virtual auto handle_message(const WebSocketMessage& message, Socket& socket) -> Task = 0;
 
     // Handle WebSocket connection open
-    virtual Task on_open(Socket& socket) = 0;
+    virtual auto on_open(Socket& socket) -> Task = 0;
 
     // Handle WebSocket connection close
-    virtual Task on_close(Socket& socket) = 0;
+    virtual auto on_close(Socket& socket) -> Task = 0;
 };
 
 } // namespace spaznet

@@ -85,7 +85,7 @@ TEST_F(RFC9113PerformanceTest, FrameSerializationSmall) {
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        frame.serialize();
+        (void)frame.serialize();
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -110,7 +110,7 @@ TEST_F(RFC9113PerformanceTest, FrameSerializationLarge) {
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        frame.serialize();
+        (void)frame.serialize();
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -427,7 +427,7 @@ TEST_F(RFC9113PerformanceTest, SettingsSerialization) {
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        settings.serialize();
+        (void)settings.serialize();
     }
 
     auto end = std::chrono::high_resolution_clock::now();

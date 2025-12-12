@@ -20,7 +20,7 @@ class LoggerTest : public ::testing::Test {
 };
 
 // Test log level enum values
-TEST(LoggerTest, LogLevelValues) {
+TEST_F(LoggerTest, LogLevelValues) {
     EXPECT_EQ(static_cast<uint8_t>(LogLevel::NONE), 0);
     EXPECT_EQ(static_cast<uint8_t>(LogLevel::ERROR), 1);
     EXPECT_EQ(static_cast<uint8_t>(LogLevel::WARN), 2);
@@ -30,7 +30,7 @@ TEST(LoggerTest, LogLevelValues) {
 }
 
 // Test singleton pattern
-TEST(LoggerTest, SingletonPattern) {
+TEST_F(LoggerTest, SingletonPattern) {
     Logger& logger1 = Logger::instance();
     Logger& logger2 = Logger::instance();
     EXPECT_EQ(&logger1, &logger2);
@@ -180,7 +180,7 @@ TEST_F(LoggerTest, DeferredFormatting) {
 }
 
 // Test JSON escaping
-TEST(LoggerTest, JsonEscaping) {
+TEST_F(LoggerTest, JsonEscaping) {
     using namespace spaznet::detail;
 
     char output[256];
@@ -222,7 +222,7 @@ TEST(LoggerTest, JsonEscaping) {
 }
 
 // Test log level strings
-TEST(LoggerTest, LogLevelStrings) {
+TEST_F(LoggerTest, LogLevelStrings) {
     using namespace spaznet::detail;
 
     EXPECT_STREQ(level_string(LogLevel::ERROR), "ERROR");
@@ -233,7 +233,7 @@ TEST(LoggerTest, LogLevelStrings) {
 }
 
 // Test log level strings (lowercase)
-TEST(LoggerTest, LogLevelStringsLower) {
+TEST_F(LoggerTest, LogLevelStringsLower) {
     using namespace spaznet::detail;
 
     EXPECT_STREQ(level_string_lower(LogLevel::ERROR), "error");
@@ -244,7 +244,7 @@ TEST(LoggerTest, LogLevelStringsLower) {
 }
 
 // Test syslog priority mapping
-TEST(LoggerTest, SyslogPriority) {
+TEST_F(LoggerTest, SyslogPriority) {
     using namespace spaznet::detail;
 
 #ifndef _WIN32
@@ -264,7 +264,7 @@ TEST(LoggerTest, SyslogPriority) {
 }
 
 // Test timestamp formatting
-TEST(LoggerTest, TimestampFormatting) {
+TEST_F(LoggerTest, TimestampFormatting) {
     using namespace spaznet::detail;
 
     format_timestamp(detail::timestamp_buffer, detail::TIMESTAMP_BUFFER_SIZE);
