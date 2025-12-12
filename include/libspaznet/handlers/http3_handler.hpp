@@ -41,6 +41,18 @@ struct HTTP3Response {
     std::string reason_phrase = "OK";
     std::unordered_map<std::string, std::string> headers;
     std::vector<uint8_t> body;
+
+    void set_header(const std::string& key, const std::string& value) {
+        headers[key] = value;
+    }
+
+    std::optional<std::string> get_header(const std::string& name) const {
+        auto it = headers.find(name);
+        if (it != headers.end()) {
+            return it->second;
+        }
+        return std::nullopt;
+    }
 };
 
 // HTTP/3 Handler interface

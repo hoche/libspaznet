@@ -81,6 +81,11 @@ class QUICStream {
     // Close stream
     void close();
 
+    // Set stream state (for QUICConnection)
+    void set_state(QUICStreamState state) {
+        state_ = state;
+    }
+
     // Internal access for QUICConnection
     std::vector<uint8_t> receive_buffer_;
     std::vector<uint8_t> send_buffer_;
