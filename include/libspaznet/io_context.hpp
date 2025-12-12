@@ -1,16 +1,16 @@
 #pragma once
 
-#include <coroutine>
-#include <memory>
-#include <queue>
 #include <atomic>
-#include <thread>
-#include <vector>
-#include <functional>
+#include <coroutine>
 #include <cstdint>
-#include <unordered_map>
-#include <mutex>
+#include <functional>
 #include <libspaznet/platform_io.hpp>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 namespace spaznet {
 
@@ -19,62 +19,59 @@ struct Task;
 
 // Coroutine task handle
 struct TaskPromise {
-    std::coroutine_handle<> continuation;
-    bool ready = false;
-    
-    auto get_return_object() {
-        return std::coroutine_handle<TaskPromise>::from_promise(*this);
-    }
-    
+    std::coroutine_handle<> continuation{std::noop_coroutine()};
+
+    // Declaration - implementation after Task is defined
+    Task get_return_object();
+
     auto initial_suspend() noexcept {
         return std::suspend_always{};
     }
-    
+
     auto final_suspend() noexcept {
         struct FinalAwaiter {
-            std::coroutine_handle<> continuation;
-            
-            bool await_ready() const noexcept { return false; }
-            
+            bool await_ready() const noexcept {
+                return false;
+            }
             void await_suspend(std::coroutine_handle<TaskPromise> h) noexcept {
-                if (h.promise().continuation) {
-                    h.promise().continuation.resume();
+                auto cont = h.promise().continuation;
+                if (cont) {
+                    cont.resume();
                 }
             }
-            
             void await_resume() noexcept {}
         };
         return FinalAwaiter{};
     }
-    
+
     void unhandled_exception() {
         std::terminate();
     }
-    
+
     void return_void() {}
 };
 
 struct Task {
     using promise_type = TaskPromise;
     std::coroutine_handle<TaskPromise> handle;
-    
+
     Task() : handle{} {}
-    
+
     Task(std::coroutine_handle<TaskPromise> h) : handle(h) {}
-    
+
     ~Task() {
         if (handle) {
             handle.destroy();
         }
     }
-    
+
     Task(const Task&) = delete;
     Task& operator=(const Task&) = delete;
-    
+
     Task(Task&& other) noexcept : handle(other.handle) {
         other.handle = {};
     }
-    
+
     Task& operator=(Task&& other) noexcept {
         if (this != &other) {
             if (handle) {
@@ -85,63 +82,68 @@ struct Task {
         }
         return *this;
     }
-    
+
     bool resume() {
-        if (handle && !handle.done()) {
-            handle.resume();
-            return !handle.done();
+        if (!handle || handle.done()) {
+            return false;
         }
-        return false;
+        handle.resume();
+        return !handle.done();
     }
-    
+
     bool done() const {
         return !handle || handle.done();
     }
-    
+
     // Make Task awaitable
-    bool await_ready() const noexcept {
-        if (!handle) return true;
-        if (handle.done()) return true;
-        return false;
-    }
-    
-    void await_suspend(std::coroutine_handle<> continuation) const noexcept {
-        if (handle && !handle.done()) {
-            // Store continuation in promise
-            handle.promise().continuation = continuation;
-            // Resume the task
-            handle.resume();
-        } else {
-            // Task already done, resume immediately
-            continuation.resume();
-        }
-    }
-    
-    void await_resume() const noexcept {
-        // Nothing to return for void tasks
+    auto operator co_await() const noexcept {
+        struct Awaiter {
+            std::coroutine_handle<TaskPromise> h;
+            bool await_ready() const noexcept {
+                return !h || h.done();
+            }
+            void await_suspend(std::coroutine_handle<> cont) const noexcept {
+                h.promise().continuation = cont;
+                if (h && !h.done()) {
+                    h.resume();
+                } else {
+                    cont.resume();
+                }
+            }
+            void await_resume() const noexcept {}
+        };
+        return Awaiter{handle};
     }
 };
 
-// Lock-free task queue using atomic operations
+// Implement TaskPromise::get_return_object after Task is defined
+inline Task TaskPromise::get_return_object() {
+    return Task{std::coroutine_handle<TaskPromise>::from_promise(*this)};
+}
+
+// Task queue using atomic enqueue and mutex-protected dequeue
+// (Simpler and safer than lock-free with hazard pointers)
 class TaskQueue {
-private:
+  private:
     struct Node {
         Task task;
         std::atomic<Node*> next;
-        
+
         Node(Task t) : task(std::move(t)), next(nullptr) {}
     };
-    
+
     std::atomic<Node*> head_;
     std::atomic<Node*> tail_;
-    
-public:
+    std::mutex dequeue_mutex_; // Protect dequeue from races
+
+  public:
     TaskQueue() {
-        Node* dummy = new Node(Task{std::coroutine_handle<TaskPromise>::from_address(nullptr)});
+        // Create dummy node with default-constructed Task (null handle is fine for dummy)
+        Node* dummy = new Node(Task{});
         head_.store(dummy);
         tail_.store(dummy);
     }
-    
+
     ~TaskQueue() {
         Node* node = head_.load();
         while (node) {
@@ -150,27 +152,29 @@ public:
             node = next;
         }
     }
-    
+
     void enqueue(Task task) {
         Node* node = new Node(std::move(task));
         Node* prev_tail = tail_.exchange(node, std::memory_order_acq_rel);
         prev_tail->next.store(node, std::memory_order_release);
     }
-    
+
     bool dequeue(Task& task) {
+        std::lock_guard<std::mutex> lock(dequeue_mutex_);
+
         Node* head = head_.load(std::memory_order_acquire);
         Node* next = head->next.load(std::memory_order_acquire);
-        
+
         if (next == nullptr) {
             return false;
         }
-        
+
         task = std::move(next->task);
         head_.store(next, std::memory_order_release);
         delete head;
         return true;
     }
-    
+
     bool empty() const {
         Node* head = head_.load(std::memory_order_acquire);
         return head->next.load(std::memory_order_acquire) == nullptr;
@@ -179,14 +183,14 @@ public:
 
 // IO Context - manages coroutines and I/O events
 class IOContext {
-private:
+  private:
     std::unique_ptr<PlatformIO> platform_io_;
     std::vector<TaskQueue> thread_queues_;
     std::vector<std::thread> worker_threads_;
     std::atomic<bool> running_;
     std::atomic<std::size_t> next_queue_;
     std::size_t num_threads_;
-    
+
     // Map from file descriptor to pending coroutine handles
     // Using lock-free approach with atomics
     struct PendingIO {
@@ -194,43 +198,49 @@ private:
         std::coroutine_handle<> write_handle;
     };
     std::unordered_map<int, PendingIO> pending_io_;
-    std::mutex io_mutex_;  // Only for the map, not for coroutine execution
-    
+    std::mutex io_mutex_; // Only for the map, not for coroutine execution
+
     void worker_thread(std::size_t queue_index);
     void process_io_events(const std::vector<PlatformIO::Event>& events);
-    
-public:
+
+  public:
     explicit IOContext(std::size_t num_threads = std::thread::hardware_concurrency());
     ~IOContext();
-    
+
     // Run the event loop (blocking)
     void run();
-    
+
     // Stop the event loop
     void stop();
-    
+
     // Schedule a coroutine task
     void schedule(Task task);
-    
+
     // Register I/O operation
     void register_io(int fd, uint32_t events, std::coroutine_handle<> handle);
-    
+
+    // Remove I/O registration for a file descriptor
+    void remove_io(int fd);
+
     // Get platform I/O interface
-    PlatformIO& platform_io() { return *platform_io_; }
-    
+    PlatformIO& platform_io() {
+        return *platform_io_;
+    }
+
     // Awaitable for async operations
-    template<typename T>
-    struct Awaiter {
+    template <typename T> struct Awaiter {
         T value;
         std::coroutine_handle<> continuation;
         bool ready = false;
-        
-        bool await_ready() const noexcept { return ready; }
-        
+
+        bool await_ready() const noexcept {
+            return ready;
+        }
+
         void await_suspend(std::coroutine_handle<> h) {
             continuation = h;
         }
-        
+
         T await_resume() noexcept {
             return value;
         }
@@ -238,8 +248,7 @@ public:
 };
 
 // Helper to create awaitable
-template<typename T>
-IOContext::Awaiter<T> make_awaiter(T value) {
+template <typename T> IOContext::Awaiter<T> make_awaiter(T value) {
     IOContext::Awaiter<T> awaiter;
     awaiter.value = value;
     awaiter.ready = true;
@@ -247,4 +256,3 @@ IOContext::Awaiter<T> make_awaiter(T value) {
 }
 
 } // namespace spaznet
-

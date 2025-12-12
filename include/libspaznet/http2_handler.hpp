@@ -1,10 +1,10 @@
 #pragma once
 
+#include <cstdint>
 #include <libspaznet/io_context.hpp>
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <cstdint>
 
 namespace spaznet {
 
@@ -32,20 +32,20 @@ struct HTTP2Response {
     int status_code = 200;
     std::unordered_map<std::string, std::string> headers;
     std::vector<uint8_t> body;
-    
+
     HTTP2Frame to_frame() const;
 };
 
 class HTTP2Handler {
-public:
+  public:
     virtual ~HTTP2Handler() = default;
-    
+
     // Handle HTTP/2 request
-    virtual Task handle_request(const HTTP2Request& request, HTTP2Response& response, Socket& socket) = 0;
-    
+    virtual Task handle_request(const HTTP2Request& request, HTTP2Response& response,
+                                Socket& socket) = 0;
+
     // Handle HTTP/2 frame
     virtual Task handle_frame(const HTTP2Frame& frame, Socket& socket) = 0;
 };
 
 } // namespace spaznet
-

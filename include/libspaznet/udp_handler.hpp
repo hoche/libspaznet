@@ -1,9 +1,9 @@
 #pragma once
 
-#include <libspaznet/io_context.hpp>
-#include <vector>
 #include <cstdint>
+#include <libspaznet/io_context.hpp>
 #include <string>
+#include <vector>
 
 namespace spaznet {
 
@@ -17,12 +17,11 @@ struct UDPPacket {
 };
 
 class UDPHandler {
-public:
+  public:
     virtual ~UDPHandler() = default;
-    
+
     // Handle incoming UDP packet
     virtual Task handle_packet(const UDPPacket& packet, Socket& socket) = 0;
 };
 
 } // namespace spaznet
-

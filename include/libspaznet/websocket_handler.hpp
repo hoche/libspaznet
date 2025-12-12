@@ -1,9 +1,9 @@
 #pragma once
 
+#include <cstdint>
 #include <libspaznet/io_context.hpp>
 #include <string>
 #include <vector>
-#include <cstdint>
 
 namespace spaznet {
 
@@ -29,7 +29,7 @@ struct WebSocketFrame {
     uint64_t payload_length;
     uint32_t masking_key;
     std::vector<uint8_t> payload;
-    
+
     std::vector<uint8_t> serialize() const;
     static WebSocketFrame parse(const std::vector<uint8_t>& data);
 };
@@ -40,18 +40,17 @@ struct WebSocketMessage {
 };
 
 class WebSocketHandler {
-public:
+  public:
     virtual ~WebSocketHandler() = default;
-    
+
     // Handle WebSocket message
     virtual Task handle_message(const WebSocketMessage& message, Socket& socket) = 0;
-    
+
     // Handle WebSocket connection open
     virtual Task on_open(Socket& socket) = 0;
-    
+
     // Handle WebSocket connection close
     virtual Task on_close(Socket& socket) = 0;
 };
 
 } // namespace spaznet
-

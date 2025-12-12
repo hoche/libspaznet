@@ -1,17 +1,13 @@
-#include <libspaznet/io_context.hpp>
-#include <libspaznet/platform_io.hpp>
 #include <algorithm>
 #include <iostream>
+#include <libspaznet/io_context.hpp>
+#include <libspaznet/platform_io.hpp>
 
 namespace spaznet {
 
 IOContext::IOContext(std::size_t num_threads)
-    : platform_io_(create_platform_io())
-    , thread_queues_(num_threads)
-    , running_(false)
-    , next_queue_(0)
-    , num_threads_(num_threads)
-{
+    : platform_io_(create_platform_io()), thread_queues_(num_threads), running_(false),
+      next_queue_(0), num_threads_(num_threads) {
     if (!platform_io_->init()) {
         throw std::runtime_error("Failed to initialize platform I/O");
     }
@@ -24,27 +20,27 @@ IOContext::~IOContext() {
 
 void IOContext::run() {
     running_.store(true, std::memory_order_release);
-    
+
     // Start worker threads
     for (std::size_t i = 0; i < num_threads_; ++i) {
         worker_threads_.emplace_back(&IOContext::worker_thread, this, i);
     }
-    
+
     // Main event loop
     std::vector<PlatformIO::Event> events;
     events.reserve(64);
-    
+
     while (running_.load(std::memory_order_acquire)) {
-        int num_events = platform_io_->wait(events, 100);  // 100ms timeout
-        
+        int num_events = platform_io_->wait(events, 100); // 100ms timeout
+
         if (num_events < 0) {
             // Error occurred
             break;
         }
-        
+
         // Process I/O events
         process_io_events(events);
-        
+
         // Steal work from queues if needed
         for (auto& queue : thread_queues_) {
             Task task;
@@ -59,7 +55,7 @@ void IOContext::run() {
             }
         }
     }
-    
+
     // Wait for worker threads
     for (auto& thread : worker_threads_) {
         if (thread.joinable()) {
@@ -80,7 +76,7 @@ void IOContext::schedule(Task task) {
 
 void IOContext::worker_thread(std::size_t queue_index) {
     TaskQueue& queue = thread_queues_[queue_index];
-    
+
     while (running_.load(std::memory_order_acquire)) {
         Task task;
         if (queue.dequeue(task)) {
@@ -100,58 +96,70 @@ void IOContext::worker_thread(std::size_t queue_index) {
 
 void IOContext::register_io(int fd, uint32_t events, std::coroutine_handle<> handle) {
     std::lock_guard<std::mutex> lock(io_mutex_);
-    
+
     auto& pending = pending_io_[fd];
     uint32_t new_events = events;
-    
+
     if (events & PlatformIO::EVENT_READ) {
         pending.read_handle = handle;
     }
     if (events & PlatformIO::EVENT_WRITE) {
         pending.write_handle = handle;
     }
-    
+
     // Check if we need to add or modify
     bool exists = (pending.read_handle || pending.write_handle);
     if (exists) {
         // Combine events
-        if (pending.read_handle) new_events |= PlatformIO::EVENT_READ;
-        if (pending.write_handle) new_events |= PlatformIO::EVENT_WRITE;
+        if (pending.read_handle)
+            new_events |= PlatformIO::EVENT_READ;
+        if (pending.write_handle)
+            new_events |= PlatformIO::EVENT_WRITE;
         platform_io_->modify_fd(fd, new_events, &pending);
     } else {
         platform_io_->add_fd(fd, new_events, &pending);
     }
 }
 
+void IOContext::remove_io(int fd) {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    pending_io_.erase(fd);
+}
+
 void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) {
-    for (const auto& ev : events) {
-        PendingIO* pending = reinterpret_cast<PendingIO*>(ev.user_data);
-        if (!pending) continue;
-        
-        std::coroutine_handle<> handle_to_resume;
-        
-        {
-            std::lock_guard<std::mutex> lock(io_mutex_);
-            if ((ev.events & PlatformIO::EVENT_READ) && pending->read_handle) {
-                handle_to_resume = pending->read_handle;
-                pending->read_handle = {};
+    // Extract handles to resume BEFORE scheduling (avoid holding lock during schedule)
+    std::vector<std::coroutine_handle<>> handles_to_resume;
+
+    {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+
+        for (const auto& ev : events) {
+            // Look up by fd (safe), not by pointer (can be invalidated)
+            auto it = pending_io_.find(ev.fd);
+            if (it == pending_io_.end()) {
+                continue; // fd was removed
             }
-            if ((ev.events & PlatformIO::EVENT_WRITE) && pending->write_handle) {
-                if (!handle_to_resume) {
-                    handle_to_resume = pending->write_handle;
-                }
-                pending->write_handle = {};
+
+            PendingIO& pending = it->second;
+
+            if ((ev.events & PlatformIO::EVENT_READ) && pending.read_handle) {
+                handles_to_resume.push_back(pending.read_handle);
+                pending.read_handle = {};
+            }
+            if ((ev.events & PlatformIO::EVENT_WRITE) && pending.write_handle) {
+                handles_to_resume.push_back(pending.write_handle);
+                pending.write_handle = {};
             }
         }
-        
-        if (handle_to_resume) {
-            // Schedule the coroutine to resume
-            // Convert to TaskPromise handle
-            auto task_handle = std::coroutine_handle<TaskPromise>::from_address(handle_to_resume.address());
-            schedule(Task{task_handle});
-        }
+    }
+    // Lock released here
+
+    // Now schedule all handles without holding the lock
+    for (auto handle : handles_to_resume) {
+        // Convert to TaskPromise handle
+        auto task_handle = std::coroutine_handle<TaskPromise>::from_address(handle.address());
+        schedule(Task{task_handle});
     }
 }
 
 } // namespace spaznet
-

@@ -1,10 +1,10 @@
 #pragma once
 
+#include <cstdint>
 #include <libspaznet/io_context.hpp>
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <cstdint>
 
 namespace spaznet {
 
@@ -24,21 +24,21 @@ struct HTTPResponse {
     std::string status_message = "OK";
     std::unordered_map<std::string, std::string> headers;
     std::vector<uint8_t> body;
-    
+
     void set_header(const std::string& key, const std::string& value) {
         headers[key] = value;
     }
-    
+
     std::vector<uint8_t> serialize() const;
 };
 
 class HTTPHandler {
-public:
+  public:
     virtual ~HTTPHandler() = default;
-    
+
     // Handle HTTP request
-    virtual Task handle_request(const HTTPRequest& request, HTTPResponse& response, Socket& socket) = 0;
+    virtual Task handle_request(const HTTPRequest& request, HTTPResponse& response,
+                                Socket& socket) = 0;
 };
 
 } // namespace spaznet
-
