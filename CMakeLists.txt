@@ -40,6 +40,7 @@ set(SOURCES
 set(HEADERS
     include/libspaznet/io_context.hpp
     include/libspaznet/platform_io.hpp
+    include/libspaznet/logger.hpp
     include/libspaznet/handlers/udp_handler.hpp
     include/libspaznet/handlers/http_handler.hpp
     include/libspaznet/handlers/http2_handler.hpp
@@ -116,6 +117,7 @@ add_executable(test_unit
     tests/unit/test_quic_handler.cpp
     tests/unit/test_rfc9112_parser.cpp
     tests/unit/test_rfc9113_parser.cpp
+    tests/unit/test_logger.cpp
 )
 
 target_link_libraries(test_unit

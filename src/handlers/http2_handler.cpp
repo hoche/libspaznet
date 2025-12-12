@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <format>
 #include <libspaznet/handlers/http2_handler.hpp>
 #include <libspaznet/utils/binary_utils.hpp>
 #include <libspaznet/utils/number_utils.hpp>
@@ -192,7 +193,7 @@ std::unordered_map<std::string, std::string> HTTP2Request::get_regular_headers()
 // HTTP2Response helper methods
 void HTTP2Response::set_status(int code, const std::string& reason) {
     status_code = code;
-    headers[":status"] = std::to_string(code);
+    headers[":status"] = std::format("{}", code);
     if (!reason.empty()) {
         headers["reason"] = reason;
     }
@@ -551,7 +552,7 @@ HTTP2Frame HTTP2Parser::build_headers_frame(const HTTP2Response& response, uint3
     // Ensure :status is set
     std::unordered_map<std::string, std::string> headers = response.headers;
     if (headers.find(":status") == headers.end()) {
-        headers[":status"] = std::to_string(response.status_code);
+        headers[":status"] = std::format("{}", response.status_code);
     }
 
     // Encode headers with HPACK
