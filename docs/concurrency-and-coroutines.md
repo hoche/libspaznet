@@ -14,7 +14,7 @@ flowchart LR
     subgraph OS[Kernel I/O + Timers]
         EVT[fd ready / timer due]
     end
-    EVT --> |wait()/poll| PIO[PlatformIO]
+    EVT --> |wait/poll| PIO[PlatformIO]
     PIO --> |Event list| LOOP[IOContext::process_io_events]
     LOOP --> |coroutine handles| SCHED[Round-robin scheduler]
     SCHED --> |enqueue Task| Q1[TaskQueue 0]
