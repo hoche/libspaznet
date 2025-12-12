@@ -1,6 +1,6 @@
 #include <algorithm>
 #include <cstring>
-#include <libspaznet/websocket_handler.hpp>
+#include <libspaznet/handlers/websocket_handler.hpp>
 
 namespace spaznet {
 
@@ -122,3 +122,4 @@ WebSocketFrame WebSocketFrame::parse(const std::vector<uint8_t>& data) {
 }
 
 } // namespace spaznet
+

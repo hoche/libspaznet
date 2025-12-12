@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <libspaznet/http2_handler.hpp>
+#include <libspaznet/handlers/http2_handler.hpp>
 
 using namespace spaznet;
 

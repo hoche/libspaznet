@@ -2,7 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <libspaznet/server.hpp>
-#include <libspaznet/websocket_handler.hpp>
+#include <libspaznet/handlers/websocket_handler.hpp>
 #include <string>
 #include <thread>
 #include <vector>

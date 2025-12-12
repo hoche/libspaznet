@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include <cstdint>
-#include <libspaznet/websocket_handler.hpp>
+#include <libspaznet/handlers/websocket_handler.hpp>
 #include <vector>
 
 using namespace spaznet;

@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <libspaznet/http_handler.hpp>
+#include <libspaznet/handlers/http_handler.hpp>
 #include <sstream>
 #include <string>
 

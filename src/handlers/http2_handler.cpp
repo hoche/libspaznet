@@ -1,5 +1,5 @@
 #include <cstring>
-#include <libspaznet/http2_handler.hpp>
+#include <libspaznet/handlers/http2_handler.hpp>
 #include <sstream>
 
 namespace spaznet {
@@ -26,3 +26,4 @@ HTTP2Frame HTTP2Response::to_frame() const {
 }
 
 } // namespace spaznet
+

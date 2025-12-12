@@ -80,10 +80,10 @@ class Socket {
 } // namespace spaznet
 
 // Include handlers after Socket is defined
-#include <libspaznet/http2_handler.hpp>
-#include <libspaznet/http_handler.hpp>
-#include <libspaznet/udp_handler.hpp>
-#include <libspaznet/websocket_handler.hpp>
+#include <libspaznet/handlers/http2_handler.hpp>
+#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/handlers/udp_handler.hpp>
+#include <libspaznet/handlers/websocket_handler.hpp>
 
 namespace spaznet {
 

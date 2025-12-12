@@ -23,10 +23,10 @@ include_directories(include)
 set(SOURCES
     src/io_context.cpp
     src/platform_io.cpp
-    src/udp_handler.cpp
-    src/http_handler.cpp
-    src/http2_handler.cpp
-    src/websocket_handler.cpp
+    src/handlers/udp_handler.cpp
+    src/handlers/http_handler.cpp
+    src/handlers/http2_handler.cpp
+    src/handlers/websocket_handler.cpp
     src/server.cpp
 )
 
@@ -34,10 +34,10 @@ set(SOURCES
 set(HEADERS
     include/libspaznet/io_context.hpp
     include/libspaznet/platform_io.hpp
-    include/libspaznet/udp_handler.hpp
-    include/libspaznet/http_handler.hpp
-    include/libspaznet/http2_handler.hpp
-    include/libspaznet/websocket_handler.hpp
+    include/libspaznet/handlers/udp_handler.hpp
+    include/libspaznet/handlers/http_handler.hpp
+    include/libspaznet/handlers/http2_handler.hpp
+    include/libspaznet/handlers/websocket_handler.hpp
     include/libspaznet/server.hpp
 )
 

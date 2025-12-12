@@ -1,5 +1,5 @@
 #include <algorithm>
-#include <libspaznet/http_handler.hpp>
+#include <libspaznet/handlers/http_handler.hpp>
 #include <sstream>
 
 namespace spaznet {
@@ -36,3 +36,4 @@ std::vector<uint8_t> HTTPResponse::serialize() const {
 }
 
 } // namespace spaznet
+

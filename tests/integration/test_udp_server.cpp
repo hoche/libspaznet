@@ -2,7 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <libspaznet/server.hpp>
-#include <libspaznet/udp_handler.hpp>
+#include <libspaznet/handlers/udp_handler.hpp>
 #include <string>
 #include <thread>
 #include <vector>
