@@ -192,13 +192,15 @@ class IOContext {
     std::size_t num_threads_;
 
     // Map from file descriptor to pending coroutine handles
-    // Using lock-free approach with atomics
+    // Handles stored as raw addresses for atomic access
     struct PendingIO {
-        std::coroutine_handle<> read_handle;
-        std::coroutine_handle<> write_handle;
+        std::atomic<void*> read_handle;
+        std::atomic<void*> write_handle;
+
+        PendingIO() : read_handle(nullptr), write_handle(nullptr) {}
     };
     std::unordered_map<int, PendingIO> pending_io_;
-    std::mutex io_mutex_; // Only for the map, not for coroutine execution
+    mutable std::atomic_flag map_lock_ = ATOMIC_FLAG_INIT; // Spinlock for map structure only
 
     void worker_thread(std::size_t queue_index);
     void process_io_events(const std::vector<PlatformIO::Event>& events);

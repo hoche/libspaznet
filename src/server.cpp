@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -174,14 +175,30 @@ void Server::set_websocket_handler(std::unique_ptr<WebSocketHandler> handler) {
 }
 
 void Server::listen_tcp(uint16_t port) {
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    // Use getaddrinfo for IPv4/IPv6 compatibility
+    struct addrinfo hints {
+    }, *result = nullptr;
+    hints.ai_family = AF_INET6; // IPv6 socket (can accept IPv4 via IPv4-mapped addresses)
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE; // For wildcard bind address
+
+    std::string port_str = std::to_string(port);
+    if (getaddrinfo(nullptr, port_str.c_str(), &hints, &result) != 0) {
+        throw std::runtime_error("Failed to resolve address");
+    }
+
+    int listen_fd = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
     if (listen_fd < 0) {
+        freeaddrinfo(result);
         throw std::runtime_error("Failed to create socket");
     }
 
     // Set socket options
     int opt = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // Allow IPv4 connections on IPv6 socket
+    int no = 0;
+    setsockopt(listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
 
     // Set non-blocking
 #ifdef _WIN32
@@ -193,15 +210,13 @@ void Server::listen_tcp(uint16_t port) {
 #endif
 
     // Bind
-    struct sockaddr_in addr {};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-
-    if (bind(listen_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+    if (bind(listen_fd, result->ai_addr, result->ai_addrlen) < 0) {
         close_socket(listen_fd);
+        freeaddrinfo(result);
         throw std::runtime_error("Failed to bind socket");
     }
+
+    freeaddrinfo(result);
 
     // Listen
     if (listen(listen_fd, SOMAXCONN) < 0) {
@@ -215,14 +230,30 @@ void Server::listen_tcp(uint16_t port) {
 }
 
 void Server::listen_udp(uint16_t port) {
-    int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    // Use getaddrinfo for IPv4/IPv6 compatibility
+    struct addrinfo hints {
+    }, *result = nullptr;
+    hints.ai_family = AF_INET6; // IPv6 socket (can accept IPv4 via IPv4-mapped addresses)
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_PASSIVE;
+
+    std::string port_str = std::to_string(port);
+    if (getaddrinfo(nullptr, port_str.c_str(), &hints, &result) != 0) {
+        throw std::runtime_error("Failed to resolve address for UDP");
+    }
+
+    int udp_fd = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
     if (udp_fd < 0) {
+        freeaddrinfo(result);
         throw std::runtime_error("Failed to create UDP socket");
     }
 
     // Set socket options for reuse
     int opt = 1;
     setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    // Allow IPv4 on IPv6 socket
+    int no = 0;
+    setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
 
     // Set non-blocking
 #ifdef _WIN32
@@ -234,15 +265,13 @@ void Server::listen_udp(uint16_t port) {
 #endif
 
     // Bind
-    struct sockaddr_in addr {};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-
-    if (bind(udp_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+    if (bind(udp_fd, result->ai_addr, result->ai_addrlen) < 0) {
         close_socket(udp_fd);
+        freeaddrinfo(result);
         throw std::runtime_error("Failed to bind UDP socket");
     }
+
+    freeaddrinfo(result);
 
     // For now, UDP just binds - actual packet handling would need a receive loop
     // This is a simplified implementation
@@ -250,7 +279,7 @@ void Server::listen_udp(uint16_t port) {
 
 void Server::accept_connections(int listen_fd) {
     while (running_.load()) {
-        struct sockaddr_in client_addr {};
+        struct sockaddr_storage client_addr {}; // Can hold IPv4 or IPv6
         socklen_t client_len = sizeof(client_addr);
 
         int client_fd =

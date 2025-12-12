@@ -95,25 +95,35 @@ void IOContext::worker_thread(std::size_t queue_index) {
 }
 
 void IOContext::register_io(int fd, uint32_t events, std::coroutine_handle<> handle) {
-    std::lock_guard<std::mutex> lock(io_mutex_);
+    // Spinlock for map structure access only
+    while (map_lock_.test_and_set(std::memory_order_acquire)) {
+        // Spin - this is brief, just map access
+    }
 
     auto& pending = pending_io_[fd];
     uint32_t new_events = events;
 
+    // Store handles atomically
+    void* handle_addr = handle.address();
     if (events & PlatformIO::EVENT_READ) {
-        pending.read_handle = handle;
+        pending.read_handle.store(handle_addr, std::memory_order_release);
     }
     if (events & PlatformIO::EVENT_WRITE) {
-        pending.write_handle = handle;
+        pending.write_handle.store(handle_addr, std::memory_order_release);
     }
 
     // Check if we need to add or modify
-    bool exists = (pending.read_handle || pending.write_handle);
+    bool has_read = pending.read_handle.load(std::memory_order_acquire) != nullptr;
+    bool has_write = pending.write_handle.load(std::memory_order_acquire) != nullptr;
+    bool exists = has_read || has_write;
+
+    map_lock_.clear(std::memory_order_release);
+
     if (exists) {
         // Combine events
-        if (pending.read_handle)
+        if (has_read)
             new_events |= PlatformIO::EVENT_READ;
-        if (pending.write_handle)
+        if (has_write)
             new_events |= PlatformIO::EVENT_WRITE;
         platform_io_->modify_fd(fd, new_events, &pending);
     } else {
@@ -122,8 +132,11 @@ void IOContext::register_io(int fd, uint32_t events, std::coroutine_handle<> han
 }
 
 void IOContext::remove_io(int fd) {
-    std::lock_guard<std::mutex> lock(io_mutex_);
+    while (map_lock_.test_and_set(std::memory_order_acquire)) {
+        // Spin
+    }
     pending_io_.erase(fd);
+    map_lock_.clear(std::memory_order_release);
 }
 
 void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) {
@@ -131,7 +144,10 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
     std::vector<std::coroutine_handle<>> handles_to_resume;
 
     {
-        std::lock_guard<std::mutex> lock(io_mutex_);
+        // Spinlock for map access
+        while (map_lock_.test_and_set(std::memory_order_acquire)) {
+            // Spin
+        }
 
         for (const auto& ev : events) {
             // Look up by fd (safe), not by pointer (can be invalidated)
@@ -142,15 +158,22 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
 
             PendingIO& pending = it->second;
 
-            if ((ev.events & PlatformIO::EVENT_READ) && pending.read_handle) {
-                handles_to_resume.push_back(pending.read_handle);
-                pending.read_handle = {};
+            // Load and clear handles atomically
+            if (ev.events & PlatformIO::EVENT_READ) {
+                void* addr = pending.read_handle.exchange(nullptr, std::memory_order_acq_rel);
+                if (addr) {
+                    handles_to_resume.push_back(std::coroutine_handle<>::from_address(addr));
+                }
             }
-            if ((ev.events & PlatformIO::EVENT_WRITE) && pending.write_handle) {
-                handles_to_resume.push_back(pending.write_handle);
-                pending.write_handle = {};
+            if (ev.events & PlatformIO::EVENT_WRITE) {
+                void* addr = pending.write_handle.exchange(nullptr, std::memory_order_acq_rel);
+                if (addr) {
+                    handles_to_resume.push_back(std::coroutine_handle<>::from_address(addr));
+                }
             }
         }
+
+        map_lock_.clear(std::memory_order_release);
     }
     // Lock released here
 

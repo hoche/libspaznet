@@ -20,8 +20,8 @@
 class IperfIntegrationTest : public ::testing::Test {
   protected:
     std::string find_iperf_executable() {
-        // Try iperf3 first, then iperf
-        const char* candidates[] = {"iperf3", "iperf"};
+        // Try iperf (iperf2) first, then iperf3
+        const char* candidates[] = {"iperf", "iperf3"};
 
         for (const char* cmd : candidates) {
             std::string test_cmd = std::string(cmd) + " --version > /dev/null 2>&1";
