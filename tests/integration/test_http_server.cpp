@@ -21,7 +21,12 @@
 
 using namespace spaznet;
 
-class TestHTTPHandler : public HTTPHandler {
+// Use a unique test handler name to avoid ODR clashes with handlers in other
+// test translation units (e.g., test_tcp_server.cpp) that also define
+// TestHTTPHandler. The previous shared name caused the linker to pick the
+// definition from another test file, so this test received the wrong body
+// payload ("OK" instead of "Hello").
+class HTTPServerTestHandler : public HTTPHandler {
   public:
     std::atomic<int> request_count{0};
     std::string last_method;
@@ -36,6 +41,7 @@ class TestHTTPHandler : public HTTPHandler {
         response.status_code = 200;
         response.reason_phrase = "OK";
         response.set_header("Content-Type", "text/plain");
+        // Set body - serialize() will automatically add Content-Length
         response.body = {'H', 'e', 'l', 'l', 'o'};
 
         co_return;
@@ -45,9 +51,9 @@ class TestHTTPHandler : public HTTPHandler {
 class HTTPServerTest : public ::testing::Test {
   protected:
     void SetUp() override {
-        handler = std::make_unique<TestHTTPHandler>();
+        handler = std::make_unique<HTTPServerTestHandler>();
         server = std::make_unique<Server>(2);
-        server->set_http_handler(std::make_unique<TestHTTPHandler>());
+        server->set_http_handler(std::make_unique<HTTPServerTestHandler>());
         server->listen_tcp(8888);
 
         server_thread = std::thread([this]() { server->run(); });
@@ -171,7 +177,7 @@ class HTTPServerTest : public ::testing::Test {
         return response;
     }
 
-    std::unique_ptr<TestHTTPHandler> handler;
+    std::unique_ptr<HTTPServerTestHandler> handler;
     std::unique_ptr<Server> server;
     std::thread server_thread;
 };
@@ -220,6 +226,7 @@ TEST_F(HTTPServerTest, ResponseBody) {
 
     // Debug output
     std::cout << "Response length: " << response.length() << std::endl;
+    std::cout << "Handler request_count: " << handler->request_count.load() << std::endl;
     if (response.length() > 0) {
         std::cout << "Response (first 500 chars): "
                   << response.substr(0, std::min(500UL, response.length())) << std::endl;
