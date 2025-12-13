@@ -1,0 +1,295 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  # Linux x64
+  build-test-linux-x64:
+    name: Build and Test - Linux x64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up CMake
+        uses: jwlawson/actions-setup-cmake@v1.14
+        with:
+          cmake-version: '3.20'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential g++-12 || sudo apt-get install -y build-essential g++-11 || sudo apt-get install -y build-essential g++-10
+
+      - name: Configure CMake
+        run: |
+          mkdir -p build
+          cd build
+          cmake ..
+
+      - name: Build
+        run: |
+          cd build
+          cmake --build . --config Release -j$(nproc)
+
+      - name: Run Unit Tests
+        run: |
+          cd build
+          ./test_unit || ctest -R UnitTests --output-on-failure
+
+      - name: Run Integration Tests
+        run: |
+          cd build
+          ./test_integration || ctest -R IntegrationTests --output-on-failure
+
+      - name: Run All Tests with CTest
+        run: |
+          cd build
+          ctest --output-on-failure
+
+  # Linux ARM64 (using Docker with QEMU)
+  build-test-linux-arm64:
+    name: Build and Test - Linux ARM64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and test in ARM64 container
+        run: |
+          docker run --rm --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace \
+            ubuntu:22.04 bash -c "
+            apt-get update && apt-get install -y build-essential g++-12 cmake git curl \
+            && mkdir -p build \
+            && cd build \
+            && cmake .. \
+            && cmake --build . --config Release -j\$(nproc) \
+            && ./test_unit || ctest -R UnitTests --output-on-failure \
+            && ./test_integration || ctest -R IntegrationTests --output-on-failure \
+            && ctest --output-on-failure
+          "
+
+  # macOS ARM64 (Apple Silicon)
+  build-test-macos-arm64:
+    name: Build and Test - macOS ARM64
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up CMake
+        uses: jwlawson/actions-setup-cmake@v1.14
+        with:
+          cmake-version: '3.20'
+
+      - name: Install dependencies
+        run: |
+          brew install cmake || true
+
+      - name: Configure CMake
+        run: |
+          mkdir -p build
+          cd build
+          cmake ..
+
+      - name: Build
+        run: |
+          cd build
+          cmake --build . --config Release -j$(sysctl -n hw.ncpu)
+
+      - name: Run Unit Tests
+        run: |
+          cd build
+          ./test_unit || ctest -R UnitTests --output-on-failure
+
+      - name: Run Integration Tests
+        run: |
+          cd build
+          ./test_integration || ctest -R IntegrationTests --output-on-failure
+
+      - name: Run All Tests with CTest
+        run: |
+          cd build
+          ctest --output-on-failure
+
+  # macOS x64 (Intel) - Note: GitHub Actions macOS runners are now ARM64 by default
+  # Using macos-12 which may still have x64 support, or using Rosetta 2 emulation
+  build-test-macos-x64:
+    name: Build and Test - macOS x64
+    runs-on: macos-12
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up CMake
+        uses: jwlawson/actions-setup-cmake@v1.14
+        with:
+          cmake-version: '3.20'
+
+      - name: Install dependencies
+        run: |
+          brew install cmake || true
+
+      - name: Configure CMake (x64)
+        run: |
+          mkdir -p build
+          cd build
+          # Force x64 architecture
+          arch -x86_64 cmake .. || cmake ..
+
+      - name: Build (x64)
+        run: |
+          cd build
+          arch -x86_64 cmake --build . --config Release -j$(sysctl -n hw.ncpu) || cmake --build . --config Release -j$(sysctl -n hw.ncpu)
+
+      - name: Run Unit Tests
+        run: |
+          cd build
+          arch -x86_64 ./test_unit || ./test_unit || ctest -R UnitTests --output-on-failure
+
+      - name: Run Integration Tests
+        run: |
+          cd build
+          arch -x86_64 ./test_integration || ./test_integration || ctest -R IntegrationTests --output-on-failure
+
+      - name: Run All Tests with CTest
+        run: |
+          cd build
+          ctest --output-on-failure
+
+  # Windows Server build
+  build-test-windows-server:
+    name: Build and Test - Windows Server
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up CMake
+        uses: jwlawson/actions-setup-cmake@v1.14
+        with:
+          cmake-version: '3.20'
+
+      - name: Install Visual Studio Build Tools
+        uses: microsoft/setup-msbuild@v1.1
+
+      - name: Configure CMake
+        run: |
+          mkdir build
+          cd build
+          cmake .. -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: |
+          cd build
+          cmake --build . --config Release -j
+
+      - name: Run Unit Tests
+        run: |
+          cd build
+          .\Release\test_unit.exe || ctest -C Release -R UnitTests --output-on-failure
+
+      - name: Run Integration Tests
+        run: |
+          cd build
+          .\Release\test_integration.exe || ctest -C Release -R IntegrationTests --output-on-failure
+
+      - name: Run All Tests with CTest
+        run: |
+          cd build
+          ctest -C Release --output-on-failure
+
+  # Windows 11 build (using windows-latest which should be Windows Server 2022 or newer)
+  build-test-windows-11:
+    name: Build and Test - Windows 11
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up CMake
+        uses: jwlawson/actions-setup-cmake@v1.14
+        with:
+          cmake-version: '3.20'
+
+      - name: Install Visual Studio Build Tools
+        uses: microsoft/setup-msbuild@v1.1
+
+      - name: Configure CMake
+        run: |
+          mkdir build
+          cd build
+          cmake .. -G "Visual Studio 17 2022" -A x64
+
+      - name: Build
+        run: |
+          cd build
+          cmake --build . --config Release -j
+
+      - name: Run Unit Tests
+        run: |
+          cd build
+          .\Release\test_unit.exe || ctest -C Release -R UnitTests --output-on-failure
+
+      - name: Run Integration Tests
+        run: |
+          cd build
+          .\Release\test_integration.exe || ctest -C Release -R IntegrationTests --output-on-failure
+
+      - name: Run All Tests with CTest
+        run: |
+          cd build
+          ctest -C Release --output-on-failure
+
+  # FreeBSD build using Docker
+  build-test-freebsd:
+    name: Build and Test - FreeBSD
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build and test in FreeBSD container
+        run: |
+          # Try FreeBSD 14 first, then fall back to 13
+          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace \
+            freebsd/freebsd-14:latest sh -c "
+            pkg install -y cmake gmake gcc12 || pkg install -y cmake gmake gcc11 || pkg install -y cmake gmake gcc10
+            mkdir -p build
+            cd build
+            cmake ..
+            cmake --build . --config Release -j\$(sysctl -n hw.ncpu || echo 4)
+            ./test_unit || ctest -R UnitTests --output-on-failure
+            ./test_integration || ctest -R IntegrationTests --output-on-failure
+            ctest --output-on-failure
+          " || docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace \
+            freebsd/freebsd-13:latest sh -c "
+            pkg install -y cmake gmake gcc12 || pkg install -y cmake gmake gcc11 || pkg install -y cmake gmake gcc10
+            mkdir -p build
+            cd build
+            cmake ..
+            cmake --build . --config Release -j\$(sysctl -n hw.ncpu || echo 4)
+            ./test_unit || ctest -R UnitTests --output-on-failure
+            ./test_integration || ctest -R IntegrationTests --output-on-failure
+            ctest --output-on-failure
+          "
