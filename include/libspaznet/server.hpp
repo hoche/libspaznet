@@ -131,6 +131,11 @@ class Server {
 
     // Stop the server
     void stop();
+
+    // Get current statistics (lock-free read)
+    [[nodiscard]] auto get_statistics() const -> Statistics {
+        return io_context_->get_statistics();
+    }
 };
 
 } // namespace spaznet

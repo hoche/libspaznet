@@ -13,10 +13,18 @@ IOContext::IOContext(std::size_t num_threads)
     if (!platform_io_->init()) {
         throw std::runtime_error("Failed to initialize platform I/O");
     }
+
+    // Set global statistics pointer for lock-free tracking
+    g_statistics.store(&statistics_, std::memory_order_release);
 }
 
 IOContext::~IOContext() {
     stop();
+
+    // Clear global statistics pointer
+    StatisticsInternal* expected = &statistics_;
+    g_statistics.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
+
     platform_io_->cleanup();
 }
 
