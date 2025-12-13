@@ -571,36 +571,48 @@ Task Server::handle_connection(Socket socket) {
             }
 
             if (parse_result == HTTPParser::ParseResult::Success) {
-                HTTPResponse response;
-                response.version = "1.1";
+                // Track request start (lock-free)
+                socket.context()->increment_active_requests();
 
-                co_await http_handler_->handle_request(request, response, socket);
+                try {
+                    HTTPResponse response;
+                    response.version = "1.1";
 
-                if (!request.should_keep_alive()) {
-                    response.set_header("Connection", "close");
-                } else {
-                    response.set_header("Connection", "keep-alive");
-                }
+                    co_await http_handler_->handle_request(request, response, socket);
 
-                std::vector<uint8_t> response_data;
-                auto te = response.get_header("Transfer-Encoding");
-                if (te) {
-                    std::string te_lower = *te;
-                    std::transform(te_lower.begin(), te_lower.end(), te_lower.begin(),
-                                   [](unsigned char c) { return std::tolower(c); });
-                    if (te_lower.find("chunked") != std::string::npos) {
-                        response_data = response.serialize_chunked();
+                    if (!request.should_keep_alive()) {
+                        response.set_header("Connection", "close");
+                    } else {
+                        response.set_header("Connection", "keep-alive");
+                    }
+
+                    std::vector<uint8_t> response_data;
+                    auto te = response.get_header("Transfer-Encoding");
+                    if (te) {
+                        std::string te_lower = *te;
+                        std::transform(te_lower.begin(), te_lower.end(), te_lower.begin(),
+                                       [](unsigned char c) { return std::tolower(c); });
+                        if (te_lower.find("chunked") != std::string::npos) {
+                            response_data = response.serialize_chunked();
+                        } else {
+                            response_data = response.serialize();
+                        }
                     } else {
                         response_data = response.serialize();
                     }
-                } else {
-                    response_data = response.serialize();
-                }
 
-                co_await socket.async_write(response_data);
+                    co_await socket.async_write(response_data);
 
-                if (!request.should_keep_alive()) {
-                    socket.close();
+                    if (!request.should_keep_alive()) {
+                        socket.close();
+                    }
+
+                    // Track request finish (lock-free) - after response is sent successfully
+                    socket.context()->decrement_active_requests();
+                } catch (...) {
+                    // Ensure request counter is decremented even on exception
+                    socket.context()->decrement_active_requests();
+                    throw;
                 }
             } else {
                 HTTPResponse error_response;

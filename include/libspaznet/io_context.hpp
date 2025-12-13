@@ -17,6 +17,30 @@ namespace spaznet {
 
 // Forward declarations
 struct Task;
+class IOContext;
+
+// Statistics structure for lock-free tracking
+// Internal structure uses atomics, snapshot uses plain values for copying
+struct Statistics {
+    std::size_t active_requests{0};          // Currently active HTTP requests
+    std::size_t total_coroutines_created{0}; // Total coroutines created
+    std::size_t active_coroutines{0};        // Currently active coroutines
+    std::size_t total_memory_bytes{0};       // Estimated memory in use (bytes)
+
+    // Helper to estimate coroutine frame size (approximate)
+    static constexpr std::size_t ESTIMATED_COROUTINE_FRAME_SIZE = 512; // bytes per coroutine frame
+};
+
+// Internal statistics storage with atomics
+struct StatisticsInternal {
+    std::atomic<std::size_t> active_requests{0};
+    std::atomic<std::size_t> total_coroutines_created{0};
+    std::atomic<std::size_t> active_coroutines{0};
+    std::atomic<std::size_t> total_memory_bytes{0};
+};
+
+// Global pointer to current IOContext statistics (set by IOContext constructor)
+inline std::atomic<StatisticsInternal*> g_statistics{nullptr};
 
 // Coroutine task handle
 struct TaskPromise {
@@ -64,6 +88,14 @@ struct Task {
 
     ~Task() {
         if (handle && owns_handle) {
+            // Track coroutine destruction (lock-free) before destroying
+            StatisticsInternal* stats = g_statistics.load(std::memory_order_acquire);
+            if (stats != nullptr) {
+                stats->active_coroutines.fetch_sub(1, std::memory_order_relaxed);
+                stats->total_memory_bytes.fetch_sub(Statistics::ESTIMATED_COROUTINE_FRAME_SIZE,
+                                                    std::memory_order_relaxed);
+            }
+
             handle.destroy();
         }
     }
@@ -79,6 +111,14 @@ struct Task {
     auto operator=(Task&& other) noexcept -> Task& {
         if (this != &other) {
             if (handle && owns_handle) {
+                // Track coroutine destruction (lock-free) before destroying
+                StatisticsInternal* stats = g_statistics.load(std::memory_order_acquire);
+                if (stats != nullptr) {
+                    stats->active_coroutines.fetch_sub(1, std::memory_order_relaxed);
+                    stats->total_memory_bytes.fetch_sub(Statistics::ESTIMATED_COROUTINE_FRAME_SIZE,
+                                                        std::memory_order_relaxed);
+                }
+
                 handle.destroy();
             }
             handle = other.handle;
@@ -132,7 +172,18 @@ struct Task {
 
 // Implement TaskPromise::get_return_object after Task is defined
 inline auto TaskPromise::get_return_object() -> Task {
-    return Task{std::coroutine_handle<TaskPromise>::from_promise(*this)};
+    auto handle = std::coroutine_handle<TaskPromise>::from_promise(*this);
+
+    // Track coroutine creation (lock-free)
+    StatisticsInternal* stats = g_statistics.load(std::memory_order_acquire);
+    if (stats != nullptr) {
+        stats->total_coroutines_created.fetch_add(1, std::memory_order_relaxed);
+        stats->active_coroutines.fetch_add(1, std::memory_order_relaxed);
+        stats->total_memory_bytes.fetch_add(Statistics::ESTIMATED_COROUTINE_FRAME_SIZE,
+                                            std::memory_order_relaxed);
+    }
+
+    return Task{handle};
 }
 
 // Task queue using atomic enqueue and mutex-protected dequeue
@@ -244,6 +295,9 @@ class IOContext {
     std::unordered_map<int, PendingIO> pending_io_;
     mutable std::atomic_flag map_lock_ = ATOMIC_FLAG_INIT; // Spinlock for map structure only
 
+    // Statistics tracking (lock-free)
+    StatisticsInternal statistics_;
+
     void worker_thread(std::size_t queue_index);
     void process_io_events(const std::vector<PlatformIO::Event>& events);
     void process_timers();
@@ -333,6 +387,27 @@ class IOContext {
     // Get platform I/O interface
     PlatformIO& platform_io() {
         return *platform_io_;
+    }
+
+    // Get current statistics (lock-free read)
+    [[nodiscard]] auto get_statistics() const -> Statistics {
+        Statistics stats;
+        stats.active_requests = statistics_.active_requests.load(std::memory_order_acquire);
+        stats.total_coroutines_created =
+            statistics_.total_coroutines_created.load(std::memory_order_acquire);
+        stats.active_coroutines = statistics_.active_coroutines.load(std::memory_order_acquire);
+        stats.total_memory_bytes = statistics_.total_memory_bytes.load(std::memory_order_acquire);
+        return stats;
+    }
+
+    // Increment active requests counter (lock-free)
+    void increment_active_requests() {
+        statistics_.active_requests.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Decrement active requests counter (lock-free)
+    void decrement_active_requests() {
+        statistics_.active_requests.fetch_sub(1, std::memory_order_relaxed);
     }
 
     // Awaitable for async operations
