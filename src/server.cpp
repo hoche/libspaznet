@@ -37,6 +37,26 @@ namespace spaznet {
 
 namespace {
 
+// Debug trace logging (lock-free per-thread)
+#include <fstream>
+#include <sstream>
+void trace_log(const std::string& msg) {
+    static thread_local std::ofstream trace_file;
+    static thread_local bool initialized = false;
+    
+    if (!initialized) {
+        std::ostringstream filename;
+        filename << "/tmp/websocket_trace_" << std::this_thread::get_id() << ".log";
+        trace_file.open(filename.str(), std::ios::app);
+        initialized = true;
+    }
+    
+    auto now = std::chrono::steady_clock::now();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+    trace_file << "[" << us << "] " << msg << "\n";
+    trace_file.flush(); // Ensure it's written immediately for debugging
+}
+
 inline uint32_t rotl(uint32_t value, uint32_t bits) {
     return (value << bits) | (value >> (32 - bits));
 }
@@ -249,7 +269,7 @@ Task Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
                 ready = true;
                 return true;
             }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                 ready = false;
                 return false;
             }
@@ -264,14 +284,29 @@ Task Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
 
         ssize_t await_resume() noexcept {
             if (!ready) {
-                // Try reading again
-                result = recv(socket->fd(), buffer->data(), size, 0);
+                // Try reading again after resume - data should be available
+                // A few retries handle spurious wakeups and data arriving in chunks
+                for (int i = 0; i < 3; ++i) {
+                    result = recv(socket->fd(), buffer->data(), size, 0);
+                    trace_log("async_read fd=" + std::to_string(socket->fd()) + 
+                             " attempt=" + std::to_string(i) + 
+                             " result=" + std::to_string(result) + 
+                             " errno=" + std::to_string(errno));
+                    if (result >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                        break;
+                    }
+                    // Brief delay for data to arrive
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                }
             }
             if (result > 0) {
                 buffer->resize(result);
-            } else if (result < 0) {
+            } else {
+                // Treat zero (connection closed) or negative (errors) as no data read.
                 buffer->clear();
             }
+            trace_log("async_read fd=" + std::to_string(socket->fd()) + 
+                     " final_result=" + std::to_string(result));
             return result;
         }
     };
@@ -302,7 +337,7 @@ Task Socket::async_write(const std::vector<uint8_t>& data) {
                     ready = true;
                     return true; // Wrote some data
                 }
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                     ready = false;
                     return false; // Would block, need to suspend
                 }
@@ -318,8 +353,19 @@ Task Socket::async_write(const std::vector<uint8_t>& data) {
 
             ssize_t await_resume() noexcept {
                 if (!ready) {
-                    // Try writing again after resume
-                    result = send(socket->fd(), data_ptr, remaining, MSG_NOSIGNAL);
+                    // Try writing again after resume - socket should be writable
+                    for (int i = 0; i < 3; ++i) {
+                        result = send(socket->fd(), data_ptr, remaining, MSG_NOSIGNAL);
+                        if (result >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                            break;
+                        }
+                        // Brief delay for socket to become writable
+                        std::this_thread::sleep_for(std::chrono::microseconds(500));
+                    }
+                }
+                // On error or connection closed, report zero to break the write loop gracefully.
+                if (result < 0) {
+                    return 0;
                 }
                 return result;
             }
@@ -497,8 +543,8 @@ void Server::accept_connections(int listen_fd) {
 
         if (client_fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // No connection available, sleep briefly and retry
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                // No connection available, back off briefly without adding noticeable latency
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
             break;
@@ -538,6 +584,20 @@ Task Server::handle_connection(Socket socket) {
         std::string request_str(buffer.begin(), buffer.end());
         auto ws_request = websocket_handler_ ? parse_websocket_request(request_str)
                                              : std::optional<WebSocketHandshakeRequest>{};
+        // If the WebSocket request is incomplete, read more until headers finish or limit hit.
+        if (websocket_handler_ && !ws_request) {
+            const std::size_t kMaxHandshakeBytes = 8192;
+            while (!ws_request && buffer.size() < kMaxHandshakeBytes) {
+                std::vector<uint8_t> more_data;
+                co_await socket.async_read(more_data, 2048);
+                if (more_data.empty()) {
+                    break;
+                }
+                buffer.insert(buffer.end(), more_data.begin(), more_data.end());
+                request_str.assign(buffer.begin(), buffer.end());
+                ws_request = parse_websocket_request(request_str);
+            }
+        }
         bool websocket_upgrade = false;
 
         if (ws_request) {
@@ -638,23 +698,43 @@ Task Server::handle_connection(Socket socket) {
             resp << "Sec-WebSocket-Accept: " << accept_key << "\r\n\r\n";
             std::string resp_str = resp.str();
             std::vector<uint8_t> resp_bytes(resp_str.begin(), resp_str.end());
+            trace_log("WS: Sending handshake response, fd=" + std::to_string(socket.fd()));
             co_await socket.async_write(resp_bytes);
+            trace_log("WS: Handshake sent, calling on_open, fd=" + std::to_string(socket.fd()));
 
             co_await websocket_handler_->on_open(socket);
+            trace_log("WS: on_open complete, starting frame loop, fd=" + std::to_string(socket.fd()));
 
             auto read_exact = [&](std::size_t n, std::vector<uint8_t>& out) -> Task {
                 out.clear();
                 std::size_t remaining = n;
+                int empty_attempts = 0;
+                const int max_empty = 20; // Allow retries for small frames arriving slowly
+                trace_log("read_exact: want=" + std::to_string(n) + " bytes, fd=" + std::to_string(socket.fd()));
                 while (remaining > 0) {
                     std::vector<uint8_t> tmp;
                     co_await socket.async_read(tmp, remaining);
+                    trace_log("read_exact: got " + std::to_string(tmp.size()) + " bytes, " +
+                             "remaining=" + std::to_string(remaining) + ", fd=" + std::to_string(socket.fd()));
                     if (tmp.empty()) {
-                        out.clear();
-                        co_return;
+                        // Empty read might be transient - retry with backoff
+                        if (++empty_attempts > max_empty) {
+                            trace_log("read_exact: too many empty reads, giving up, fd=" + std::to_string(socket.fd()));
+                            out.clear();
+                            co_return;
+                        }
+                        // Exponential backoff: 100μs, 200μs, 400μs, 800μs, then 1ms
+                        auto delay_us = std::min(100 << std::min(empty_attempts - 1, 3), 1000);
+                        trace_log("read_exact: empty read #" + std::to_string(empty_attempts) + 
+                                 ", delaying " + std::to_string(delay_us) + "μs, fd=" + std::to_string(socket.fd()));
+                        std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+                        continue;
                     }
+                    empty_attempts = 0;
                     out.insert(out.end(), tmp.begin(), tmp.end());
                     remaining -= tmp.size();
                 }
+                trace_log("read_exact: complete, got " + std::to_string(out.size()) + " bytes, fd=" + std::to_string(socket.fd()));
             };
 
             auto send_frame = [&](WebSocketOpcode opcode, const std::vector<uint8_t>& payload,
@@ -690,9 +770,13 @@ Task Server::handle_connection(Socket socket) {
             bool fragmented = false;
 
             while (true) {
+                trace_log("WS: Reading frame header, fd=" + std::to_string(socket.fd()));
                 std::vector<uint8_t> header;
                 co_await read_exact(2, header);
+                trace_log("WS: Got header bytes=" + std::to_string(header.size()) + 
+                         ", fd=" + std::to_string(socket.fd()));
                 if (header.size() < 2) {
+                    trace_log("WS: Header too short, closing, fd=" + std::to_string(socket.fd()));
                     break;
                 }
 

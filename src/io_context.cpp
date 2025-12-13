@@ -170,7 +170,11 @@ void IOContext::register_io(int fd, uint32_t events, std::coroutine_handle<> han
         // Spin - this is brief, just map access
     }
 
-    auto& pending = pending_io_[fd];
+    // Determine whether this fd was already registered before storing new handles.
+    auto it = pending_io_.find(fd);
+    bool already_registered = it != pending_io_.end();
+    PendingIO& pending = already_registered ? it->second : pending_io_[fd];
+
     uint32_t new_events = events;
 
     // Store handles atomically
@@ -182,23 +186,24 @@ void IOContext::register_io(int fd, uint32_t events, std::coroutine_handle<> han
         pending.write_handle.store(handle_addr, std::memory_order_release);
     }
 
-    // Check if we need to add or modify
+    // After storing, ensure we enable both read/write bits that currently have waiters.
     bool has_read = pending.read_handle.load(std::memory_order_acquire) != nullptr;
     bool has_write = pending.write_handle.load(std::memory_order_acquire) != nullptr;
-    bool exists = has_read || has_write;
+    if (has_read) {
+        new_events |= PlatformIO::EVENT_READ;
+    }
+    if (has_write) {
+        new_events |= PlatformIO::EVENT_WRITE;
+    }
 
-    map_lock_.clear(std::memory_order_release);
-
-    if (exists) {
-        // Combine events
-        if (has_read)
-            new_events |= PlatformIO::EVENT_READ;
-        if (has_write)
-            new_events |= PlatformIO::EVENT_WRITE;
+    // Keep the map lock until after add/modify to avoid rehash invalidating &pending.
+    if (already_registered) {
         platform_io_->modify_fd(fd, new_events, &pending);
     } else {
         platform_io_->add_fd(fd, new_events, &pending);
     }
+
+    map_lock_.clear(std::memory_order_release);
 }
 
 void IOContext::remove_io(int fd) {

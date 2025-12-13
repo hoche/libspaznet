@@ -33,7 +33,7 @@ class PlatformIOPoll : public PlatformIO {
         return true;
     }
 
-    auto add_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
+    auto add_fd(int file_descriptor, uint32_t events, void* /*user_data*/) -> bool override {
         if (fd_info_.find(file_descriptor) != fd_info_.end()) {
             return false; // Already exists
         }
@@ -50,18 +50,18 @@ class PlatformIOPoll : public PlatformIO {
         pfd.revents = 0;
 
         pollfds_.push_back(pfd);
-        fd_info_[file_descriptor] = {user_data, events};
+        fd_info_[file_descriptor] = {nullptr, events}; // user_data unused
 
         return true;
     }
 
-    auto modify_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
+    auto modify_fd(int file_descriptor, uint32_t events, void* /*user_data*/) -> bool override {
         auto it = fd_info_.find(file_descriptor);
         if (it == fd_info_.end()) {
-            return add_fd(file_descriptor, events, user_data);
+            return add_fd(file_descriptor, events, nullptr);
         }
 
-        it->second = {user_data, events};
+        it->second = {nullptr, events}; // user_data unused
 
         for (auto& pfd : pollfds_) {
             if (pfd.fd == file_descriptor) {
@@ -130,12 +130,7 @@ class PlatformIOPoll : public PlatformIO {
                 event.events |= EVENT_ERROR;
             }
 
-            auto it = fd_info_.find(pfd.fd);
-            if (it != fd_info_.end()) {
-                event.user_data = it->second.first;
-            } else {
-                event.user_data = nullptr;
-            }
+            event.user_data = nullptr; // we only rely on fd lookup in IOContext
 
             events.push_back(event);
         }
