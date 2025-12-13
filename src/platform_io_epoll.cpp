@@ -33,6 +33,7 @@ class PlatformIOEpoll : public PlatformIO {
     }
 
     auto add_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
+        (void)user_data; // unused for epoll implementation
         epoll_event event{};
         event.events = 0;
         if ((events & EVENT_READ) != 0U) {
@@ -47,12 +48,14 @@ class PlatformIOEpoll : public PlatformIO {
         if ((events & EVENT_EDGE_TRIGGER) != 0U) {
             event.events |= EPOLLET;
         }
-        event.data.ptr = user_data;
+        // Store the file descriptor so IOContext can map the event back to PendingIO.
+        event.data.fd = file_descriptor;
 
         return epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, file_descriptor, &event) == 0;
     }
 
     auto modify_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
+        (void)user_data; // unused for epoll implementation
         epoll_event event{};
         event.events = 0;
         if ((events & EVENT_READ) != 0U) {
@@ -67,7 +70,8 @@ class PlatformIOEpoll : public PlatformIO {
         if ((events & EVENT_EDGE_TRIGGER) != 0U) {
             event.events |= EPOLLET;
         }
-        event.data.ptr = user_data;
+        // Keep fd in the event payload (IOContext does fd-based lookup).
+        event.data.fd = file_descriptor;
 
         return epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, file_descriptor, &event) == 0;
     }
@@ -91,8 +95,8 @@ class PlatformIOEpoll : public PlatformIO {
         // NOLINTBEGIN(cppcoreguidelines-pro-bounds-constant-array-index)
         for (int i = 0; i < nfds; ++i) {
             Event event{};
-            event.fd = -1; // We use user_data to identify the socket
-            event.user_data = epoll_events[i].data.ptr;
+            event.fd = epoll_events[i].data.fd;
+            event.user_data = nullptr;
             event.events = 0;
 
             if ((epoll_events[i].events & EPOLLIN) != 0U) {
