@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstring>
 #include <format>
+#include <fstream>
 #include <iostream>
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/server.hpp>
@@ -38,19 +39,17 @@ namespace spaznet {
 namespace {
 
 // Debug trace logging (lock-free per-thread)
-#include <fstream>
-#include <sstream>
 void trace_log(const std::string& msg) {
     static thread_local std::ofstream trace_file;
     static thread_local bool initialized = false;
-    
+
     if (!initialized) {
         std::ostringstream filename;
         filename << "/tmp/websocket_trace_" << std::this_thread::get_id() << ".log";
         trace_file.open(filename.str(), std::ios::app);
         initialized = true;
     }
-    
+
     auto now = std::chrono::steady_clock::now();
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
     trace_file << "[" << us << "] " << msg << "\n";
@@ -288,11 +287,11 @@ Task Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
                 // A few retries handle spurious wakeups and data arriving in chunks
                 for (int i = 0; i < 3; ++i) {
                     result = recv(socket->fd(), buffer->data(), size, 0);
-                    trace_log("async_read fd=" + std::to_string(socket->fd()) + 
-                             " attempt=" + std::to_string(i) + 
-                             " result=" + std::to_string(result) + 
-                             " errno=" + std::to_string(errno));
-                    if (result >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                    trace_log("async_read fd=" + std::to_string(socket->fd()) + " attempt=" +
+                              std::to_string(i) + " result=" + std::to_string(result) +
+                              " errno=" + std::to_string(errno));
+                    if (result >= 0 ||
+                        (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
                         break;
                     }
                     // Brief delay for data to arrive
@@ -305,8 +304,8 @@ Task Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
                 // Treat zero (connection closed) or negative (errors) as no data read.
                 buffer->clear();
             }
-            trace_log("async_read fd=" + std::to_string(socket->fd()) + 
-                     " final_result=" + std::to_string(result));
+            trace_log("async_read fd=" + std::to_string(socket->fd()) +
+                      " final_result=" + std::to_string(result));
             return result;
         }
     };
@@ -356,7 +355,8 @@ Task Socket::async_write(const std::vector<uint8_t>& data) {
                     // Try writing again after resume - socket should be writable
                     for (int i = 0; i < 3; ++i) {
                         result = send(socket->fd(), data_ptr, remaining, MSG_NOSIGNAL);
-                        if (result >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                        if (result >= 0 ||
+                            (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
                             break;
                         }
                         // Brief delay for socket to become writable
@@ -703,30 +703,35 @@ Task Server::handle_connection(Socket socket) {
             trace_log("WS: Handshake sent, calling on_open, fd=" + std::to_string(socket.fd()));
 
             co_await websocket_handler_->on_open(socket);
-            trace_log("WS: on_open complete, starting frame loop, fd=" + std::to_string(socket.fd()));
+            trace_log("WS: on_open complete, starting frame loop, fd=" +
+                      std::to_string(socket.fd()));
 
             auto read_exact = [&](std::size_t n, std::vector<uint8_t>& out) -> Task {
                 out.clear();
                 std::size_t remaining = n;
                 int empty_attempts = 0;
                 const int max_empty = 20; // Allow retries for small frames arriving slowly
-                trace_log("read_exact: want=" + std::to_string(n) + " bytes, fd=" + std::to_string(socket.fd()));
+                trace_log("read_exact: want=" + std::to_string(n) +
+                          " bytes, fd=" + std::to_string(socket.fd()));
                 while (remaining > 0) {
                     std::vector<uint8_t> tmp;
                     co_await socket.async_read(tmp, remaining);
                     trace_log("read_exact: got " + std::to_string(tmp.size()) + " bytes, " +
-                             "remaining=" + std::to_string(remaining) + ", fd=" + std::to_string(socket.fd()));
+                              "remaining=" + std::to_string(remaining) +
+                              ", fd=" + std::to_string(socket.fd()));
                     if (tmp.empty()) {
                         // Empty read might be transient - retry with backoff
                         if (++empty_attempts > max_empty) {
-                            trace_log("read_exact: too many empty reads, giving up, fd=" + std::to_string(socket.fd()));
+                            trace_log("read_exact: too many empty reads, giving up, fd=" +
+                                      std::to_string(socket.fd()));
                             out.clear();
                             co_return;
                         }
                         // Exponential backoff: 100μs, 200μs, 400μs, 800μs, then 1ms
                         auto delay_us = std::min(100 << std::min(empty_attempts - 1, 3), 1000);
-                        trace_log("read_exact: empty read #" + std::to_string(empty_attempts) + 
-                                 ", delaying " + std::to_string(delay_us) + "μs, fd=" + std::to_string(socket.fd()));
+                        trace_log("read_exact: empty read #" + std::to_string(empty_attempts) +
+                                  ", delaying " + std::to_string(delay_us) +
+                                  "μs, fd=" + std::to_string(socket.fd()));
                         std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
                         continue;
                     }
@@ -734,7 +739,8 @@ Task Server::handle_connection(Socket socket) {
                     out.insert(out.end(), tmp.begin(), tmp.end());
                     remaining -= tmp.size();
                 }
-                trace_log("read_exact: complete, got " + std::to_string(out.size()) + " bytes, fd=" + std::to_string(socket.fd()));
+                trace_log("read_exact: complete, got " + std::to_string(out.size()) +
+                          " bytes, fd=" + std::to_string(socket.fd()));
             };
 
             auto send_frame = [&](WebSocketOpcode opcode, const std::vector<uint8_t>& payload,
@@ -773,8 +779,8 @@ Task Server::handle_connection(Socket socket) {
                 trace_log("WS: Reading frame header, fd=" + std::to_string(socket.fd()));
                 std::vector<uint8_t> header;
                 co_await read_exact(2, header);
-                trace_log("WS: Got header bytes=" + std::to_string(header.size()) + 
-                         ", fd=" + std::to_string(socket.fd()));
+                trace_log("WS: Got header bytes=" + std::to_string(header.size()) +
+                          ", fd=" + std::to_string(socket.fd()));
                 if (header.size() < 2) {
                     trace_log("WS: Header too short, closing, fd=" + std::to_string(socket.fd()));
                     break;
