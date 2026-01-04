@@ -56,7 +56,7 @@ class IperfIntegrationTest : public ::testing::Test {
         stop_iperf_server();
     }
 
-    bool start_iperf_server(int port, int duration_seconds = 300) {
+    bool start_iperf_server(int port, int duration_seconds = 300, bool udp = false) {
         if (iperf_executable_.empty()) {
             return false;
         }
@@ -70,6 +70,10 @@ class IperfIntegrationTest : public ::testing::Test {
         } else {
             // iperf2 syntax (uses -t for time, but server doesn't need it)
             cmd << iperf_executable_ << " -s -p " << port;
+            // For iperf2, UDP requires the server to be started with `-u`.
+            if (udp) {
+                cmd << " -u";
+            }
         }
 
         std::cout << "\n[IPERF] Starting server: " << cmd.str() << std::endl;
@@ -227,7 +231,8 @@ TEST_F(IperfIntegrationTest, TCPBandwidthTest) {
     const int duration = 3;
 
     // Automatically start iperf server
-    ASSERT_TRUE(start_iperf_server(server_port_)) << "Failed to start iperf server";
+    ASSERT_TRUE(start_iperf_server(server_port_, /*duration_seconds=*/300, /*udp=*/false))
+        << "Failed to start iperf server";
 
     std::cout << "\n[IPERF] TCP Bandwidth Test:" << std::endl;
     std::cout << "  Server: " << iperf_executable_ << " on port " << server_port_ << std::endl;
@@ -246,7 +251,8 @@ TEST_F(IperfIntegrationTest, UDPBandwidthTest) {
     const int duration = 3;
 
     // Automatically start iperf server
-    ASSERT_TRUE(start_iperf_server(server_port_)) << "Failed to start iperf server";
+    ASSERT_TRUE(start_iperf_server(server_port_, /*duration_seconds=*/300, /*udp=*/true))
+        << "Failed to start iperf server";
 
     std::cout << "\n[IPERF] UDP Bandwidth Test:" << std::endl;
     std::cout << "  Server: " << iperf_executable_ << " on port " << server_port_ << std::endl;
