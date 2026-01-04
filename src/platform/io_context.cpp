@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
-#include <libspaznet/io_context.hpp>
-#include <libspaznet/platform_io.hpp>
+#include <libspaznet/platform/io_context.hpp>
+#include <libspaznet/platform/platform_io.hpp>
 #include <limits>
 
 namespace spaznet {
