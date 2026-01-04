@@ -32,6 +32,23 @@ cd build
 ./test_performance
 ```
 
+### Thread-mode benchmark report (single-threaded default vs multi-threaded scaling)
+
+This builds a dedicated benchmark runner that prints a **Markdown report** comparing:
+- libspaznet HTTP throughput + latency percentiles vs server thread count
+- raw TCP and UDP throughput via iperf/iperf3 vs parallel stream count (aligned to the same thread counts)
+
+```bash
+cd build
+./bench_thread_modes > thread_mode_report.md
+```
+
+Tuning knobs:
+
+```bash
+./bench_thread_modes --http-seconds 2.0 --iperf-seconds 3 --client-threads 32 > thread_mode_report.md
+```
+
 ### Specific Test
 ```bash
 ./test_performance --gtest_filter=ThroughputTest.SingleConnectionThroughput

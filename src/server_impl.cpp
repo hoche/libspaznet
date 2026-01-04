@@ -654,12 +654,22 @@ Task Server::handle_connection(Socket socket) {
             HTTPParser::ParseResult parse_result =
                 HTTPParser::parse_request(buffer, request, bytes_consumed);
 
+            // Read until we have a full request (headers + body) or hit a safety limit.
+            // This allows benchmarking and real usage with larger request bodies.
             if (parse_result == HTTPParser::ParseResult::Incomplete) {
-                std::vector<uint8_t> more_data;
-                co_await socket.async_read(more_data, 8192);
-                buffer.insert(buffer.end(), more_data.begin(), more_data.end());
+                constexpr std::size_t kReadChunk = 8192;
+                constexpr std::size_t kMaxRequestBytes = 1024 * 1024; // 1 MiB safety cap
 
-                parse_result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+                while (parse_result == HTTPParser::ParseResult::Incomplete &&
+                       buffer.size() < kMaxRequestBytes) {
+                    std::vector<uint8_t> more_data;
+                    co_await socket.async_read(more_data, kReadChunk);
+                    if (more_data.empty()) {
+                        break;
+                    }
+                    buffer.insert(buffer.end(), more_data.begin(), more_data.end());
+                    parse_result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+                }
             }
 
             if (parse_result == HTTPParser::ParseResult::Success) {
