@@ -502,7 +502,11 @@ class IOContext {
     std::vector<std::thread> worker_threads_;
     std::atomic<bool> running_;
     std::atomic<std::size_t> next_queue_;
+    // Number of worker threads to spawn (0 means fully non-threaded: everything runs on run()
+    // thread).
     std::size_t num_threads_;
+    // Number of task queues. Must be >= 1 so schedule() never divides by zero.
+    std::size_t queue_count_;
 
     // Wakeup pipe: lets worker threads interrupt PlatformIO::wait() when they add an earlier timer.
     int wake_read_fd_{-1};
@@ -556,7 +560,9 @@ class IOContext {
                        std::shared_ptr<Task> task_ptr);
 
   public:
-    explicit IOContext(std::size_t num_threads = std::thread::hardware_concurrency());
+    // `num_threads` is the number of worker threads to spawn (not counting the calling thread
+    // running `run()`). Default is 0, meaning non-threaded mode.
+    explicit IOContext(std::size_t num_threads = 0);
     ~IOContext();
 
     // Delete copy and move operations

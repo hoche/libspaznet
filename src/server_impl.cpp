@@ -399,11 +399,6 @@ Server::Server(std::size_t num_threads)
 
 Server::~Server() {
     stop();
-    for (auto& t : accept_threads_) {
-        if (t.joinable()) {
-            t.join();
-        }
-    }
 }
 
 void Server::set_udp_handler(std::unique_ptr<UDPHandler> handler) {
@@ -480,9 +475,13 @@ void Server::listen_tcp(uint16_t port) {
         throw std::runtime_error("Failed to listen on socket");
     }
 
-    // Start accept thread
     running_.store(true);
-    accept_threads_.emplace_back(&Server::accept_connections, this, listen_fd);
+    {
+        std::lock_guard<std::mutex> lock(listen_fds_mutex_);
+        listen_fds_.push_back(listen_fd);
+    }
+    // Schedule accept loop on the IOContext (works in both threaded and non-threaded modes).
+    io_context_->schedule(accept_connections(listen_fd));
 }
 
 void Server::listen_udp(uint16_t port) {
@@ -533,8 +532,20 @@ void Server::listen_udp(uint16_t port) {
     // This is a simplified implementation
 }
 
-void Server::accept_connections(int listen_fd) {
-    while (running_.load()) {
+Task Server::accept_connections(int listen_fd) {
+    struct ReadableAwaiter {
+        IOContext* ctx;
+        int fd;
+        [[nodiscard]] bool await_ready() const noexcept {
+            return false;
+        }
+        void await_suspend(std::coroutine_handle<> h) const {
+            ctx->register_io(fd, PlatformIO::EVENT_READ, h);
+        }
+        void await_resume() const noexcept {}
+    };
+
+    while (running_.load(std::memory_order_acquire)) {
         struct sockaddr_storage client_addr {}; // Can hold IPv4 or IPv6
         socklen_t client_len = sizeof(client_addr);
 
@@ -542,9 +553,12 @@ void Server::accept_connections(int listen_fd) {
             accept(listen_fd, reinterpret_cast<struct sockaddr*>(&client_addr), &client_len);
 
         if (client_fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // No connection available, back off briefly without adding noticeable latency
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                // Wait until the listening socket becomes readable (new connection ready).
+                co_await ReadableAwaiter{io_context_.get(), listen_fd};
                 continue;
             }
             break;
@@ -563,7 +577,25 @@ void Server::accept_connections(int listen_fd) {
         Socket socket(client_fd, io_context_.get());
         io_context_->schedule(handle_connection(std::move(socket)));
     }
-    close_socket(listen_fd);
+
+    // If we exit the accept loop due to error while still running, close the listening fd here.
+    // During normal shutdown, stop() closes all listening fds and may destroy this coroutine while
+    // suspended.
+    bool should_close = false;
+    {
+        std::lock_guard<std::mutex> lock(listen_fds_mutex_);
+        auto it = std::find(listen_fds_.begin(), listen_fds_.end(), listen_fd);
+        if (it != listen_fds_.end()) {
+            listen_fds_.erase(it);
+            should_close = true;
+        }
+    }
+    if (should_close) {
+        io_context_->remove_io(listen_fd);
+        io_context_->platform_io().remove_fd(listen_fd);
+        close_socket(listen_fd);
+    }
+    co_return;
 }
 
 Task Server::handle_connection(Socket socket) {
@@ -919,6 +951,21 @@ void Server::run() {
 void Server::stop() {
     running_.store(false);
     io_context_->stop();
+
+    // Close all listening sockets. This also releases any accept coroutines suspended on them.
+    std::vector<int> fds;
+    {
+        std::lock_guard<std::mutex> lock(listen_fds_mutex_);
+        fds.swap(listen_fds_);
+    }
+    for (int fd : fds) {
+        if (fd < 0) {
+            continue;
+        }
+        io_context_->remove_io(fd);
+        io_context_->platform_io().remove_fd(fd);
+        close_socket(fd);
+    }
 }
 
 } // namespace spaznet
