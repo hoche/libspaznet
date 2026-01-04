@@ -130,6 +130,7 @@ add_executable(test_integration
     tests/test_main.cpp
     tests/integration/test_tcp_server.cpp
     tests/integration/test_http_server.cpp
+    tests/integration/test_thread_modes.cpp
     tests/integration/test_websocket_server.cpp
     tests/integration/test_udp_server.cpp
     tests/integration/test_concurrent_connections.cpp

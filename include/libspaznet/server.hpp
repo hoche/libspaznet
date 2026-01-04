@@ -7,6 +7,7 @@
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/platform_io.hpp>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -103,15 +104,18 @@ class Server {
     std::unique_ptr<HTTP3Handler> http3_handler_;
 
     std::unordered_map<int, std::coroutine_handle<>> socket_handles_;
-    std::vector<std::thread> accept_threads_;
+    // Track active listening sockets so stop()/destructor can close them even if coroutines are
+    // currently suspended on accept.
+    std::mutex listen_fds_mutex_;
+    std::vector<int> listen_fds_;
     std::atomic<bool> running_;
 
     Task handle_connection(Socket socket);
-    void accept_connections(int listen_fd); // Changed from Task to void
+    Task accept_connections(int listen_fd);
 
   public:
-  public:
-    Server(std::size_t num_threads = std::thread::hardware_concurrency());
+    // `num_threads` is the number of IO worker threads to spawn (0 = non-threaded default).
+    Server(std::size_t num_threads = 0);
     ~Server();
 
     // Start listening on a port (schedules the listen task)

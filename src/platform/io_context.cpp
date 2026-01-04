@@ -10,8 +10,10 @@
 namespace spaznet {
 
 IOContext::IOContext(std::size_t num_threads)
-    : platform_io_(create_platform_io()), thread_queues_(num_threads), running_(false),
-      next_queue_(0), num_threads_(num_threads) {
+    : platform_io_(create_platform_io()),
+      thread_queues_(std::max<std::size_t>(1, num_threads == 0 ? 1 : num_threads)), running_(false),
+      next_queue_(0), num_threads_(num_threads),
+      queue_count_(std::max<std::size_t>(1, num_threads == 0 ? 1 : num_threads)) {
     if (!platform_io_->init()) {
         throw std::runtime_error("Failed to initialize platform I/O");
     }
@@ -141,14 +143,18 @@ void IOContext::run() {
 
 void IOContext::stop() {
     running_.store(false, std::memory_order_release);
+    // Ensure any blocking wait() returns promptly.
+    wakeup_event_loop();
 }
 
 void IOContext::schedule(Task task) {
     // With reference counting, we can safely enqueue the task
     // The handle won't be destroyed while any Task references it
     // Round-robin scheduling
-    std::size_t index = next_queue_.fetch_add(1, std::memory_order_acq_rel) % num_threads_;
+    std::size_t index = next_queue_.fetch_add(1, std::memory_order_acq_rel) % queue_count_;
     thread_queues_[index].enqueue(std::move(task));
+    // If another thread is blocked in wait(), wake it so scheduled work runs promptly.
+    wakeup_event_loop();
 }
 
 void IOContext::worker_thread(std::size_t queue_index) {
