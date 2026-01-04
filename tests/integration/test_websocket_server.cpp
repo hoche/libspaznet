@@ -196,7 +196,7 @@ class EchoWebSocketHandler : public WebSocketHandler {
         frame.payload = message.data;
         frame.payload_length = frame.payload.size();
         auto bytes = frame.serialize();
-        co_await socket.async_write(bytes);
+        co_await socket.async_write(std::move(bytes));
     }
     Task on_close(Socket& socket) override {
         close_count.fetch_add(1);

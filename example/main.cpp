@@ -67,7 +67,7 @@ class ExampleWebSocketHandler : public spaznet::WebSocketHandler {
             frame.payload_length = frame.payload.size();
 
             auto frame_data = frame.serialize();
-            co_await socket.async_write(frame_data);
+            co_await socket.async_write(std::move(frame_data));
         }
         co_return;
     }

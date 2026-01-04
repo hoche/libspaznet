@@ -59,3 +59,7 @@ Attach symbols with `\ingroup core` (etc.) in their comments.
 
 Doxygen preserves fenced code blocks; GitHub-compatible Mermaid diagrams in `docs/*.md` (e.g., `concurrency-and-coroutines.md`) render on GitHub and remain readable in generated HTML as code blocks. Keep them fenced with ```mermaid for consistency.
 
+
+
+
+

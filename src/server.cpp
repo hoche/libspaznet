@@ -318,7 +318,7 @@ Task Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
     }
 }
 
-Task Socket::async_write(const std::vector<uint8_t>& data) {
+Task Socket::async_write(std::vector<uint8_t> data) {
     std::size_t total_sent = 0;
 
     while (total_sent < data.size()) {
@@ -661,7 +661,7 @@ Task Server::handle_connection(Socket socket) {
                         response_data = response.serialize();
                     }
 
-                    co_await socket.async_write(response_data);
+                    co_await socket.async_write(std::move(response_data));
 
                     if (!request.should_keep_alive()) {
                         socket.close();
@@ -683,7 +683,7 @@ Task Server::handle_connection(Socket socket) {
                 error_response.set_header("Content-Length", "0");
 
                 auto error_data = error_response.serialize();
-                co_await socket.async_write(error_data);
+                co_await socket.async_write(std::move(error_data));
                 socket.close();
             }
         } else if (websocket_upgrade && websocket_handler_) {
@@ -699,7 +699,7 @@ Task Server::handle_connection(Socket socket) {
             std::string resp_str = resp.str();
             std::vector<uint8_t> resp_bytes(resp_str.begin(), resp_str.end());
             trace_log("WS: Sending handshake response, fd=" + std::to_string(socket.fd()));
-            co_await socket.async_write(resp_bytes);
+            co_await socket.async_write(std::move(resp_bytes));
             trace_log("WS: Handshake sent, calling on_open, fd=" + std::to_string(socket.fd()));
 
             co_await websocket_handler_->on_open(socket);
@@ -760,7 +760,7 @@ Task Server::handle_connection(Socket socket) {
                 }
                 frame.payload_length = frame.payload.size();
                 auto data = frame.serialize();
-                co_await socket.async_write(data);
+                co_await socket.async_write(std::move(data));
             };
 
             bool sent_close = false;
@@ -865,7 +865,7 @@ Task Server::handle_connection(Socket socket) {
                             close_frame.payload = payload;
                             close_frame.payload_length = close_frame.payload.size();
                             auto data = close_frame.serialize();
-                            co_await socket.async_write(data);
+                            co_await socket.async_write(std::move(data));
                         }
                         break;
                     } else if (opcode == WebSocketOpcode::Ping) {
