@@ -107,6 +107,7 @@ FetchContent_MakeAvailable(googletest)
 
 # Unit tests
 add_executable(test_unit
+    tests/test_main.cpp
     tests/unit/test_task_queue.cpp
     tests/unit/test_platform_io.cpp
     tests/unit/test_io_context.cpp
@@ -123,12 +124,12 @@ add_executable(test_unit
 target_link_libraries(test_unit
     spaznet
     GTest::gtest
-    GTest::gtest_main
     GTest::gmock
 )
 
 # Integration tests
 add_executable(test_integration
+    tests/test_main.cpp
     tests/integration/test_tcp_server.cpp
     tests/integration/test_http_server.cpp
     tests/integration/test_websocket_server.cpp
@@ -143,12 +144,12 @@ add_executable(test_integration
 target_link_libraries(test_integration
     spaznet
     GTest::gtest
-    GTest::gtest_main
     GTest::gmock
 )
 
 # Performance tests
 add_executable(test_performance
+    tests/test_main.cpp
     tests/performance/test_throughput.cpp
     tests/performance/test_latency.cpp
     tests/performance/test_concurrent_performance.cpp
@@ -162,7 +163,6 @@ add_executable(test_performance
 target_link_libraries(test_performance
     spaznet
     GTest::gtest
-    GTest::gtest_main
     GTest::gmock
 )
 
