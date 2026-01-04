@@ -504,6 +504,10 @@ class IOContext {
     std::atomic<std::size_t> next_queue_;
     std::size_t num_threads_;
 
+    // Wakeup pipe: lets worker threads interrupt PlatformIO::wait() when they add an earlier timer.
+    int wake_read_fd_{-1};
+    int wake_write_fd_{-1};
+
     // Timer management
     struct TimerEntry {
         uint64_t id;
@@ -539,6 +543,9 @@ class IOContext {
 
     // Statistics tracking (lock-free)
     StatisticsInternal statistics_;
+
+    void wakeup_event_loop();
+    void drain_wakeup_pipe();
 
     void worker_thread(std::size_t queue_index);
     void process_io_events(const std::vector<PlatformIO::Event>& events);
@@ -623,7 +630,12 @@ class IOContext {
     TimerAwaiter interval(std::chrono::steady_clock::duration period) {
         auto now = std::chrono::steady_clock::now();
         auto period_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(period);
-        return TimerAwaiter{this, now + period, period_ns, true};
+        // IMPORTANT: `interval()` is typically used as `co_await ctx.interval(period)` inside a
+        // loop. In that pattern, each await creates a fresh TimerAwaiter; making it repeating would
+        // leak repeating timers and can resume the coroutine multiple times back-to-back.
+        //
+        // So we schedule a one-shot timer for now+period here.
+        return TimerAwaiter{this, now + period, period_ns, false};
     }
 
     // Get platform I/O interface

@@ -61,10 +61,19 @@ TEST(IOContextTimerTest, IntervalStaysPeriodic) {
         }
     };
 
+    std::thread runner([&ctx]() { ctx.run(); });
+    // Give the event loop time to start.
+    std::this_thread::sleep_for(50ms);
+
     ctx.schedule(task());
 
-    std::thread runner([&ctx]() { ctx.run(); });
-    std::this_thread::sleep_for(250ms);
+    // Wait up to a reasonable deadline for 3 ticks (avoid flaky fixed sleeps).
+    int attempts = 0;
+    while (ticks.size() < 3 && attempts < 200) { // 200 * 5ms = 1s
+        std::this_thread::sleep_for(5ms);
+        ++attempts;
+    }
+
     ctx.stop();
     runner.join();
 
