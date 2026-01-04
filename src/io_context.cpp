@@ -1,3 +1,5 @@
+#include <fcntl.h>
+#include <unistd.h>
 #include <algorithm>
 #include <chrono>
 #include <iostream>
@@ -14,6 +16,24 @@ IOContext::IOContext(std::size_t num_threads)
         throw std::runtime_error("Failed to initialize platform I/O");
     }
 
+    // Create wakeup pipe (non-blocking) so timer additions can interrupt wait().
+    int fds[2]{-1, -1};
+    if (pipe(fds) == 0) {
+        wake_read_fd_ = fds[0];
+        wake_write_fd_ = fds[1];
+        // Set non-blocking
+        int flags = fcntl(wake_read_fd_, F_GETFL, 0);
+        if (flags != -1) {
+            fcntl(wake_read_fd_, F_SETFL, flags | O_NONBLOCK);
+        }
+        flags = fcntl(wake_write_fd_, F_GETFL, 0);
+        if (flags != -1) {
+            fcntl(wake_write_fd_, F_SETFL, flags | O_NONBLOCK);
+        }
+        // Register wake_read_fd_ for read events
+        platform_io_->add_fd(wake_read_fd_, PlatformIO::EVENT_READ, nullptr);
+    }
+
     // Set global statistics pointer for lock-free tracking
     g_statistics.store(&statistics_, std::memory_order_release);
 }
@@ -26,6 +46,39 @@ IOContext::~IOContext() {
     g_statistics.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
 
     platform_io_->cleanup();
+
+    if (wake_read_fd_ >= 0) {
+        // Best-effort remove; ignore failures during shutdown.
+        platform_io_->remove_fd(wake_read_fd_);
+        close(wake_read_fd_);
+        wake_read_fd_ = -1;
+    }
+    if (wake_write_fd_ >= 0) {
+        close(wake_write_fd_);
+        wake_write_fd_ = -1;
+    }
+}
+
+void IOContext::wakeup_event_loop() {
+    if (wake_write_fd_ < 0) {
+        return;
+    }
+    // Write a single byte; ignore EAGAIN if pipe is full.
+    uint8_t b = 1;
+    (void)write(wake_write_fd_, &b, 1);
+}
+
+void IOContext::drain_wakeup_pipe() {
+    if (wake_read_fd_ < 0) {
+        return;
+    }
+    uint8_t buf[64];
+    for (;;) {
+        ssize_t n = read(wake_read_fd_, buf, sizeof(buf));
+        if (n <= 0) {
+            break;
+        }
+    }
 }
 
 void IOContext::run() {
@@ -65,15 +118,6 @@ void IOContext::run() {
                 // Check if task handle is valid before accessing it
                 if (!task.handle) {
                     continue;
-                }
-
-                // If suspended on timer, don't resume here (timer will schedule it)
-                void* handle_addr = task.handle.address();
-                {
-                    std::lock_guard<std::mutex> timer_lock(timer_mutex_);
-                    if (suspended_tasks_.find(handle_addr) != suspended_tasks_.end()) {
-                        continue;
-                    }
                 }
 
                 // Resume at most once. Do NOT auto-reschedule here:
@@ -116,15 +160,6 @@ void IOContext::worker_thread(std::size_t queue_index) {
             // Check if task handle is valid before accessing it
             if (!task.handle) {
                 continue;
-            }
-
-            // If suspended on timer, don't resume here (timer will schedule it)
-            void* handle_addr = task.handle.address();
-            {
-                std::lock_guard<std::mutex> timer_lock(timer_mutex_);
-                if (suspended_tasks_.find(handle_addr) != suspended_tasks_.end()) {
-                    continue;
-                }
             }
 
             // Resume at most once. Do NOT auto-reschedule:
@@ -203,6 +238,11 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
         }
 
         for (const auto& ev : events) {
+            // Wakeup pipe event: drain and continue.
+            if (ev.fd == wake_read_fd_) {
+                drain_wakeup_pipe();
+                continue;
+            }
             // Look up by fd (safe), not by pointer (can be invalidated)
             auto it = pending_io_.find(ev.fd);
             if (it == pending_io_.end()) {
@@ -263,12 +303,23 @@ uint64_t IOContext::add_timer(std::chrono::steady_clock::time_point first_fire,
     if (first_fire <= now) {
         first_fire = now + std::chrono::milliseconds(1);
     }
-    std::lock_guard<std::mutex> lock(timer_mutex_);
-    // Track this task as suspended on a timer
-    if (task_ptr && task_ptr->handle) {
-        suspended_tasks_[task_ptr->handle.address()] = task_ptr;
+    bool should_wake = false;
+    {
+        std::lock_guard<std::mutex> lock(timer_mutex_);
+        // Wake the event loop if this timer is the new earliest timer.
+        if (timers_.empty() || first_fire < timers_.top().next_fire) {
+            should_wake = true;
+        }
+
+        // Track this task as suspended on a timer
+        if (task_ptr && task_ptr->handle) {
+            suspended_tasks_[task_ptr->handle.address()] = task_ptr;
+        }
+        timers_.push(TimerEntry{id, first_fire, interval, repeat, task_ptr});
     }
-    timers_.push(TimerEntry{id, first_fire, interval, repeat, task_ptr});
+    if (should_wake) {
+        wakeup_event_loop();
+    }
     return id;
 }
 
