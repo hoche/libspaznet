@@ -16,8 +16,12 @@
 namespace spaznet {
 
 // Forward declarations
+struct TaskPromise;
 struct Task;
 class IOContext;
+struct CoroutineControlBlock;
+void add_ref_coroutine_control_block(CoroutineControlBlock* cb) noexcept;
+void release_coroutine_control_block(CoroutineControlBlock* cb) noexcept;
 
 // Statistics structure for lock-free tracking
 // Internal structure uses atomics, snapshot uses plain values for copying
@@ -42,9 +46,27 @@ struct StatisticsInternal {
 // Global pointer to current IOContext statistics (set by IOContext constructor)
 inline std::atomic<StatisticsInternal*> g_statistics{nullptr};
 
+// Per-coroutine control block (one per coroutine frame).
+// Stored in the coroutine's promise and referenced by CoroutineHandle/Task/IOContext.
+// NOTE: TaskPromise is forward-declared here; std::coroutine_handle<TaskPromise> is OK as a member.
+struct CoroutineControlBlock {
+    std::coroutine_handle<TaskPromise> handle;
+    std::atomic<std::size_t> ref_count{1};
+};
+
 // Coroutine task handle
 struct TaskPromise {
-    std::coroutine_handle<> continuation{std::noop_coroutine()};
+    // Continuation support:
+    // If a coroutine (TaskPromise) awaits another Task, the awaited Task stores a ref-counted
+    // pointer to the awaiter's control block here. That keeps the awaiter coroutine alive even
+    // if the scheduler drops its Task wrapper while it is suspended.
+    CoroutineControlBlock* continuation_cb{nullptr};
+    // Fallback continuation for non-Task awaiters.
+    std::coroutine_handle<> continuation_raw{std::noop_coroutine()};
+
+    // Per-coroutine control block (allocated in get_return_object).
+    // This is the single source of truth for coroutine lifetime management.
+    CoroutineControlBlock* control_block{nullptr};
 
     // Declaration - implementation after Task is defined
     auto get_return_object() -> Task;
@@ -59,7 +81,22 @@ struct TaskPromise {
                 return false;
             }
             void await_suspend(std::coroutine_handle<TaskPromise> handle) noexcept {
-                auto cont = handle.promise().continuation;
+                auto& promise = handle.promise();
+
+                if (promise.continuation_cb != nullptr) {
+                    CoroutineControlBlock* cb = promise.continuation_cb;
+                    promise.continuation_cb = nullptr;
+
+                    auto cont = cb->handle;
+                    if (cont) {
+                        cont.resume();
+                    }
+                    release_coroutine_control_block(cb);
+                    return;
+                }
+
+                auto cont = promise.continuation_raw;
+                promise.continuation_raw = std::noop_coroutine();
                 if (cont) {
                     cont.resume();
                 }
@@ -76,89 +113,251 @@ struct TaskPromise {
     void return_void() {}
 };
 
-struct Task {
-    using promise_type = TaskPromise;
-    std::coroutine_handle<TaskPromise> handle;
-    bool owns_handle{true}; // Track if this Task owns the coroutine (can destroy it)
+// Intrusive reference-counted coroutine handle wrapper.
+// Critical invariant: there is exactly one CoroutineControlBlock per coroutine frame.
+class CoroutineHandle {
+  private:
+    CoroutineControlBlock* cb_{nullptr};
 
-    Task() = default;
-
-    Task(std::coroutine_handle<TaskPromise> handle_param)
-        : handle(handle_param), owns_handle(true) {}
-
-    ~Task() {
-        if (handle && owns_handle) {
-            // Track coroutine destruction (lock-free) before destroying
-            StatisticsInternal* stats = g_statistics.load(std::memory_order_acquire);
-            if (stats != nullptr) {
-                stats->active_coroutines.fetch_sub(1, std::memory_order_relaxed);
-                stats->total_memory_bytes.fetch_sub(Statistics::ESTIMATED_COROUTINE_FRAME_SIZE,
-                                                    std::memory_order_relaxed);
-            }
-
-            handle.destroy();
+    explicit CoroutineHandle(CoroutineControlBlock* cb, bool add_ref) : cb_(cb) {
+        if (cb_ != nullptr && add_ref) {
+            cb_->ref_count.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
-    Task(const Task&) = delete;
-    auto operator=(const Task&) -> Task& = delete;
-
-    Task(Task&& other) noexcept : handle(other.handle), owns_handle(other.owns_handle) {
-        other.handle = {};
-        other.owns_handle = false;
+    void release() noexcept {
+        CoroutineControlBlock* cb = cb_;
+        cb_ = nullptr;
+        if (cb == nullptr) {
+            return;
+        }
+        release_coroutine_control_block(cb);
     }
 
-    auto operator=(Task&& other) noexcept -> Task& {
-        if (this != &other) {
-            if (handle && owns_handle) {
-                // Track coroutine destruction (lock-free) before destroying
-                StatisticsInternal* stats = g_statistics.load(std::memory_order_acquire);
-                if (stats != nullptr) {
-                    stats->active_coroutines.fetch_sub(1, std::memory_order_relaxed);
-                    stats->total_memory_bytes.fetch_sub(Statistics::ESTIMATED_COROUTINE_FRAME_SIZE,
-                                                        std::memory_order_relaxed);
-                }
+  public:
+    CoroutineHandle() = default;
 
-                handle.destroy();
-            }
-            handle = other.handle;
-            owns_handle = other.owns_handle;
-            other.handle = {};
-            other.owns_handle = false;
+    // Adopt an existing reference (used only by TaskPromise::get_return_object).
+    static auto adopt(CoroutineControlBlock* cb) -> CoroutineHandle {
+        return CoroutineHandle(cb, /*add_ref=*/false);
+    }
+
+    // Obtain a CoroutineHandle from an existing coroutine handle (adds a ref).
+    static auto from_handle(std::coroutine_handle<TaskPromise> h) -> CoroutineHandle {
+        if (!h) {
+            return {};
+        }
+        CoroutineControlBlock* cb = h.promise().control_block;
+        if (cb == nullptr) {
+            return {};
+        }
+        return CoroutineHandle(cb, /*add_ref=*/true);
+    }
+
+    // Intrusive helpers for TaskPromise continuation handling.
+    static void add_ref(CoroutineControlBlock* cb) noexcept {
+        add_ref_coroutine_control_block(cb);
+    }
+
+    CoroutineHandle(const CoroutineHandle& other) : cb_(other.cb_) {
+        if (cb_ != nullptr) {
+            cb_->ref_count.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    CoroutineHandle& operator=(const CoroutineHandle& other) {
+        if (this == &other) {
+            return *this;
+        }
+        release();
+        cb_ = other.cb_;
+        if (cb_ != nullptr) {
+            cb_->ref_count.fetch_add(1, std::memory_order_relaxed);
         }
         return *this;
     }
 
-    // Create a non-owning Task view (for timers)
+    CoroutineHandle(CoroutineHandle&& other) noexcept : cb_(other.cb_) {
+        other.cb_ = nullptr;
+    }
+
+    CoroutineHandle& operator=(CoroutineHandle&& other) noexcept {
+        if (this == &other) {
+            return *this;
+        }
+        release();
+        cb_ = other.cb_;
+        other.cb_ = nullptr;
+        return *this;
+    }
+
+    ~CoroutineHandle() {
+        release();
+    }
+
+    [[nodiscard]] auto get() const -> std::coroutine_handle<TaskPromise> {
+        return cb_ ? cb_->handle : std::coroutine_handle<TaskPromise>{};
+    }
+
+    [[nodiscard]] auto address() const -> void* {
+        auto h = get();
+        return h ? h.address() : nullptr;
+    }
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return cb_ != nullptr && cb_->handle;
+    }
+
+    [[nodiscard]] auto done() const -> bool {
+        auto h = get();
+        return !h || h.done();
+    }
+
+    void resume() const {
+        auto h = get();
+        if (h) {
+            h.resume();
+        }
+    }
+
+    [[nodiscard]] auto ref_count() const -> std::size_t {
+        return cb_ ? cb_->ref_count.load(std::memory_order_acquire) : 0;
+    }
+
+    [[nodiscard]] auto operator==(const std::coroutine_handle<TaskPromise>& other) const noexcept
+        -> bool {
+        return get() == other;
+    }
+
+    [[nodiscard]] auto operator!=(const std::coroutine_handle<TaskPromise>& other) const noexcept
+        -> bool {
+        return !(*this == other);
+    }
+
+    [[nodiscard]] auto operator==(const CoroutineHandle& other) const noexcept -> bool {
+        return cb_ == other.cb_;
+    }
+
+    [[nodiscard]] auto operator!=(const CoroutineHandle& other) const noexcept -> bool {
+        return !(*this == other);
+    }
+};
+
+// Non-member comparison operators for reverse comparison
+[[nodiscard]] inline auto operator==(const std::coroutine_handle<TaskPromise>& lhs,
+                                     const CoroutineHandle& rhs) noexcept -> bool {
+    return rhs == lhs;
+}
+
+[[nodiscard]] inline auto operator!=(const std::coroutine_handle<TaskPromise>& lhs,
+                                     const CoroutineHandle& rhs) noexcept -> bool {
+    return rhs != lhs;
+}
+
+struct Task {
+    using promise_type = TaskPromise;
+    CoroutineHandle handle; // Reference-counted handle
+
+    Task() = default;
+
+    explicit Task(std::coroutine_handle<TaskPromise> handle_param)
+        : handle(CoroutineHandle::from_handle(handle_param)) {}
+
+    explicit Task(CoroutineHandle handle_param) : handle(std::move(handle_param)) {}
+
+    // Copy constructor - increments reference count
+    Task(const Task& other) = default;
+
+    // Copy assignment - handles reference counting automatically
+    auto operator=(const Task& other) -> Task& = default;
+
+    // Move constructor - transfers ownership
+    Task(Task&& other) noexcept = default;
+
+    // Move assignment - handles reference counting automatically
+    auto operator=(Task&& other) noexcept -> Task& = default;
+
+    // Destructor - decrements reference count (handled by CoroutineHandle)
+    ~Task() = default;
+
+    // Create a Task from a handle (increments reference count)
     static auto from_handle(std::coroutine_handle<TaskPromise> handle_param) -> Task {
-        Task task;
-        task.handle = handle_param;
-        task.owns_handle = false;
-        return task;
+        return Task(handle_param);
     }
 
     auto resume() -> bool {
-        if ((handle == nullptr) || handle.done()) {
+        if (!handle) {
+            return false;
+        }
+        // Check if done - handle is reference-counted, so it's safe
+        if (handle.done()) {
             return false;
         }
         handle.resume();
+        // Check if done after resume
         return !handle.done();
     }
 
     [[nodiscard]] auto done() const -> bool {
-        return (handle == nullptr) || handle.done();
+        if (!handle) {
+            return true;
+        }
+        // Check if done - handle is reference-counted, so it's safe
+        return handle.done();
     }
 
     // Make Task awaitable
     auto operator co_await() const noexcept {
         struct Awaiter {
-            std::coroutine_handle<TaskPromise> handle;
+            CoroutineHandle handle;
             [[nodiscard]] auto await_ready() const noexcept -> bool {
-                return (handle == nullptr) || handle.done();
+                return !handle || handle.done();
             }
+            // Awaiting from a Task coroutine: store a ref-counted continuation to keep the awaiter
+            // alive.
+            void await_suspend(std::coroutine_handle<TaskPromise> cont) const noexcept {
+                auto task_handle = handle.get();
+                if (!task_handle) {
+                    cont.resume();
+                    return;
+                }
+
+                auto& p = task_handle.promise();
+                // Clear any previous continuation (shouldn't happen, but be safe)
+                if (p.continuation_cb != nullptr) {
+                    release_coroutine_control_block(p.continuation_cb);
+                    p.continuation_cb = nullptr;
+                }
+                p.continuation_raw = std::noop_coroutine();
+
+                // Hold a ref to the awaiting coroutine while we are suspended.
+                CoroutineControlBlock* awaiter_cb = cont.promise().control_block;
+                p.continuation_cb = awaiter_cb;
+                add_ref_coroutine_control_block(awaiter_cb);
+
+                if (!handle.done()) {
+                    handle.resume();
+                } else {
+                    cont.resume();
+                }
+            }
+
+            // Fallback for non-Task awaiters.
             void await_suspend(std::coroutine_handle<> cont) const noexcept {
-                handle.promise().continuation = cont;
-                if ((handle != nullptr) && !handle.done()) {
+                auto task_handle = handle.get();
+                if (!task_handle) {
+                    cont.resume();
+                    return;
+                }
+
+                auto& p = task_handle.promise();
+                if (p.continuation_cb != nullptr) {
+                    release_coroutine_control_block(p.continuation_cb);
+                    p.continuation_cb = nullptr;
+                }
+                p.continuation_raw = cont;
+
+                if (!handle.done()) {
                     handle.resume();
                 } else {
                     cont.resume();
@@ -173,6 +372,8 @@ struct Task {
 // Implement TaskPromise::get_return_object after Task is defined
 inline auto TaskPromise::get_return_object() -> Task {
     auto handle = std::coroutine_handle<TaskPromise>::from_promise(*this);
+    auto* cb = new CoroutineControlBlock{handle};
+    control_block = cb;
 
     // Track coroutine creation (lock-free)
     StatisticsInternal* stats = g_statistics.load(std::memory_order_acquire);
@@ -183,11 +384,42 @@ inline auto TaskPromise::get_return_object() -> Task {
                                             std::memory_order_relaxed);
     }
 
-    return Task{handle};
+    return Task{CoroutineHandle::adopt(cb)};
 }
 
-// Task queue using atomic enqueue and mutex-protected dequeue
-// (Simpler and safer than lock-free with hazard pointers)
+// Intrusive ref-count helpers (used by TaskPromise/Task awaiter).
+inline void add_ref_coroutine_control_block(CoroutineControlBlock* cb) noexcept {
+    if (cb != nullptr) {
+        cb->ref_count.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+inline void release_coroutine_control_block(CoroutineControlBlock* cb) noexcept {
+    if (cb == nullptr) {
+        return;
+    }
+    if (cb->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        auto h = cb->handle;
+        cb->handle = std::coroutine_handle<TaskPromise>{};
+
+        // Track coroutine destruction (lock-free)
+        StatisticsInternal* stats = g_statistics.load(std::memory_order_acquire);
+        if (stats != nullptr) {
+            stats->active_coroutines.fetch_sub(1, std::memory_order_relaxed);
+            stats->total_memory_bytes.fetch_sub(Statistics::ESTIMATED_COROUTINE_FRAME_SIZE,
+                                                std::memory_order_relaxed);
+        }
+
+        if (h) {
+            h.destroy();
+        }
+        delete cb;
+    }
+}
+
+// Task queue using lock-free enqueue and dequeue
+// Single-consumer design: each worker thread has its own queue
+// Enqueue is multi-producer, dequeue is single-consumer (lock-free)
 class TaskQueue {
   private:
     struct Node {
@@ -199,14 +431,14 @@ class TaskQueue {
 
     std::atomic<Node*> head_;
     std::atomic<Node*> tail_;
-    std::mutex dequeue_mutex_; // Protect dequeue from races
+    mutable std::mutex dequeue_mutex_; // Protects dequeue to avoid use-after-free
 
   public:
     TaskQueue() {
         // Create dummy node with default-constructed Task (null handle is fine for dummy)
         Node* dummy = new Node(Task{});
-        head_.store(dummy);
-        tail_.store(dummy);
+        head_.store(dummy, std::memory_order_relaxed);
+        tail_.store(dummy, std::memory_order_relaxed);
     }
 
     // Delete copy and move operations
@@ -216,32 +448,42 @@ class TaskQueue {
     auto operator=(TaskQueue&&) -> TaskQueue& = delete;
 
     ~TaskQueue() {
-        Node* node = head_.load();
+        Node* node = head_.load(std::memory_order_acquire);
         while (node != nullptr) {
-            Node* next = node->next.load();
+            Node* next = node->next.load(std::memory_order_acquire);
             delete node;
             node = next;
         }
     }
 
+    // Multi-producer enqueue (lock-free)
     void enqueue(Task task) {
         Node* node = new Node(std::move(task));
         Node* prev_tail = tail_.exchange(node, std::memory_order_acq_rel);
         prev_tail->next.store(node, std::memory_order_release);
     }
 
+    // Multi-consumer dequeue (protected by mutex to avoid use-after-free)
+    // Note: This is not fully lock-free, but ensures thread safety
+    // A fully lock-free implementation would require hazard pointers or epoch-based reclamation
     auto dequeue(Task& task) -> bool {
         std::lock_guard<std::mutex> lock(dequeue_mutex_);
 
         Node* head = head_.load(std::memory_order_acquire);
-        Node* next = head->next.load(std::memory_order_acquire);
-
-        if (next == nullptr) {
+        if (head == nullptr) {
             return false;
         }
 
-        task = std::move(next->task);
+        Node* next = head->next.load(std::memory_order_acquire);
+        if (next == nullptr) {
+            return false; // Queue is empty
+        }
+
+        // Update head atomically
         head_.store(next, std::memory_order_release);
+
+        // Safe to access next->task and delete head (protected by mutex)
+        task = std::move(next->task);
         delete head;
         return true;
     }
@@ -287,10 +529,10 @@ class IOContext {
     // Map from file descriptor to pending coroutine handles
     // Handles stored as raw addresses for atomic access
     struct PendingIO {
-        std::atomic<void*> read_handle;
-        std::atomic<void*> write_handle;
+        CoroutineHandle read;
+        CoroutineHandle write;
 
-        PendingIO() : read_handle(nullptr), write_handle(nullptr) {}
+        PendingIO() = default;
     };
     std::unordered_map<int, PendingIO> pending_io_;
     mutable std::atomic_flag map_lock_ = ATOMIC_FLAG_INIT; // Spinlock for map structure only

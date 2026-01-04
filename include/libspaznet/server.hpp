@@ -74,7 +74,7 @@ class Socket {
     Task async_read(std::vector<uint8_t>& buffer, std::size_t size);
 
     // Async write
-    Task async_write(const std::vector<uint8_t>& data);
+    Task async_write(std::vector<uint8_t> data);
 
     void close();
 };

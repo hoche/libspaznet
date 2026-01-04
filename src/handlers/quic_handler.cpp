@@ -113,7 +113,7 @@ Task QUICConnection::process_packet(const std::vector<uint8_t>& packet) {
     if (!frames.empty()) {
         std::vector<QUICStreamFrame> ack_frames;
         auto response = serialize_packet(QUICPacketType::OneRTT, ack_frames);
-        co_await socket_.async_write(response);
+        co_await socket_.async_write(std::move(response));
     }
 }
 
@@ -137,7 +137,7 @@ Task QUICConnection::send_stream_data(uint64_t stream_id, const std::vector<uint
 
     std::vector<QUICStreamFrame> frames = {frame};
     auto packet = serialize_packet(QUICPacketType::OneRTT, frames);
-    co_await socket_.async_write(packet);
+    co_await socket_.async_write(std::move(packet));
 }
 
 Task QUICConnection::close() {

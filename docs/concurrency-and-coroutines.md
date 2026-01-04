@@ -414,3 +414,7 @@ void on_external_ready(IOContext& ctx, ExternalEvent ev) {
 
 Keep coroutine boundaries clean: once you start with `Task`, stay with coroutines and let the `IOContext` scheduler be the only component that moves work across threads.
 
+
+
+
+

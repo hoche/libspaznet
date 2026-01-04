@@ -67,37 +67,21 @@ void IOContext::run() {
                     continue;
                 }
 
-                // Check if this task is suspended on a timer BEFORE checking done()
-                // This avoids accessing potentially destroyed coroutine frame
+                // If suspended on timer, don't resume here (timer will schedule it)
                 void* handle_addr = task.handle.address();
-                bool is_suspended_on_timer = false;
                 {
                     std::lock_guard<std::mutex> timer_lock(timer_mutex_);
-                    auto it = suspended_tasks_.find(handle_addr);
-                    if (it != suspended_tasks_.end()) {
-                        is_suspended_on_timer = true;
+                    if (suspended_tasks_.find(handle_addr) != suspended_tasks_.end()) {
+                        continue;
                     }
                 }
 
-                // If suspended on timer, don't check done() or resume - timer will handle it
-                if (is_suspended_on_timer) {
-                    // Make Task non-owning - timer will handle resumption
-                    task.owns_handle = false;
-                    {
-                        std::lock_guard<std::mutex> timer_lock(timer_mutex_);
-                        suspended_tasks_.erase(handle_addr);
-                    }
-                    // Don't reschedule - timer will do it
-                    continue;
-                }
-
-                // Not suspended on timer - proceed normally
+                // Resume at most once. Do NOT auto-reschedule here:
+                // - If it suspended on I/O, process_io_events() will schedule it.
+                // - If it suspended on a timer, process_timers() will schedule it.
+                // - If it is awaiting another Task, that Task will resume it via continuation.
                 if (!task.done()) {
                     task.resume();
-                    if (!task.done()) {
-                        // Task not done, reschedule
-                        schedule(std::move(task));
-                    }
                 }
             }
         }
@@ -116,6 +100,8 @@ void IOContext::stop() {
 }
 
 void IOContext::schedule(Task task) {
+    // With reference counting, we can safely enqueue the task
+    // The handle won't be destroyed while any Task references it
     // Round-robin scheduling
     std::size_t index = next_queue_.fetch_add(1, std::memory_order_acq_rel) % num_threads_;
     thread_queues_[index].enqueue(std::move(task));
@@ -132,30 +118,19 @@ void IOContext::worker_thread(std::size_t queue_index) {
                 continue;
             }
 
+            // If suspended on timer, don't resume here (timer will schedule it)
+            void* handle_addr = task.handle.address();
+            {
+                std::lock_guard<std::mutex> timer_lock(timer_mutex_);
+                if (suspended_tasks_.find(handle_addr) != suspended_tasks_.end()) {
+                    continue;
+                }
+            }
+
+            // Resume at most once. Do NOT auto-reschedule:
+            // resumption should be driven by I/O/timers/continuations.
             if (!task.done()) {
                 task.resume();
-                if (!task.done()) {
-                    // Check if this task is suspended on a timer
-                    // by looking it up in the suspended_tasks_ map
-                    void* handle_addr = task.handle.address();
-                    bool is_suspended_on_timer = false;
-                    {
-                        std::lock_guard<std::mutex> timer_lock(timer_mutex_);
-                        auto it = suspended_tasks_.find(handle_addr);
-                        if (it != suspended_tasks_.end()) {
-                            is_suspended_on_timer = true;
-                            // Task is suspended on a timer - make it non-owning
-                            // The timer will handle resumption
-                            task.owns_handle = false;
-                            // Don't reschedule - timer will do it
-                            suspended_tasks_.erase(it);
-                        }
-                    }
-                    if (!is_suspended_on_timer) {
-                        // Task not done and not on timer, reschedule
-                        schedule(std::move(task));
-                    }
-                }
             }
         } else {
             // No work, yield
@@ -175,24 +150,27 @@ void IOContext::register_io(int fd, uint32_t events, std::coroutine_handle<> han
     bool already_registered = it != pending_io_.end();
     PendingIO& pending = already_registered ? it->second : pending_io_[fd];
 
-    uint32_t new_events = events;
-
-    // Store handles atomically
-    void* handle_addr = handle.address();
-    if (events & PlatformIO::EVENT_READ) {
-        pending.read_handle.store(handle_addr, std::memory_order_release);
+    // Convert to our TaskPromise coroutine handle and keep it alive while registered.
+    // NOTE: Storing only the raw address is not enough; the coroutine frame may be destroyed
+    // while suspended. We must retain a strong reference here.
+    uint32_t new_events = 0;
+    if (handle) {
+        auto task_handle = std::coroutine_handle<TaskPromise>::from_address(handle.address());
+        if (task_handle) {
+            if (events & PlatformIO::EVENT_READ) {
+                pending.read = CoroutineHandle::from_handle(task_handle);
+            }
+            if (events & PlatformIO::EVENT_WRITE) {
+                pending.write = CoroutineHandle::from_handle(task_handle);
+            }
+        }
     }
-    if (events & PlatformIO::EVENT_WRITE) {
-        pending.write_handle.store(handle_addr, std::memory_order_release);
-    }
 
-    // After storing, ensure we enable both read/write bits that currently have waiters.
-    bool has_read = pending.read_handle.load(std::memory_order_acquire) != nullptr;
-    bool has_write = pending.write_handle.load(std::memory_order_acquire) != nullptr;
-    if (has_read) {
+    // Enable event bits that currently have waiters.
+    if (pending.read) {
         new_events |= PlatformIO::EVENT_READ;
     }
-    if (has_write) {
+    if (pending.write) {
         new_events |= PlatformIO::EVENT_WRITE;
     }
 
@@ -215,8 +193,8 @@ void IOContext::remove_io(int fd) {
 }
 
 void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) {
-    // Extract handles to resume BEFORE scheduling (avoid holding lock during schedule)
-    std::vector<std::coroutine_handle<>> handles_to_resume;
+    // Extract tasks to schedule BEFORE scheduling (avoid holding lock during schedule)
+    std::vector<Task> tasks_to_schedule;
 
     {
         // Spinlock for map access
@@ -233,18 +211,32 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
 
             PendingIO& pending = it->second;
 
-            // Load and clear handles atomically
+            bool changed = false;
             if (ev.events & PlatformIO::EVENT_READ) {
-                void* addr = pending.read_handle.exchange(nullptr, std::memory_order_acq_rel);
-                if (addr) {
-                    handles_to_resume.push_back(std::coroutine_handle<>::from_address(addr));
+                if (pending.read) {
+                    tasks_to_schedule.emplace_back(Task{std::move(pending.read)});
+                    pending.read = {};
+                    changed = true;
                 }
             }
             if (ev.events & PlatformIO::EVENT_WRITE) {
-                void* addr = pending.write_handle.exchange(nullptr, std::memory_order_acq_rel);
-                if (addr) {
-                    handles_to_resume.push_back(std::coroutine_handle<>::from_address(addr));
+                if (pending.write) {
+                    tasks_to_schedule.emplace_back(Task{std::move(pending.write)});
+                    pending.write = {};
+                    changed = true;
                 }
+            }
+
+            // Update interest mask to avoid spurious wakeups.
+            if (changed) {
+                uint32_t new_events = 0;
+                if (pending.read) {
+                    new_events |= PlatformIO::EVENT_READ;
+                }
+                if (pending.write) {
+                    new_events |= PlatformIO::EVENT_WRITE;
+                }
+                platform_io_->modify_fd(ev.fd, new_events, &pending);
             }
         }
 
@@ -252,18 +244,9 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
     }
     // Lock released here
 
-    // Now schedule all handles without holding the lock
-    for (auto handle : handles_to_resume) {
-        // Check if handle is valid before converting
-        if (!handle || handle.done()) {
-            continue;
-        }
-        // Convert to TaskPromise handle
-        auto task_handle = std::coroutine_handle<TaskPromise>::from_address(handle.address());
-        // Additional validation - ensure handle is still valid
-        if (task_handle && !task_handle.done()) {
-            schedule(Task{task_handle});
-        }
+    // Now schedule all tasks without holding the lock.
+    for (auto& task : tasks_to_schedule) {
+        schedule(std::move(task));
     }
 }
 
@@ -327,11 +310,10 @@ void IOContext::process_timers() {
             ready_tasks.push_back(entry.task_ptr);
 
             if (entry.repeat) {
-                // Maintain consistent period regardless of processing delay
-                do {
-                    entry.next_fire += entry.interval;
-                } while (entry.next_fire <= now);
-                // Re-add the entry with the same task_ptr
+                // Keep intervals stable: schedule next fire relative to "now".
+                // This avoids "catch-up" compression where a delayed tick makes the next tick fire
+                // too soon (which breaks IntervalStaysPeriodic).
+                entry.next_fire = now + entry.interval;
                 timers_.push(entry);
             }
         }
@@ -365,17 +347,15 @@ void IOContext::process_timers() {
             suspended_tasks_.erase(handle.address());
         }
 
-        // Clear the handle in the shared Task and make it non-owning
-        // This transfers ownership to the new Task we'll create
-        task_ptr->handle = {};
-        task_ptr->owns_handle = false;
-
-        // Create new Task with ownership of the handle
-        Task task_to_schedule{handle};
-        task_to_schedule.owns_handle = true;
-
-        // Schedule the task - Task::resume() will check if handle is done
-        schedule(std::move(task_to_schedule));
+        // Create new Task from the handle - reference counting handles ownership
+        // The handle from task_ptr is already reference-counted, so we can safely
+        // create a new Task from it
+        auto task_handle = handle.get();
+        if (task_handle) {
+            Task task_to_schedule{task_handle};
+            // Schedule the task - Task::resume() will check if handle is done
+            schedule(std::move(task_to_schedule));
+        }
     }
 }
 
