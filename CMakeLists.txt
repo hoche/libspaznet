@@ -165,6 +165,12 @@ target_link_libraries(test_performance
     GTest::gmock
 )
 
+# Thread-mode benchmark runner (prints a Markdown report). Not added to CTest by default.
+add_executable(bench_thread_modes
+    tests/performance/bench_thread_modes.cpp
+)
+target_link_libraries(bench_thread_modes spaznet)
+
 # Add tests to CTest
 add_test(NAME UnitTests COMMAND test_unit)
 add_test(NAME IntegrationTests COMMAND test_integration)
