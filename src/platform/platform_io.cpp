@@ -1,4 +1,4 @@
-#include <libspaznet/platform_io.hpp>
+#include <libspaznet/platform/platform_io.hpp>
 
 #ifdef USE_EPOLL
 #include "platform_io_epoll.cpp"

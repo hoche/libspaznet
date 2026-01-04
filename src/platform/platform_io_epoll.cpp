@@ -5,7 +5,7 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
-#include <libspaznet/platform_io.hpp>
+#include <libspaznet/platform/platform_io.hpp>
 
 namespace spaznet {
 

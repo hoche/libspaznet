@@ -21,8 +21,8 @@ include_directories(include)
 
 # Source files
 set(SOURCES
-    src/io_context.cpp
-    src/platform_io.cpp
+    src/platform/io_context.cpp
+    src/platform/platform_io.cpp
     src/handlers/udp_handler.cpp
     src/handlers/http_handler.cpp
     src/handlers/http2_handler.cpp
@@ -33,13 +33,15 @@ set(SOURCES
     src/utils/number_utils.cpp
     src/utils/binary_utils.cpp
     src/utils/header_utils.cpp
-    src/server.cpp
+    src/server_impl.cpp
 )
 
 # Header files
 set(HEADERS
     include/libspaznet/io_context.hpp
     include/libspaznet/platform_io.hpp
+    include/libspaznet/platform/io_context.hpp
+    include/libspaznet/platform/platform_io.hpp
     include/libspaznet/logger.hpp
     include/libspaznet/handlers/udp_handler.hpp
     include/libspaznet/handlers/http_handler.hpp
@@ -59,16 +61,12 @@ add_library(spaznet STATIC ${SOURCES} ${HEADERS})
 
 # Platform-specific sources
 if(USE_EPOLL)
-    target_sources(spaznet PRIVATE src/platform_io_epoll.cpp)
     target_compile_definitions(spaznet PRIVATE USE_EPOLL)
 elseif(USE_KQUEUE)
-    target_sources(spaznet PRIVATE src/platform_io_kqueue.cpp)
     target_compile_definitions(spaznet PRIVATE USE_KQUEUE)
 elseif(USE_IOCP)
-    target_sources(spaznet PRIVATE src/platform_io_iocp.cpp)
     target_compile_definitions(spaznet PRIVATE USE_IOCP)
 else()
-    target_sources(spaznet PRIVATE src/platform_io_poll.cpp)
     target_compile_definitions(spaznet PRIVATE USE_POLL)
 endif()
 
@@ -78,7 +76,7 @@ if(WIN32)
 endif()
 
 # Example executable
-add_executable(example example/main.cpp)
+add_executable(example example/server.cpp)
 target_link_libraries(example spaznet)
 
 # Installation

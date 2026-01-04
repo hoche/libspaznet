@@ -6,7 +6,7 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
-#include <libspaznet/platform_io.hpp>
+#include <libspaznet/platform/platform_io.hpp>
 #include <unordered_map>
 
 namespace spaznet {

@@ -4,7 +4,7 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <libspaznet/platform_io.hpp>
+#include <libspaznet/platform/platform_io.hpp>
 #include <unordered_map>
 #include <vector>
 
