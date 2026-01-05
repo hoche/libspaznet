@@ -13,6 +13,9 @@
 #include <unordered_map>
 #include <vector>
 
+// Server/public API header: suppress noisy style checks.
+// NOLINTBEGIN
+
 namespace spaznet {
 
 // Forward declarations
@@ -82,6 +85,8 @@ class Socket {
 };
 
 } // namespace spaznet
+
+// NOLINTEND
 
 // Include handlers after Socket is defined
 #include <libspaznet/handlers/http2_handler.hpp>

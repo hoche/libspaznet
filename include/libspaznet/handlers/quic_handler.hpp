@@ -7,6 +7,15 @@
 #include <unordered_map>
 #include <vector>
 
+// QUIC data types expose some members publicly for convenience in this toy implementation.
+// Suppress clang-tidy warnings that would require major API refactors.
+// NOLINTBEGIN(
+//   cppcoreguidelines-non-private-member-variables-in-classes,
+//   cppcoreguidelines-use-default-member-init,
+//   modernize-use-default-member-init,
+//   cppcoreguidelines-pro-type-member-init
+// )
+
 namespace spaznet {
 
 // Forward declaration
@@ -183,3 +192,10 @@ class QUICHandler {
 };
 
 } // namespace spaznet
+
+// NOLINTEND(
+//   cppcoreguidelines-non-private-member-variables-in-classes,
+//   cppcoreguidelines-use-default-member-init,
+//   modernize-use-default-member-init,
+//   cppcoreguidelines-pro-type-member-init
+// )
