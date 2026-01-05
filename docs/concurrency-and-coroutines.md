@@ -56,7 +56,7 @@ graph TB
 
 - **IOContext** owns the event loop, worker threads, timer wheel, and platform-specific I/O demultiplexer.
 - **Task** is a coroutine return type; its promise (`TaskPromise`) stores a continuation handle so `co_await` chains resume correctly.
-- **TaskQueue** is a multi-producer/single-consumer queue per worker thread; enqueue is atomic, dequeue is mutex-protected to simplify correctness.
+- **TaskQueue** is a multi-producer/single-consumer queue per worker thread; enqueue is atomic, dequeue is mutex-protected to simplify correctness. See `mutex-vs-atomics.md` for detailed explanation of why mutexes are used instead of atomics in specific cases.
 - **PlatformIO** (epoll/kqueue/poll/IOCP) translates OS events into coroutine resumes; pending I/O registrations store raw coroutine handles for atomic swaps.
 
 ```mermaid
@@ -413,6 +413,8 @@ void on_external_ready(IOContext& ctx, ExternalEvent ev) {
 - Handler vtables are violated, so HTTP/WebSocket/TCP dispatch cannot call your handler at all.
 
 Keep coroutine boundaries clean: once you start with `Task`, stay with coroutines and let the `IOContext` scheduler be the only component that moves work across threads.
+
+
 
 
 

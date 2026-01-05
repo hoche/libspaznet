@@ -92,6 +92,22 @@ ctest
 ./test_integration
 ```
 
+### Performance Tests Only
+```bash
+./test_performance
+```
+
+### Thread Mode Benchmark
+
+Generate a comprehensive performance report comparing different thread configurations:
+
+```bash
+cd build
+./bench_thread_modes > thread_mode_report.md
+```
+
+This benchmark compares HTTP throughput and latency across different thread counts (0, 2, 4, 8, 16, 32, etc.) and includes raw TCP/UDP bandwidth measurements via iperf3. See `tests/performance/README.md` for more details.
+
 ### Specific Test
 ```bash
 ./test_unit --gtest_filter=TaskQueueTest.BasicEnqueueDequeue
@@ -125,6 +141,7 @@ When adding new functionality:
 - **Other Unix**: Falls back to poll()
 
 Tests should work on all platforms, but some integration tests may require network access.
+
 
 
 
