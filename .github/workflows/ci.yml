@@ -293,3 +293,4 @@ jobs:
             ./test_integration || ctest -R IntegrationTests --output-on-failure
             ctest --output-on-failure
           "
+
