@@ -109,7 +109,7 @@ class QUICStream {
 // QUIC Connection (RFC9000)
 class QUICConnection {
   public:
-    QUICConnection(ConnectionID dest_conn_id, ConnectionID src_conn_id, Socket& socket);
+    QUICConnection(ConnectionID dest_conn_id, ConnectionID src_conn_id);
     ~QUICConnection() = default;
 
     // Delete copy and move operations
@@ -132,11 +132,13 @@ class QUICConnection {
     auto get_stream(uint64_t stream_id) -> std::shared_ptr<QUICStream>;
 
     // Process incoming QUIC packet
-    auto process_packet(const std::vector<uint8_t>& packet) -> Task;
+    // Returns true on successful parse; `frames_out` will contain any STREAM frames.
+    auto process_packet(const std::vector<uint8_t>& packet,
+                        std::vector<QUICStreamFrame>& frames_out) -> bool;
 
-    // Send data on stream
-    auto send_stream_data(uint64_t stream_id, const std::vector<uint8_t>& data,
-                          bool fin = false) -> Task;
+    // Build a QUIC packet containing STREAM frames (toy implementation).
+    [[nodiscard]] auto build_packet(QUICPacketType type, const std::vector<QUICStreamFrame>& frames)
+        const -> std::vector<uint8_t>;
 
     // Close connection
     auto close() -> Task;
@@ -144,7 +146,6 @@ class QUICConnection {
   private:
     ConnectionID dest_conn_id_;
     ConnectionID src_conn_id_;
-    Socket& socket_;
     QUICConnectionState state_;
     std::unordered_map<uint64_t, std::shared_ptr<QUICStream>> streams_;
     uint64_t next_stream_id_;
@@ -157,7 +158,7 @@ class QUICConnection {
 
     // Serialize QUIC packet
     auto serialize_packet(QUICPacketType type,
-                          const std::vector<QUICStreamFrame>& frames) -> std::vector<uint8_t>;
+                          const std::vector<QUICStreamFrame>& frames) const -> std::vector<uint8_t>;
 };
 
 // QUIC Handler interface

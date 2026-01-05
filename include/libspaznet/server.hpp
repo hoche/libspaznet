@@ -31,7 +31,8 @@ class Socket {
     bool owns_fd_;
 
   public:
-    Socket(int fd, IOContext* ctx) : fd_(fd), io_context_(ctx), owns_fd_(true) {}
+    Socket(int fd, IOContext* ctx, bool owns_fd = true)
+        : fd_(fd), io_context_(ctx), owns_fd_(owns_fd) {}
 
     // Move constructor
     Socket(Socket&& other) noexcept
@@ -112,6 +113,7 @@ class Server {
 
     Task handle_connection(Socket socket);
     Task accept_connections(int listen_fd);
+    Task receive_udp(int udp_fd);
 
   public:
     // `num_threads` is the number of IO worker threads to spawn (0 = non-threaded default).

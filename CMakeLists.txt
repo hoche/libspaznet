@@ -28,6 +28,7 @@ set(SOURCES
     src/handlers/http2_handler.cpp
     src/handlers/websocket_handler.cpp
     src/handlers/quic_handler.cpp
+    src/handlers/quic_server.cpp
     src/handlers/http3_handler.cpp
     src/utils/string_utils.cpp
     src/utils/number_utils.cpp
@@ -48,6 +49,7 @@ set(HEADERS
     include/libspaznet/handlers/http2_handler.hpp
     include/libspaznet/handlers/websocket_handler.hpp
     include/libspaznet/handlers/quic_handler.hpp
+    include/libspaznet/handlers/quic_server.hpp
     include/libspaznet/handlers/http3_handler.hpp
     include/libspaznet/utils/string_utils.hpp
     include/libspaznet/utils/number_utils.hpp
