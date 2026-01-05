@@ -207,6 +207,10 @@ TEST_F(RFC9112ParserTest, RequestShouldKeepAlive) {
     request3.version = "1.0";
     request3.headers["Connection"] = "keep-alive";
     EXPECT_TRUE(request3.should_keep_alive());
+
+    HTTPRequest request4;
+    request4.version = "1.0";
+    EXPECT_FALSE(request4.should_keep_alive());
 }
 
 TEST_F(RFC9112ParserTest, RequestGetContentLength) {

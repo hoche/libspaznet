@@ -649,30 +649,52 @@ Task Server::handle_connection(Socket socket) {
         }
 
         if (!websocket_upgrade && http_handler_) {
-            HTTPRequest request;
-            size_t bytes_consumed = 0;
-            HTTPParser::ParseResult parse_result =
-                HTTPParser::parse_request(buffer, request, bytes_consumed);
+            constexpr std::size_t kReadChunk = 8192;
+            constexpr std::size_t kMaxRequestBytes = 1024 * 1024; // 1 MiB safety cap
 
-            // Read until we have a full request (headers + body) or hit a safety limit.
-            // This allows benchmarking and real usage with larger request bodies.
-            if (parse_result == HTTPParser::ParseResult::Incomplete) {
-                constexpr std::size_t kReadChunk = 8192;
-                constexpr std::size_t kMaxRequestBytes = 1024 * 1024; // 1 MiB safety cap
+            // HTTP/1.1 keep-alive: serve multiple requests per TCP connection.
+            while (true) {
+                HTTPRequest request;
+                size_t bytes_consumed = 0;
+                HTTPParser::ParseResult parse_result =
+                    HTTPParser::parse_request(buffer, request, bytes_consumed);
 
+                // Read until we have a full request (headers + body) or hit a safety limit.
                 while (parse_result == HTTPParser::ParseResult::Incomplete &&
                        buffer.size() < kMaxRequestBytes) {
                     std::vector<uint8_t> more_data;
                     co_await socket.async_read(more_data, kReadChunk);
                     if (more_data.empty()) {
-                        break;
+                        // Client closed connection (or read error).
+                        socket.close();
+                        co_return;
                     }
                     buffer.insert(buffer.end(), more_data.begin(), more_data.end());
                     parse_result = HTTPParser::parse_request(buffer, request, bytes_consumed);
                 }
-            }
 
-            if (parse_result == HTTPParser::ParseResult::Success) {
+                if (parse_result != HTTPParser::ParseResult::Success) {
+                    HTTPResponse error_response;
+                    error_response.version = "1.1";
+                    error_response.status_code = 400;
+                    error_response.reason_phrase = "Bad Request";
+                    error_response.set_header("Connection", "close");
+                    error_response.set_header("Content-Length", "0");
+
+                    auto error_data = error_response.serialize();
+                    co_await socket.async_write(std::move(error_data));
+                    socket.close();
+                    co_return;
+                }
+
+                if (bytes_consumed > buffer.size()) {
+                    socket.close();
+                    co_return;
+                }
+
+                // Consume request bytes so we can parse the next request (pipelined or later).
+                buffer.erase(buffer.begin(), buffer.begin() + bytes_consumed);
+
                 // Track request start (lock-free)
                 socket.context()->increment_active_requests();
 
@@ -682,11 +704,8 @@ Task Server::handle_connection(Socket socket) {
 
                     co_await http_handler_->handle_request(request, response, socket);
 
-                    if (!request.should_keep_alive()) {
-                        response.set_header("Connection", "close");
-                    } else {
-                        response.set_header("Connection", "keep-alive");
-                    }
+                    const bool keep_alive = request.should_keep_alive();
+                    response.set_header("Connection", keep_alive ? "keep-alive" : "close");
 
                     std::vector<uint8_t> response_data;
                     auto te = response.get_header("Transfer-Encoding");
@@ -705,28 +724,18 @@ Task Server::handle_connection(Socket socket) {
 
                     co_await socket.async_write(std::move(response_data));
 
-                    if (!request.should_keep_alive()) {
-                        socket.close();
-                    }
-
                     // Track request finish (lock-free) - after response is sent successfully
                     socket.context()->decrement_active_requests();
+
+                    if (!keep_alive) {
+                        socket.close();
+                        co_return;
+                    }
                 } catch (...) {
                     // Ensure request counter is decremented even on exception
                     socket.context()->decrement_active_requests();
                     throw;
                 }
-            } else {
-                HTTPResponse error_response;
-                error_response.version = "1.1";
-                error_response.status_code = 400;
-                error_response.reason_phrase = "Bad Request";
-                error_response.set_header("Connection", "close");
-                error_response.set_header("Content-Length", "0");
-
-                auto error_data = error_response.serialize();
-                co_await socket.async_write(std::move(error_data));
-                socket.close();
             }
         } else if (websocket_upgrade && websocket_handler_) {
             auto& hdrs = ws_request->headers;

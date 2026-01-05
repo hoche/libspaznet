@@ -140,6 +140,68 @@ class RFC9112IntegrationTest : public ::testing::Test {
         return "";
     }
 
+    std::string read_response(int sock) {
+        std::string response;
+        char buffer[4096];
+
+        auto start_time = std::chrono::steady_clock::now();
+        const auto timeout = std::chrono::seconds(2);
+        bool got_headers = false;
+        size_t headers_end = std::string::npos;
+        size_t expected_len = 0;
+        bool has_content_length = false;
+
+        while (std::chrono::steady_clock::now() - start_time < timeout) {
+            int received = recv(sock, buffer, sizeof(buffer) - 1, 0);
+            if (received > 0) {
+                buffer[received] = '\0';
+                response.append(buffer, received);
+
+                if (!got_headers) {
+                    headers_end = response.find("\r\n\r\n");
+                    if (headers_end != std::string::npos) {
+                        got_headers = true;
+                        size_t content_length_pos = response.find("Content-Length:");
+                        if (content_length_pos != std::string::npos) {
+                            size_t len_start = response.find(": ", content_length_pos);
+                            if (len_start != std::string::npos) {
+                                len_start += 2;
+                                size_t len_end = response.find("\r\n", len_start);
+                                if (len_end != std::string::npos) {
+                                    try {
+                                        expected_len = static_cast<size_t>(std::stoul(
+                                            response.substr(len_start, len_end - len_start)));
+                                        has_content_length = true;
+                                    } catch (...) {
+                                        has_content_length = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (got_headers && has_content_length) {
+                    const size_t body_start = headers_end + 4;
+                    if (response.size() >= body_start + expected_len) {
+                        break;
+                    }
+                } else if (got_headers) {
+                    // No Content-Length: treat headers-only as complete for these tests.
+                    break;
+                }
+            } else if (received == 0) {
+                // Connection closed by peer.
+                break;
+            } else {
+                // Timeout or transient error.
+                break;
+            }
+        }
+
+        return response;
+    }
+
     RFC9112TestHandler* handler; // Raw pointer since server owns the unique_ptr
     std::unique_ptr<Server> server;
     std::thread server_thread;
@@ -216,6 +278,55 @@ TEST_F(RFC9112IntegrationTest, ConnectionKeepAlive) {
     std::string response = send_request(request);
 
     EXPECT_NE(response.find("Connection: keep-alive"), std::string::npos);
+}
+
+TEST_F(RFC9112IntegrationTest, KeepAliveAllowsMultipleRequestsOnSameConnection) {
+    int sock = connect_to_server();
+    ASSERT_GE(sock, 0);
+
+#ifndef _WIN32
+    // Set receive timeout so tests don't hang.
+    struct timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
+    std::string req1 = "GET /one HTTP/1.1\r\n"
+                       "Host: localhost:9996\r\n"
+                       "Connection: keep-alive\r\n"
+                       "\r\n";
+#ifdef _WIN32
+    ASSERT_GT(send(sock, req1.c_str(), static_cast<int>(req1.size()), 0), 0);
+#else
+    ASSERT_EQ(send(sock, req1.c_str(), req1.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(req1.size()));
+#endif
+
+    std::string resp1 = read_response(sock);
+    EXPECT_NE(resp1.find("HTTP/1.1 200 OK"), std::string::npos);
+    EXPECT_NE(resp1.find("Connection: keep-alive"), std::string::npos);
+
+    std::string req2 = "GET /two HTTP/1.1\r\n"
+                       "Host: localhost:9996\r\n"
+                       "Connection: close\r\n"
+                       "\r\n";
+#ifdef _WIN32
+    ASSERT_GT(send(sock, req2.c_str(), static_cast<int>(req2.size()), 0), 0);
+#else
+    ASSERT_EQ(send(sock, req2.c_str(), req2.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(req2.size()));
+#endif
+
+    std::string resp2 = read_response(sock);
+    EXPECT_NE(resp2.find("HTTP/1.1 200 OK"), std::string::npos);
+    EXPECT_NE(resp2.find("Connection: close"), std::string::npos);
+
+    close_socket(sock);
+
+    // Give server a moment to record both requests.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_GE(handler->request_count.load(), 2);
 }
 
 TEST_F(RFC9112IntegrationTest, ConnectionClose) {
