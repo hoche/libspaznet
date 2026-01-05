@@ -17,15 +17,48 @@ std::optional<std::string> HTTPRequest::get_header(const std::string& name) cons
 }
 
 bool HTTPRequest::should_keep_alive() const {
+    const bool is_http_11 = (version == "1.1");
+    const bool is_http_10 = (version == "1.0");
+
     auto connection = get_header("Connection");
     if (connection) {
+        // RFC 9110: Connection is a list of tokens.
         std::string conn = HTTPParser::to_lower(*connection);
-        if (conn == "close") {
+        bool has_close = false;
+        bool has_keep_alive = false;
+
+        std::istringstream iss(conn);
+        std::string part;
+        while (std::getline(iss, part, ',')) {
+            part = HTTPParser::trim_ows(part);
+            if (part == "close") {
+                has_close = true;
+            } else if (part == "keep-alive") {
+                has_keep_alive = true;
+            }
+        }
+
+        if (has_close) {
             return false;
         }
+        if (is_http_10) {
+            // HTTP/1.0 defaults to closing unless explicitly kept alive.
+            return has_keep_alive;
+        }
+        if (is_http_11) {
+            // HTTP/1.1 defaults to keep-alive unless close is present.
+            return true;
+        }
+
+        // Unknown HTTP version: be conservative and only keep-alive if explicitly requested.
+        return has_keep_alive;
     }
-    // HTTP/1.1 defaults to keep-alive unless Connection: close
-    return version == "1.1" || version == "1.0";
+
+    // Defaults by version.
+    if (is_http_11) {
+        return true;
+    }
+    return false;
 }
 
 std::optional<size_t> HTTPRequest::get_content_length() const {
