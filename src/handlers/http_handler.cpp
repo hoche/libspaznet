@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <cstdlib>
 #include <format>
 #include <libspaznet/handlers/http_handler.hpp>
@@ -8,6 +9,17 @@
 #include <libspaznet/utils/string_utils.hpp>
 #include <sstream>
 #include <stdexcept>
+
+// HTTP/1.x parser/serializer code uses many protocol constants and iterator math; keep tidy output
+// actionable by suppressing a few noisy style checks in this translation unit.
+// NOLINTBEGIN(
+//   modernize-use-trailing-return-type,
+//   cppcoreguidelines-narrowing-conversions,
+//   readability-identifier-length,
+//   readability-function-cognitive-complexity,
+//   cppcoreguidelines-avoid-magic-numbers,
+//   readability-magic-numbers
+// )
 
 namespace spaznet {
 
@@ -372,14 +384,17 @@ HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& bu
         if (buffer.size() < header_end + body_size) {
             return ParseResult::Incomplete;
         }
-        request.body.assign(buffer.begin() + header_end, buffer.begin() + header_end + body_size);
+        const auto header_off = static_cast<std::ptrdiff_t>(header_end);
+        const auto body_off = static_cast<std::ptrdiff_t>(body_size);
+        request.body.assign(buffer.begin() + header_off, buffer.begin() + header_off + body_off);
         bytes_consumed += body_size;
     } else if (request.is_chunked()) {
         // Parse chunked body
         size_t chunk_bytes = 0;
-        ParseResult chunk_result =
-            parse_chunked_body(std::vector<uint8_t>(buffer.begin() + header_end, buffer.end()),
-                               request.body, chunk_bytes);
+        ParseResult chunk_result = parse_chunked_body(
+            std::vector<uint8_t>(buffer.begin() + static_cast<std::ptrdiff_t>(header_end),
+                                 buffer.end()),
+            request.body, chunk_bytes);
         if (chunk_result != ParseResult::Success) {
             return chunk_result;
         }
@@ -389,8 +404,8 @@ HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& bu
     return ParseResult::Success;
 }
 
-HTTPParser::ParseResult HTTPParser::parse_response(const std::vector<uint8_t>& buffer,
-                                                   HTTPResponse& response, size_t& bytes_consumed) {
+auto HTTPParser::parse_response(const std::vector<uint8_t>& buffer, HTTPResponse& response,
+                                size_t& bytes_consumed) -> HTTPParser::ParseResult {
     bytes_consumed = 0;
 
     // Find end of headers
@@ -449,9 +464,9 @@ HTTPParser::ParseResult HTTPParser::parse_response(const std::vector<uint8_t>& b
     bytes_consumed = header_end;
 
     // Parse body
-    auto cl = response.get_header("Content-Length");
-    if (cl) {
-        auto body_size_opt = NumberUtils::parse_uint64(*cl);
+    auto content_length_header = response.get_header("Content-Length");
+    if (content_length_header) {
+        auto body_size_opt = NumberUtils::parse_uint64(*content_length_header);
         if (!body_size_opt) {
             return ParseResult::Error;
         }
@@ -459,15 +474,19 @@ HTTPParser::ParseResult HTTPParser::parse_response(const std::vector<uint8_t>& b
         if (buffer.size() < header_end + body_size) {
             return ParseResult::Incomplete;
         }
-        response.body.assign(buffer.begin() + header_end, buffer.begin() + header_end + body_size);
+        const auto header_off = static_cast<std::ptrdiff_t>(header_end);
+        const auto body_off = static_cast<std::ptrdiff_t>(body_size);
+        response.body.assign(buffer.begin() + header_off, buffer.begin() + header_off + body_off);
         bytes_consumed += body_size;
     } else {
-        auto te = response.get_header("Transfer-Encoding");
-        if (te && to_lower(*te).find("chunked") != std::string::npos) {
+        auto transfer_encoding_header = response.get_header("Transfer-Encoding");
+        if (transfer_encoding_header &&
+            to_lower(*transfer_encoding_header).find("chunked") != std::string::npos) {
             size_t chunk_bytes = 0;
-            ParseResult chunk_result =
-                parse_chunked_body(std::vector<uint8_t>(buffer.begin() + header_end, buffer.end()),
-                                   response.body, chunk_bytes);
+            ParseResult chunk_result = parse_chunked_body(
+                std::vector<uint8_t>(buffer.begin() + static_cast<std::ptrdiff_t>(header_end),
+                                     buffer.end()),
+                response.body, chunk_bytes);
             if (chunk_result != ParseResult::Success) {
                 return chunk_result;
             }
@@ -478,18 +497,18 @@ HTTPParser::ParseResult HTTPParser::parse_response(const std::vector<uint8_t>& b
     return ParseResult::Success;
 }
 
-size_t HTTPParser::parse_chunk_size(const std::string& line) {
+auto HTTPParser::parse_chunk_size(const std::string& line) -> size_t {
     // Chunk size is hex number per RFC 9112 Section 7.1
     try {
-        return std::stoull(line, nullptr, 16);
+        constexpr int kHexBase = 16;
+        return std::stoull(line, nullptr, kHexBase);
     } catch (...) {
         return 0;
     }
 }
 
-HTTPParser::ParseResult HTTPParser::parse_chunked_body(const std::vector<uint8_t>& buffer,
-                                                       std::vector<uint8_t>& body,
-                                                       size_t& bytes_consumed) {
+auto HTTPParser::parse_chunked_body(const std::vector<uint8_t>& buffer, std::vector<uint8_t>& body,
+                                    size_t& bytes_consumed) -> HTTPParser::ParseResult {
     bytes_consumed = 0;
     body.clear();
 
@@ -499,7 +518,7 @@ HTTPParser::ParseResult HTTPParser::parse_chunked_body(const std::vector<uint8_t
         // Find chunk size line (ends with CRLF)
         size_t crlf_pos = pos;
         while (crlf_pos + 1 < buffer.size() &&
-               !(buffer[crlf_pos] == '\r' && buffer[crlf_pos + 1] == '\n')) {
+               (buffer[crlf_pos] != '\r' || buffer[crlf_pos + 1] != '\n')) {
             crlf_pos++;
         }
 
@@ -507,7 +526,8 @@ HTTPParser::ParseResult HTTPParser::parse_chunked_body(const std::vector<uint8_t
             return ParseResult::Incomplete;
         }
 
-        std::string chunk_size_line(buffer.begin() + pos, buffer.begin() + crlf_pos);
+        std::string chunk_size_line(buffer.begin() + static_cast<std::ptrdiff_t>(pos),
+                                    buffer.begin() + static_cast<std::ptrdiff_t>(crlf_pos));
         size_t chunk_size = parse_chunk_size(chunk_size_line);
 
         pos = crlf_pos + 2; // Skip CRLF
@@ -526,7 +546,8 @@ HTTPParser::ParseResult HTTPParser::parse_chunked_body(const std::vector<uint8_t
             return ParseResult::Incomplete;
         }
 
-        body.insert(body.end(), buffer.begin() + pos, buffer.begin() + pos + chunk_size);
+        body.insert(body.end(), buffer.begin() + static_cast<std::ptrdiff_t>(pos),
+                    buffer.begin() + static_cast<std::ptrdiff_t>(pos + chunk_size));
         pos += chunk_size;
 
         // Skip CRLF after chunk data
@@ -538,5 +559,14 @@ HTTPParser::ParseResult HTTPParser::parse_chunked_body(const std::vector<uint8_t
 
     return ParseResult::Incomplete;
 }
+
+// NOLINTEND(
+//   modernize-use-trailing-return-type,
+//   cppcoreguidelines-narrowing-conversions,
+//   readability-identifier-length,
+//   readability-function-cognitive-complexity,
+//   cppcoreguidelines-avoid-magic-numbers,
+//   readability-magic-numbers
+// )
 
 } // namespace spaznet

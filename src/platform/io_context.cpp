@@ -1,6 +1,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <iostream>
 #include <libspaznet/platform/io_context.hpp>
@@ -19,18 +20,20 @@ IOContext::IOContext(std::size_t num_threads)
     }
 
     // Create wakeup pipe (non-blocking) so timer additions can interrupt wait().
-    int fds[2]{-1, -1};
-    if (pipe(fds) == 0) {
+    std::array<int, 2> fds{-1, -1};
+    if (pipe(fds.data()) == 0) {
         wake_read_fd_ = fds[0];
         wake_write_fd_ = fds[1];
         // Set non-blocking
         int flags = fcntl(wake_read_fd_, F_GETFL, 0);
         if (flags != -1) {
-            fcntl(wake_read_fd_, F_SETFL, flags | O_NONBLOCK);
+            fcntl(wake_read_fd_, F_SETFL,
+                  flags | O_NONBLOCK); // NOLINT(cppcoreguidelines-pro-type-vararg)
         }
         flags = fcntl(wake_write_fd_, F_GETFL, 0);
         if (flags != -1) {
-            fcntl(wake_write_fd_, F_SETFL, flags | O_NONBLOCK);
+            fcntl(wake_write_fd_, F_SETFL,
+                  flags | O_NONBLOCK); // NOLINT(cppcoreguidelines-pro-type-vararg)
         }
         // Register wake_read_fd_ for read events
         platform_io_->add_fd(wake_read_fd_, PlatformIO::EVENT_READ, nullptr);
@@ -61,23 +64,24 @@ IOContext::~IOContext() {
     }
 }
 
-void IOContext::wakeup_event_loop() {
+auto IOContext::wakeup_event_loop() const -> void {
     if (wake_write_fd_ < 0) {
         return;
     }
     // Write a single byte; ignore EAGAIN if pipe is full.
-    uint8_t b = 1;
-    (void)write(wake_write_fd_, &b, 1);
+    const uint8_t byte = 1;
+    (void)write(wake_write_fd_, &byte, 1);
 }
 
-void IOContext::drain_wakeup_pipe() {
+auto IOContext::drain_wakeup_pipe() const -> void {
     if (wake_read_fd_ < 0) {
         return;
     }
-    uint8_t buf[64];
+    constexpr std::size_t kDrainChunk = 64;
+    std::array<uint8_t, kDrainChunk> buffer{};
     for (;;) {
-        ssize_t n = read(wake_read_fd_, buf, sizeof(buf));
-        if (n <= 0) {
+        ssize_t bytes_read = read(wake_read_fd_, buffer.data(), buffer.size());
+        if (bytes_read <= 0) {
             break;
         }
     }
@@ -93,7 +97,8 @@ void IOContext::run() {
 
     // Main event loop
     std::vector<PlatformIO::Event> events;
-    events.reserve(64);
+    constexpr std::size_t kInitialEventCapacity = 64;
+    events.reserve(kInitialEventCapacity);
 
     while (running_.load(std::memory_order_acquire)) {
         // Process timers that are already due before waiting on I/O
@@ -180,16 +185,16 @@ void IOContext::worker_thread(std::size_t queue_index) {
     }
 }
 
-void IOContext::register_io(int fd, uint32_t events, std::coroutine_handle<> handle) {
+void IOContext::register_io(int file_descriptor, uint32_t events, std::coroutine_handle<> handle) {
     // Spinlock for map structure access only
     while (map_lock_.test_and_set(std::memory_order_acquire)) {
         // Spin - this is brief, just map access
     }
 
     // Determine whether this fd was already registered before storing new handles.
-    auto it = pending_io_.find(fd);
-    bool already_registered = it != pending_io_.end();
-    PendingIO& pending = already_registered ? it->second : pending_io_[fd];
+    auto pending_it = pending_io_.find(file_descriptor);
+    bool already_registered = pending_it != pending_io_.end();
+    PendingIO& pending = already_registered ? pending_it->second : pending_io_[file_descriptor];
 
     // Convert to our TaskPromise coroutine handle and keep it alive while registered.
     // NOTE: Storing only the raw address is not enough; the coroutine frame may be destroyed
@@ -198,10 +203,10 @@ void IOContext::register_io(int fd, uint32_t events, std::coroutine_handle<> han
     if (handle) {
         auto task_handle = std::coroutine_handle<TaskPromise>::from_address(handle.address());
         if (task_handle) {
-            if (events & PlatformIO::EVENT_READ) {
+            if ((events & PlatformIO::EVENT_READ) != 0) {
                 pending.read = CoroutineHandle::from_handle(task_handle);
             }
-            if (events & PlatformIO::EVENT_WRITE) {
+            if ((events & PlatformIO::EVENT_WRITE) != 0) {
                 pending.write = CoroutineHandle::from_handle(task_handle);
             }
         }
@@ -217,19 +222,19 @@ void IOContext::register_io(int fd, uint32_t events, std::coroutine_handle<> han
 
     // Keep the map lock until after add/modify to avoid rehash invalidating &pending.
     if (already_registered) {
-        platform_io_->modify_fd(fd, new_events, &pending);
+        platform_io_->modify_fd(file_descriptor, new_events, &pending);
     } else {
-        platform_io_->add_fd(fd, new_events, &pending);
+        platform_io_->add_fd(file_descriptor, new_events, &pending);
     }
 
     map_lock_.clear(std::memory_order_release);
 }
 
-void IOContext::remove_io(int fd) {
+void IOContext::remove_io(int file_descriptor) {
     while (map_lock_.test_and_set(std::memory_order_acquire)) {
         // Spin
     }
-    pending_io_.erase(fd);
+    pending_io_.erase(file_descriptor);
     map_lock_.clear(std::memory_order_release);
 }
 
@@ -243,31 +248,31 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
             // Spin
         }
 
-        for (const auto& ev : events) {
+        for (const auto& evt : events) {
             // Wakeup pipe event: drain and continue.
-            if (ev.fd == wake_read_fd_) {
+            if (evt.fd == wake_read_fd_) {
                 drain_wakeup_pipe();
                 continue;
             }
             // Look up by fd (safe), not by pointer (can be invalidated)
-            auto it = pending_io_.find(ev.fd);
-            if (it == pending_io_.end()) {
+            auto pending_it = pending_io_.find(evt.fd);
+            if (pending_it == pending_io_.end()) {
                 continue; // fd was removed
             }
 
-            PendingIO& pending = it->second;
+            PendingIO& pending = pending_it->second;
 
             bool changed = false;
-            if (ev.events & PlatformIO::EVENT_READ) {
+            if ((evt.events & PlatformIO::EVENT_READ) != 0) {
                 if (pending.read) {
-                    tasks_to_schedule.emplace_back(Task{std::move(pending.read)});
+                    tasks_to_schedule.emplace_back(std::move(pending.read));
                     pending.read = {};
                     changed = true;
                 }
             }
-            if (ev.events & PlatformIO::EVENT_WRITE) {
+            if ((evt.events & PlatformIO::EVENT_WRITE) != 0) {
                 if (pending.write) {
-                    tasks_to_schedule.emplace_back(Task{std::move(pending.write)});
+                    tasks_to_schedule.emplace_back(std::move(pending.write));
                     pending.write = {};
                     changed = true;
                 }
@@ -282,7 +287,7 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
                 if (pending.write) {
                     new_events |= PlatformIO::EVENT_WRITE;
                 }
-                platform_io_->modify_fd(ev.fd, new_events, &pending);
+                platform_io_->modify_fd(evt.fd, new_events, &pending);
             }
         }
 
@@ -296,10 +301,10 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
     }
 }
 
-uint64_t IOContext::add_timer(std::chrono::steady_clock::time_point first_fire,
-                              std::chrono::nanoseconds interval, bool repeat,
-                              std::shared_ptr<Task> task_ptr) {
-    uint64_t id = next_timer_id_.fetch_add(1, std::memory_order_relaxed);
+auto IOContext::add_timer(std::chrono::steady_clock::time_point first_fire,
+                          std::chrono::nanoseconds interval, bool repeat,
+                          const std::shared_ptr<Task>& task_ptr) -> uint64_t {
+    uint64_t timer_id = next_timer_id_.fetch_add(1, std::memory_order_relaxed);
     // Prevent zero-length repeating intervals from spinning
     if (repeat && interval.count() <= 0) {
         interval = std::chrono::milliseconds(1);
@@ -321,12 +326,12 @@ uint64_t IOContext::add_timer(std::chrono::steady_clock::time_point first_fire,
         if (task_ptr && task_ptr->handle) {
             suspended_tasks_[task_ptr->handle.address()] = task_ptr;
         }
-        timers_.push(TimerEntry{id, first_fire, interval, repeat, task_ptr});
+        timers_.push(TimerEntry{timer_id, first_fire, interval, repeat, task_ptr});
     }
     if (should_wake) {
         wakeup_event_loop();
     }
-    return id;
+    return timer_id;
 }
 
 void IOContext::cancel_timer(uint64_t timer_id) {
@@ -416,7 +421,7 @@ void IOContext::process_timers() {
     }
 }
 
-int IOContext::compute_wait_timeout_ms() {
+auto IOContext::compute_wait_timeout_ms() -> int {
     using namespace std::chrono;
     std::lock_guard<std::mutex> lock(timer_mutex_);
 
@@ -441,7 +446,8 @@ int IOContext::compute_wait_timeout_ms() {
         return static_cast<int>(clamped);
     }
 
-    return 100; // Default timeout when no timers are pending
+    constexpr int kDefaultTimeoutMs = 100;
+    return kDefaultTimeoutMs; // Default timeout when no timers are pending
 }
 
 } // namespace spaznet

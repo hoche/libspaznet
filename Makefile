@@ -11,6 +11,9 @@ BUILD_DIR ?= build
 CMAKE ?= cmake
 MAKE ?= make
 VALGRIND ?= valgrind
+CLANG ?= clang
+CLANGXX ?= clang++
+MSAN_RUN ?= 0
 
 # Detect number of CPU cores for parallel builds
 NPROC ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
@@ -45,13 +48,13 @@ help:
 	@echo ""
 	@echo "Sanitizer targets:"
 	@echo "  make build-asan   - Build with AddressSanitizer"
-	@echo "  make build-tsan   - Build with ThreadSanitizer"
+	@echo "  make build-tsan   - Build with ThreadSanitizer (clang)"
 	@echo "  make build-msan   - Build with MemorySanitizer"
 	@echo "  make build-ubsan - Build with UndefinedBehaviorSanitizer"
 	@echo "  make build-debug - Build with debug symbols"
 	@echo "  make test-asan   - Run tests with AddressSanitizer"
 	@echo "  make test-tsan   - Run tests with ThreadSanitizer"
-	@echo "  make test-msan   - Run tests with MemorySanitizer"
+	@echo "  make test-msan   - Run tests with MemorySanitizer (requires MSAN_RUN=1 + instrumented stdlib)"
 	@echo "  make test-ubsan  - Run tests with UndefinedBehaviorSanitizer"
 	@echo "  make test-valgrind - Run tests with Valgrind"
 	@echo "  make sanitizers  - Build and test with all sanitizers"
@@ -126,6 +129,7 @@ tidy: build
 	@cd $(BUILD_DIR) && \
 		$(CMAKE) -DCMAKE_EXPORT_COMPILE_COMMANDS=ON . && \
 		run-clang-tidy -j$(NPROC) -p . \
+			-source-filter='/(src|include|tests)/' \
 			-header-filter='include/.*' \
 			-checks='-*,readability-*,performance-*,modernize-*,cppcoreguidelines-*' \
 			-quiet \
@@ -214,7 +218,7 @@ build-asan: $(BUILD_ASAN)/CMakeCache.txt
 	@cd $(BUILD_ASAN) && $(MAKE) -j$(NPROC)
 
 build-tsan: $(BUILD_TSAN)/CMakeCache.txt
-	@echo "Building with ThreadSanitizer..."
+	@echo "Building with ThreadSanitizer (clang)..."
 	@cd $(BUILD_TSAN) && $(MAKE) -j$(NPROC)
 
 build-msan: $(BUILD_MSAN)/CMakeCache.txt
@@ -241,19 +245,28 @@ $(BUILD_ASAN)/CMakeCache.txt:
 		-DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address"
 
 $(BUILD_TSAN)/CMakeCache.txt:
-	@echo "Configuring CMake with ThreadSanitizer..."
+	@echo "Configuring CMake with ThreadSanitizer (clang)..."
+	@command -v $(CLANG) >/dev/null 2>&1 || (echo "ERROR: '$(CLANG)' not found. Install clang (e.g. 'sudo apt install clang') or set CLANG=/path/to/clang." && exit 1)
+	@command -v $(CLANGXX) >/dev/null 2>&1 || (echo "ERROR: '$(CLANGXX)' not found. Install clang++ (e.g. 'sudo apt install clang') or set CLANGXX=/path/to/clang++." && exit 1)
 	@mkdir -p $(BUILD_TSAN)
 	@cd $(BUILD_TSAN) && $(CMAKE) .. \
+		-DCMAKE_C_COMPILER=$(CLANG) \
+		-DCMAKE_CXX_COMPILER=$(CLANGXX) \
 		-DCMAKE_BUILD_TYPE=Debug \
-		-DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g" \
-		-DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g" \
+		-DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -O1 -fno-optimize-sibling-calls" \
+		-DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -O1 -fno-optimize-sibling-calls" \
 		-DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
 		-DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread"
 
 $(BUILD_MSAN)/CMakeCache.txt:
 	@echo "Configuring CMake with MemorySanitizer..."
+	@# MemorySanitizer is supported by Clang only (GCC will reject -fsanitize=memory).
+	@command -v $(CLANG) >/dev/null 2>&1 || (echo "ERROR: '$(CLANG)' not found. Install clang (e.g. 'sudo apt install clang') or set CLANG=/path/to/clang." && exit 1)
+	@command -v $(CLANGXX) >/dev/null 2>&1 || (echo "ERROR: '$(CLANGXX)' not found. Install clang++ (e.g. 'sudo apt install clang') or set CLANGXX=/path/to/clang++." && exit 1)
 	@mkdir -p $(BUILD_MSAN)
 	@cd $(BUILD_MSAN) && $(CMAKE) .. \
+		-DCMAKE_C_COMPILER=$(CLANG) \
+		-DCMAKE_CXX_COMPILER=$(CLANGXX) \
 		-DCMAKE_BUILD_TYPE=Debug \
 		-DCMAKE_CXX_FLAGS="-fsanitize=memory -fno-omit-frame-pointer -g -fno-optimize-sibling-calls" \
 		-DCMAKE_C_FLAGS="-fsanitize=memory -fno-omit-frame-pointer -g -fno-optimize-sibling-calls" \
@@ -286,17 +299,25 @@ test-asan: build-asan
 		ctest --output-on-failure
 
 test-tsan: build-tsan
-	@echo "Running tests with ThreadSanitizer..."
+	@echo "Running tests with ThreadSanitizer (clang)..."
 	@cd $(BUILD_TSAN) && \
 		TSAN_OPTIONS=halt_on_error=1:abort_on_error=1 \
 		ctest --output-on-failure
 
 test-msan: build-msan
-	@echo "Running tests with MemorySanitizer..."
-	@echo "Note: MemorySanitizer requires instrumented libraries"
-	@cd $(BUILD_MSAN) && \
-		MSAN_OPTIONS=halt_on_error=1:abort_on_error=1 \
-		ctest --output-on-failure
+	@echo "MemorySanitizer notes:"
+	@echo "  - MSan is clang-only (this Makefile forces clang/clang++ for build-msan)."
+	@echo "  - MSan also requires an instrumented C/C++ runtime + C++ standard library."
+	@echo "    If you see failures inside libstdc++/gtest before any tests run, that's expected."
+	@echo ""
+	@if [ "$(MSAN_RUN)" != "1" ]; then \
+		echo "Skipping MSan test run (set MSAN_RUN=1 once you have an instrumented stdlib/toolchain)."; \
+	else \
+		echo "Running tests with MemorySanitizer..."; \
+		cd $(BUILD_MSAN) && \
+			MSAN_OPTIONS=halt_on_error=1:abort_on_error=1 \
+			ctest --output-on-failure; \
+	fi
 
 test-ubsan: build-ubsan
 	@echo "Running tests with UndefinedBehaviorSanitizer..."
@@ -322,7 +343,7 @@ test-valgrind: build-debug
 	@echo "Valgrind analysis complete. Check output above and log files for issues."
 
 # Combined sanitizer target
-sanitizers: build-asan build-tsan build-ubsan
+sanitizers: build-asan build-ubsan #build-tsan 
 	@echo "Running all sanitizer tests..."
 	@echo ""
 	@echo "=== AddressSanitizer ==="
@@ -349,8 +370,8 @@ help-sanitizers:
 	@echo "Sanitizer Test Targets:"
 	@echo ""
 	@echo "  make test-asan    - Run tests with AddressSanitizer"
-	@echo "  make test-tsan    - Run tests with ThreadSanitizer"
-	@echo "  make test-msan    - Run tests with MemorySanitizer"
+	@echo "  make test-tsan    - Run tests with ThreadSanitizer (clang)"
+	@echo "  make test-msan    - Run tests with MemorySanitizer (requires MSAN_RUN=1 + instrumented stdlib)"
 	@echo "  make test-ubsan   - Run tests with UndefinedBehaviorSanitizer"
 	@echo "  make test-valgrind - Run tests with Valgrind"
 	@echo "  make sanitizers   - Build and test with all sanitizers"

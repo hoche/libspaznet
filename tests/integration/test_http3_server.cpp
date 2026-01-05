@@ -5,6 +5,7 @@
 #include <libspaznet/handlers/quic_handler.hpp>
 #include <libspaznet/server.hpp>
 #include <memory>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -55,6 +56,37 @@ std::vector<uint8_t> recv_udp(int fd, size_t max_size) {
         return buffer;
     }
     return {};
+}
+
+std::vector<uint8_t> build_h3_headers_payload(const std::string& method,
+                                              const std::string& path = "/",
+                                              const std::string& scheme = "https",
+                                              const std::string& authority = "localhost") {
+    std::vector<uint8_t> h3;
+    h3.push_back(0x01); // HEADERS frame type
+    std::ostringstream oss;
+    oss << method << " " << path << " " << scheme << " " << authority << "\r\n";
+    oss << "user-agent: test\r\n";
+    oss << "\r\n";
+    auto s = oss.str();
+    h3.insert(h3.end(), s.begin(), s.end());
+    return h3;
+}
+
+std::vector<uint8_t> build_quic_packet(uint64_t stream_id, const std::vector<uint8_t>& payload,
+                                       bool fin) {
+    ConnectionID dest;
+    dest.bytes = {0x01, 0x02, 0x03, 0x04};
+    ConnectionID src;
+    src.bytes = {0x05, 0x06, 0x07, 0x08};
+    auto conn = std::make_shared<QUICConnection>(dest, src);
+
+    QUICStreamFrame frame;
+    frame.stream_id = stream_id;
+    frame.offset = 0;
+    frame.data = payload;
+    frame.fin = fin;
+    return conn->build_packet(QUICPacketType::Initial, {frame});
 }
 
 } // namespace
@@ -147,28 +179,8 @@ TEST_F(HTTP3ServerTest, EndToEndRequestResponse) {
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 
-    // Toy HTTP/3 HEADERS frame:
-    // - first byte is frame type (1 = Headers)
-    // - payload is text; first line is "METHOD PATH SCHEME AUTHORITY"
-    std::vector<uint8_t> h3;
-    h3.push_back(0x01); // HEADERS frame type
-    const std::string headers = "GET / https localhost\r\n"
-                                "user-agent: test\r\n"
-                                "\r\n";
-    h3.insert(h3.end(), headers.begin(), headers.end());
-
-    ConnectionID dest;
-    dest.bytes = {0x01, 0x02, 0x03, 0x04};
-    ConnectionID src;
-    src.bytes = {0x05, 0x06, 0x07, 0x08};
-    auto conn = std::make_shared<QUICConnection>(dest, src);
-    QUICStreamFrame frame;
-    frame.stream_id = 0;
-    frame.offset = 0;
-    frame.data = std::move(h3);
-    frame.fin = true;
-
-    std::vector<uint8_t> packet = conn->build_packet(QUICPacketType::Initial, {frame});
+    std::vector<uint8_t> packet =
+        build_quic_packet(0, build_h3_headers_payload("GET"), /*fin=*/true);
     ASSERT_TRUE(send_udp(client_fd, packet, port));
 
     // Give server time to process.
@@ -185,4 +197,97 @@ TEST_F(HTTP3ServerTest, EndToEndRequestResponse) {
     EXPECT_NE(resp_str.find("GET"), std::string::npos); // body echoes method in handler
 
     EXPECT_GE(handler->request_count.load(), 1);
+}
+
+TEST_F(HTTP3ServerTest, MultipleStreamsProduceMultipleResponses) {
+    int client_fd = create_udp_socket();
+    ASSERT_GE(client_fd, 0);
+
+#ifndef _WIN32
+    struct timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
+    ASSERT_TRUE(send_udp(
+        client_fd, build_quic_packet(0, build_h3_headers_payload("GET"), /*fin=*/true), port));
+    ASSERT_TRUE(send_udp(
+        client_fd, build_quic_packet(4, build_h3_headers_payload("POST"), /*fin=*/true), port));
+
+    // Read up to two responses.
+    std::vector<std::string> responses;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (responses.size() < 2 && std::chrono::steady_clock::now() < deadline) {
+        auto resp = recv_udp(client_fd, 64 * 1024);
+        if (!resp.empty()) {
+            responses.emplace_back(resp.begin(), resp.end());
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+    }
+
+    close_socket(client_fd);
+
+    ASSERT_NE(handler, nullptr);
+    EXPECT_GE(handler->request_count.load(), 2);
+
+    ASSERT_GE(responses.size(), 2u);
+    bool saw_get = false;
+    bool saw_post = false;
+    for (const auto& s : responses) {
+        EXPECT_NE(s.find(":status 200"), std::string::npos);
+        if (s.find("GET") != std::string::npos) {
+            saw_get = true;
+        }
+        if (s.find("POST") != std::string::npos) {
+            saw_post = true;
+        }
+    }
+    EXPECT_TRUE(saw_get);
+    EXPECT_TRUE(saw_post);
+}
+
+TEST_F(HTTP3ServerTest, RequestIsHandledOnlyAfterFin) {
+    int client_fd = create_udp_socket();
+    ASSERT_GE(client_fd, 0);
+
+#ifndef _WIN32
+    // Short timeout for "no response yet" check.
+    struct timeval tv_short;
+    tv_short.tv_sec = 0;
+    tv_short.tv_usec = 200000;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv_short, sizeof(tv_short));
+#endif
+
+    auto full = build_h3_headers_payload("GET");
+    ASSERT_GT(full.size(), 8u);
+    std::vector<uint8_t> part1(full.begin(), full.begin() + 5);
+    std::vector<uint8_t> part2(full.begin() + 5, full.end());
+
+    // Send without FIN: should not trigger handler or response.
+    ASSERT_TRUE(send_udp(client_fd, build_quic_packet(0, part1, /*fin=*/false), port));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_NE(handler, nullptr);
+    EXPECT_EQ(handler->request_count.load(), 0);
+    auto no_resp = recv_udp(client_fd, 64 * 1024);
+    EXPECT_TRUE(no_resp.empty());
+
+#ifndef _WIN32
+    // Restore longer timeout for real response.
+    struct timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
+    ASSERT_TRUE(send_udp(client_fd, build_quic_packet(0, part2, /*fin=*/true), port));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_GE(handler->request_count.load(), 1);
+    auto resp = recv_udp(client_fd, 64 * 1024);
+    close_socket(client_fd);
+
+    ASSERT_FALSE(resp.empty());
+    std::string resp_str(resp.begin(), resp.end());
+    EXPECT_NE(resp_str.find(":status 200"), std::string::npos);
 }

@@ -14,6 +14,10 @@
 #include <syslog.h>
 #endif
 
+// Logger/formatting utilities intentionally use macros and low-level buffer manipulation for speed.
+// Suppress noisy clang-tidy checks in this header to keep analysis actionable.
+// NOLINTBEGIN
+
 namespace spaznet {
 
 // Log levels - higher value = more verbose
@@ -439,5 +443,7 @@ struct SimpleFormatter {
     do {                                                                                           \
     } while (0)
 #endif
+
+// NOLINTEND
 
 } // namespace spaznet

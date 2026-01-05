@@ -1,10 +1,3 @@
-#include <arpa/inet.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -29,11 +22,38 @@
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <cerrno>
 #define close_socket ::close
 #endif
+
+// This translation unit is intentionally low-level (socket I/O, protocol parsing) and uses many
+// protocol-defined constants (e.g. bitmasks, opcodes, fixed header sizes). We suppress a few
+// noisy style checks here to keep clang-tidy signal high for the rest of the codebase.
+// NOLINTBEGIN(
+//   cppcoreguidelines-avoid-magic-numbers,
+//   readability-magic-numbers,
+//   readability-identifier-length,
+//   modernize-use-trailing-return-type,
+//   modernize-avoid-c-arrays,
+//   cppcoreguidelines-avoid-c-arrays,
+//   cppcoreguidelines-pro-bounds-constant-array-index,
+//   cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+//   cppcoreguidelines-pro-bounds-pointer-arithmetic,
+//   cppcoreguidelines-pro-type-reinterpret-cast,
+//   cppcoreguidelines-pro-type-vararg,
+//   cppcoreguidelines-pro-type-member-init,
+//   readability-implicit-bool-conversion,
+//   readability-isolate-declaration,
+//   readability-make-member-function-const,
+//   readability-convert-member-functions-to-static,
+//   readability-function-cognitive-complexity,
+//   cppcoreguidelines-avoid-reference-coroutine-parameters,
+//   cppcoreguidelines-avoid-capturing-lambda-coroutines
+// )
 
 namespace spaznet {
 
@@ -602,7 +622,7 @@ Task Server::receive_udp(int udp_fd) {
         }
 
         if (quic_engine) {
-            co_await quic_engine->handle_datagram(udp_fd, addr, addr_len, buffer);
+            co_await quic_engine->handle_datagram(udp_fd, addr, addr_len, std::move(buffer));
         }
     }
 
@@ -1063,5 +1083,27 @@ void Server::stop() {
         close_socket(fd);
     }
 }
+
+// NOLINTEND(
+//   cppcoreguidelines-avoid-magic-numbers,
+//   readability-magic-numbers,
+//   readability-identifier-length,
+//   modernize-use-trailing-return-type,
+//   modernize-avoid-c-arrays,
+//   cppcoreguidelines-avoid-c-arrays,
+//   cppcoreguidelines-pro-bounds-constant-array-index,
+//   cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+//   cppcoreguidelines-pro-bounds-pointer-arithmetic,
+//   cppcoreguidelines-pro-type-reinterpret-cast,
+//   cppcoreguidelines-pro-type-vararg,
+//   cppcoreguidelines-pro-type-member-init,
+//   readability-implicit-bool-conversion,
+//   readability-isolate-declaration,
+//   readability-make-member-function-const,
+//   readability-convert-member-functions-to-static,
+//   readability-function-cognitive-complexity,
+//   cppcoreguidelines-avoid-reference-coroutine-parameters,
+//   cppcoreguidelines-avoid-capturing-lambda-coroutines
+// )
 
 } // namespace spaznet

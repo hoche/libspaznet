@@ -18,8 +18,8 @@ class QUICServerEngine {
 
     // Process one UDP datagram received on `udp_fd` from `addr` and optionally send responses
     // back via sendto() on the same socket.
-    auto handle_datagram(int udp_fd, const sockaddr_storage& addr, socklen_t addr_len,
-                         const std::vector<uint8_t>& datagram) -> Task;
+    auto handle_datagram(int udp_fd, sockaddr_storage addr, socklen_t addr_len,
+                         std::vector<uint8_t> datagram) -> Task;
 
   private:
     QUICHandler* quic_handler_{nullptr};

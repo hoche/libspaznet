@@ -31,6 +31,23 @@ int create_udp_socket() {
     return fd;
 }
 
+std::vector<uint8_t> build_quic_stream_packet(uint64_t stream_id, const std::vector<uint8_t>& data,
+                                              bool fin) {
+    ConnectionID dest;
+    dest.bytes = {0x01, 0x02, 0x03, 0x04};
+    ConnectionID src;
+    src.bytes = {0x05, 0x06, 0x07, 0x08};
+    auto conn = std::make_shared<QUICConnection>(dest, src);
+
+    QUICStreamFrame frame;
+    frame.stream_id = stream_id;
+    frame.offset = 0;
+    frame.data = data;
+    frame.fin = fin;
+
+    return conn->build_packet(QUICPacketType::Initial, {frame});
+}
+
 bool send_udp(int fd, const std::vector<uint8_t>& data, uint16_t port) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -112,18 +129,8 @@ TEST_F(QUICServerTest, ReceivesUDPPacket) {
     int client_fd = create_udp_socket();
     ASSERT_GE(client_fd, 0);
 
-    // Build a toy QUIC packet containing a STREAM frame so the server can notify the handler.
-    ConnectionID dest;
-    dest.bytes = {0x01, 0x02, 0x03, 0x04};
-    ConnectionID src;
-    src.bytes = {0x05, 0x06, 0x07, 0x08};
-    auto conn = std::make_shared<QUICConnection>(dest, src);
-    QUICStreamFrame frame;
-    frame.stream_id = 0;
-    frame.offset = 0;
-    frame.data = {'p', 'i', 'n', 'g'};
-    frame.fin = true;
-    std::vector<uint8_t> test_data = conn->build_packet(QUICPacketType::Initial, {frame});
+    std::vector<uint8_t> test_data =
+        build_quic_stream_packet(0, std::vector<uint8_t>{'p', 'i', 'n', 'g'}, true);
 
     ASSERT_TRUE(send_udp(client_fd, test_data, port));
 
@@ -134,4 +141,45 @@ TEST_F(QUICServerTest, ReceivesUDPPacket) {
     EXPECT_GE(handler->stream_data_count.load(), 1);
 
     close_socket(client_fd);
+}
+
+TEST_F(QUICServerTest, ConnectionCallbackOncePerRemote) {
+    int client_fd = create_udp_socket();
+    ASSERT_GE(client_fd, 0);
+
+    // Send two packets from the same socket/remote endpoint.
+    ASSERT_TRUE(send_udp(
+        client_fd, build_quic_stream_packet(0, std::vector<uint8_t>{'a'}, /*fin=*/true), port));
+    ASSERT_TRUE(send_udp(
+        client_fd, build_quic_stream_packet(4, std::vector<uint8_t>{'b'}, /*fin=*/true), port));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    ASSERT_NE(handler, nullptr);
+    EXPECT_EQ(handler->connection_count.load(), 1);
+    EXPECT_GE(handler->stream_data_count.load(), 2);
+
+    close_socket(client_fd);
+}
+
+TEST_F(QUICServerTest, ConnectionCallbackPerRemote) {
+    int client_fd1 = create_udp_socket();
+    int client_fd2 = create_udp_socket();
+    ASSERT_GE(client_fd1, 0);
+    ASSERT_GE(client_fd2, 0);
+
+    // Send one packet from each socket (different local ports => different remote endpoints).
+    ASSERT_TRUE(send_udp(
+        client_fd1, build_quic_stream_packet(0, std::vector<uint8_t>{'x'}, /*fin=*/true), port));
+    ASSERT_TRUE(send_udp(
+        client_fd2, build_quic_stream_packet(0, std::vector<uint8_t>{'y'}, /*fin=*/true), port));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    ASSERT_NE(handler, nullptr);
+    EXPECT_GE(handler->connection_count.load(), 2);
+    EXPECT_GE(handler->stream_data_count.load(), 2);
+
+    close_socket(client_fd1);
+    close_socket(client_fd2);
 }

@@ -52,12 +52,15 @@ TEST(IOContextTimerTest, SleepForFiresOnce) {
 TEST(IOContextTimerTest, IntervalStaysPeriodic) {
     IOContext ctx(1);
     std::vector<std::chrono::steady_clock::time_point> ticks;
+    ticks.reserve(3);
+    std::atomic<int> tick_count{0};
 
     auto task = [&]() -> Task {
         // Capture three ticks
         for (int i = 0; i < 3; ++i) {
             co_await ctx.interval(30ms);
             ticks.push_back(std::chrono::steady_clock::now());
+            tick_count.fetch_add(1, std::memory_order_relaxed);
         }
     };
 
@@ -69,7 +72,7 @@ TEST(IOContextTimerTest, IntervalStaysPeriodic) {
 
     // Wait up to a reasonable deadline for 3 ticks (avoid flaky fixed sleeps).
     int attempts = 0;
-    while (ticks.size() < 3 && attempts < 200) { // 200 * 5ms = 1s
+    while (tick_count.load(std::memory_order_relaxed) < 3 && attempts < 200) { // 200 * 5ms = 1s
         std::this_thread::sleep_for(5ms);
         ++attempts;
     }
@@ -77,6 +80,7 @@ TEST(IOContextTimerTest, IntervalStaysPeriodic) {
     ctx.stop();
     runner.join();
 
+    ASSERT_EQ(tick_count.load(std::memory_order_relaxed), 3);
     ASSERT_EQ(ticks.size(), 3);
 
     auto delta1 =
