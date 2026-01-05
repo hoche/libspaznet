@@ -11,11 +11,12 @@ A high-performance, cross-platform network server library written in C++20 using
   - IOCP on Windows
 
 - **Coroutine-based async I/O:** Uses C++20 coroutines as the primary execution model
-- **Thread-safe:** Multi-threaded with lock-free task queues (minimal mutex usage)
+- **Thread-safe:** Can run either Single-threaded or multi-threaded with lock-free task queues (minimal mutex usage)
 - **Protocol support:**
   - UDP
   - HTTP/1.1
   - HTTP/2
+  - QUIC & HTTP/3 (partial)
   - WebSockets
 
 ## Quick Start
@@ -113,6 +114,8 @@ Or run tests individually:
 - HTTP handler (request/response serialization)
 - WebSocket handler (frame parsing and serialization)
 - HTTP/2 handler (frame structure)
+- QUIC handler
+- HTTP/3 handler (partial)
 
 **Integration Tests:**
 - TCP server (connection handling, multiple ports)
@@ -214,7 +217,7 @@ int main() {
 - **Server:** High-level server interface
 - **Handlers:** Protocol-specific request handlers (UDP, HTTP, HTTP/2, WebSocket)
 
-The library uses C++20 coroutines for async operations, with threads only used to run multiple coroutines in parallel. Task scheduling is lock-free using atomic operations.
+The library uses C++20 coroutines for async operations, optionally with threads only used to run multiple coroutines in parallel. Task scheduling is lock-free using atomic operations.
 
 ## Requirements
 
@@ -227,7 +230,7 @@ The library uses C++20 coroutines for async operations, with threads only used t
 - clang-format (for code formatting)
 - clang-tidy (for static analysis)
 - cppcheck (for additional static analysis)
-- iperf3 (for performance benchmarking)
+- iperf2 or iperf3 (for performance benchmarking)
 
 ## Development Workflow
 
