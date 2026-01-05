@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <cstring>
 #include <libspaznet/handlers/quic_handler.hpp>
-#include <libspaznet/server.hpp>
 #include <stdexcept>
 
 namespace spaznet {
@@ -58,8 +57,8 @@ void QUICStream::close() {
 }
 
 // QUICConnection implementation
-QUICConnection::QUICConnection(ConnectionID dest_conn_id, ConnectionID src_conn_id, Socket& socket)
-    : dest_conn_id_(dest_conn_id), src_conn_id_(src_conn_id), socket_(socket),
+QUICConnection::QUICConnection(ConnectionID dest_conn_id, ConnectionID src_conn_id)
+    : dest_conn_id_(std::move(dest_conn_id)), src_conn_id_(std::move(src_conn_id)),
       state_(QUICConnectionState::Handshake), next_stream_id_(0), max_stream_id_(100) {}
 
 std::shared_ptr<QUICStream> QUICConnection::get_stream(uint64_t stream_id) {
@@ -78,9 +77,11 @@ std::shared_ptr<QUICStream> QUICConnection::get_stream(uint64_t stream_id) {
     return stream;
 }
 
-Task QUICConnection::process_packet(const std::vector<uint8_t>& packet) {
+bool QUICConnection::process_packet(const std::vector<uint8_t>& packet,
+                                    std::vector<QUICStreamFrame>& frames_out) {
+    frames_out.clear();
     if (packet.empty()) {
-        co_return;
+        return false;
     }
 
     QUICPacketType type;
@@ -88,7 +89,15 @@ Task QUICConnection::process_packet(const std::vector<uint8_t>& packet) {
     std::vector<QUICStreamFrame> frames;
 
     if (!parse_packet(packet, type, dest_id, src_id, frames)) {
-        co_return;
+        return false;
+    }
+
+    // Update connection IDs if packet carried them (long header).
+    if (!dest_id.bytes.empty()) {
+        dest_conn_id_ = dest_id;
+    }
+    if (!src_id.bytes.empty()) {
+        src_conn_id_ = src_id;
     }
 
     // Process frames
@@ -109,35 +118,13 @@ Task QUICConnection::process_packet(const std::vector<uint8_t>& packet) {
         }
     }
 
-    // Send acknowledgment if needed
-    if (!frames.empty()) {
-        std::vector<QUICStreamFrame> ack_frames;
-        auto response = serialize_packet(QUICPacketType::OneRTT, ack_frames);
-        co_await socket_.async_write(std::move(response));
-    }
+    frames_out = std::move(frames);
+    return true;
 }
 
-Task QUICConnection::send_stream_data(uint64_t stream_id, const std::vector<uint8_t>& data,
-                                      bool fin) {
-    auto stream = get_stream(stream_id);
-    if (!stream) {
-        co_return;
-    }
-
-    QUICStreamFrame frame;
-    frame.stream_id = stream_id;
-    frame.offset = stream->send_offset_;
-    frame.data = data;
-    frame.fin = fin;
-
-    stream->send_offset_ += data.size();
-    if (fin) {
-        stream->send_fin_ = true;
-    }
-
-    std::vector<QUICStreamFrame> frames = {frame};
-    auto packet = serialize_packet(QUICPacketType::OneRTT, frames);
-    co_await socket_.async_write(std::move(packet));
+std::vector<uint8_t> QUICConnection::build_packet(
+    QUICPacketType type, const std::vector<QUICStreamFrame>& frames) const {
+    return serialize_packet(type, frames);
 }
 
 Task QUICConnection::close() {
@@ -207,19 +194,15 @@ bool QUICConnection::parse_packet(const std::vector<uint8_t>& packet, QUICPacket
         if ((frame_type & 0x08) != 0) {
             QUICStreamFrame frame;
 
-            // Stream ID (variable length)
-            uint64_t stream_id = 0;
-            int stream_id_len = 0;
-            if ((frame_type & 0x07) < 3) {
-                stream_id_len = (frame_type & 0x07) + 1;
-            } else {
-                stream_id_len = 4 + ((frame_type & 0x07) - 3) * 4;
-            }
-
-            if (packet.size() < offset + stream_id_len) {
+            // Stream ID length + Stream ID (toy encoding: 1 byte length, then big-endian ID)
+            if (packet.size() < offset + 1) {
                 break;
             }
-
+            uint8_t stream_id_len = packet[offset++];
+            if (stream_id_len == 0 || packet.size() < offset + stream_id_len) {
+                break;
+            }
+            uint64_t stream_id = 0;
             for (int i = 0; i < stream_id_len; ++i) {
                 stream_id = (stream_id << 8) | packet[offset++];
             }
@@ -227,7 +210,13 @@ bool QUICConnection::parse_packet(const std::vector<uint8_t>& packet, QUICPacket
 
             // Offset (if present)
             if ((frame_type & 0x04) != 0) {
+                if (packet.size() < offset + 1) {
+                    break;
+                }
                 uint8_t offset_len = packet[offset++];
+                if (packet.size() < offset + offset_len) {
+                    break;
+                }
                 frame.offset = 0;
                 for (int i = 0; i < offset_len; ++i) {
                     frame.offset = (frame.offset << 8) | packet[offset++];
@@ -239,7 +228,13 @@ bool QUICConnection::parse_packet(const std::vector<uint8_t>& packet, QUICPacket
             // Length (if present)
             uint64_t length = 0;
             if ((frame_type & 0x02) != 0) {
+                if (packet.size() < offset + 1) {
+                    break;
+                }
                 uint8_t length_len = packet[offset++];
+                if (packet.size() < offset + length_len) {
+                    break;
+                }
                 for (int i = 0; i < length_len; ++i) {
                     length = (length << 8) | packet[offset++];
                 }
@@ -264,16 +259,14 @@ bool QUICConnection::parse_packet(const std::vector<uint8_t>& packet, QUICPacket
     return true;
 }
 
-std::vector<uint8_t> QUICConnection::serialize_packet(QUICPacketType type,
-                                                      const std::vector<QUICStreamFrame>& frames) {
+std::vector<uint8_t> QUICConnection::serialize_packet(
+    QUICPacketType type, const std::vector<QUICStreamFrame>& frames) const {
     std::vector<uint8_t> packet;
 
     if (type == QUICPacketType::OneRTT) {
         // Short header (RFC9000 Section 17.3.1)
-        packet.push_back(0x40); // Fixed bits: 01 (short header)
-
-        // Destination Connection ID (already known)
-        packet.insert(packet.end(), dest_conn_id_.bytes.begin(), dest_conn_id_.bytes.end());
+        // Use bit 7 set to distinguish from long header in this toy parser.
+        packet.push_back(0x80); // Short header marker (toy)
     } else {
         // Long header
         uint8_t first_byte = static_cast<uint8_t>(type) << 4;
@@ -297,24 +290,7 @@ std::vector<uint8_t> QUICConnection::serialize_packet(QUICPacketType type,
     // Serialize frames
     for (const auto& frame : frames) {
         // STREAM frame
-        uint8_t frame_type = 0x08; // STREAM frame base
-
-        // Determine stream ID length
-        uint64_t stream_id = frame.stream_id;
-        int stream_id_bytes = 0;
-        if (stream_id < (1ULL << 8)) {
-            stream_id_bytes = 1;
-            frame_type |= 0x00;
-        } else if (stream_id < (1ULL << 16)) {
-            stream_id_bytes = 2;
-            frame_type |= 0x01;
-        } else if (stream_id < (1ULL << 24)) {
-            stream_id_bytes = 3;
-            frame_type |= 0x02;
-        } else {
-            stream_id_bytes = 4;
-            frame_type |= 0x03;
-        }
+        uint8_t frame_type = 0x08; // STREAM frame base (toy)
 
         // Offset present
         if (frame.offset > 0) {
@@ -330,6 +306,20 @@ std::vector<uint8_t> QUICConnection::serialize_packet(QUICPacketType type,
         }
 
         packet.push_back(frame_type);
+
+        // Stream ID length (toy encoding) + Stream ID (big-endian)
+        uint64_t stream_id = frame.stream_id;
+        int stream_id_bytes = 0;
+        if (stream_id < (1ULL << 8)) {
+            stream_id_bytes = 1;
+        } else if (stream_id < (1ULL << 16)) {
+            stream_id_bytes = 2;
+        } else if (stream_id < (1ULL << 24)) {
+            stream_id_bytes = 3;
+        } else {
+            stream_id_bytes = 4;
+        }
+        packet.push_back(static_cast<uint8_t>(stream_id_bytes));
 
         // Stream ID
         for (int i = stream_id_bytes - 1; i >= 0; --i) {

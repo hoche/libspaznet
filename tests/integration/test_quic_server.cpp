@@ -79,9 +79,10 @@ class TestQUICHandler : public QUICHandler {
 class QUICServerTest : public ::testing::Test {
   protected:
     void SetUp() override {
-        handler = std::make_unique<TestQUICHandler>();
+        auto handler_unique = std::make_unique<TestQUICHandler>();
+        handler = handler_unique.get();
         server = std::make_unique<Server>(2);
-        server->set_quic_handler(std::make_unique<TestQUICHandler>());
+        server->set_quic_handler(std::move(handler_unique));
         port = 8888;
         server->listen_udp(port);
 
@@ -97,7 +98,7 @@ class QUICServerTest : public ::testing::Test {
     }
 
     uint16_t port{};
-    std::unique_ptr<TestQUICHandler> handler;
+    TestQUICHandler* handler{};
     std::unique_ptr<Server> server;
     std::thread server_thread;
 };
@@ -111,10 +112,26 @@ TEST_F(QUICServerTest, ReceivesUDPPacket) {
     int client_fd = create_udp_socket();
     ASSERT_GE(client_fd, 0);
 
-    std::vector<uint8_t> test_data = {0xC0, 0x00, 0x00, 0x00, 0x01}; // Simple QUIC-like packet
+    // Build a toy QUIC packet containing a STREAM frame so the server can notify the handler.
+    ConnectionID dest;
+    dest.bytes = {0x01, 0x02, 0x03, 0x04};
+    ConnectionID src;
+    src.bytes = {0x05, 0x06, 0x07, 0x08};
+    auto conn = std::make_shared<QUICConnection>(dest, src);
+    QUICStreamFrame frame;
+    frame.stream_id = 0;
+    frame.offset = 0;
+    frame.data = {'p', 'i', 'n', 'g'};
+    frame.fin = true;
+    std::vector<uint8_t> test_data = conn->build_packet(QUICPacketType::Initial, {frame});
+
     ASSERT_TRUE(send_udp(client_fd, test_data, port));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    ASSERT_NE(handler, nullptr);
+    EXPECT_GE(handler->connection_count.load(), 1);
+    EXPECT_GE(handler->stream_data_count.load(), 1);
 
     close_socket(client_fd);
 }

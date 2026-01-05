@@ -13,6 +13,7 @@
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <libspaznet/handlers/quic_server.hpp>
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/server.hpp>
 #include <map>
@@ -528,8 +529,84 @@ void Server::listen_udp(uint16_t port) {
 
     freeaddrinfo(result);
 
-    // For now, UDP just binds - actual packet handling would need a receive loop
-    // This is a simplified implementation
+    running_.store(true);
+    {
+        std::lock_guard<std::mutex> lock(listen_fds_mutex_);
+        listen_fds_.push_back(udp_fd);
+    }
+    io_context_->schedule(receive_udp(udp_fd));
+}
+
+Task Server::receive_udp(int udp_fd) {
+    struct ReadableAwaiter {
+        IOContext* ctx;
+        int fd;
+        [[nodiscard]] bool await_ready() const noexcept {
+            return false;
+        }
+        void await_suspend(std::coroutine_handle<> h) const {
+            ctx->register_io(fd, PlatformIO::EVENT_READ, h);
+        }
+        void await_resume() const noexcept {}
+    };
+
+    Socket udp_socket(udp_fd, io_context_.get(), /*owns_fd=*/false);
+    std::optional<QUICServerEngine> quic_engine;
+    if (quic_handler_ || http3_handler_) {
+        quic_engine.emplace(quic_handler_.get(), http3_handler_.get());
+    }
+
+    while (running_.load(std::memory_order_acquire)) {
+        std::vector<uint8_t> buffer(64 * 1024);
+        sockaddr_storage addr{};
+        socklen_t addr_len = sizeof(addr);
+
+        ssize_t received = recvfrom(udp_fd, buffer.data(), buffer.size(), 0,
+                                    reinterpret_cast<struct sockaddr*>(&addr), &addr_len);
+
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                co_await ReadableAwaiter{io_context_.get(), udp_fd};
+                continue;
+            }
+            break;
+        }
+
+        if (received == 0) {
+            continue;
+        }
+
+        buffer.resize(static_cast<size_t>(received));
+
+        if (udp_handler_) {
+            UDPPacket pkt;
+            pkt.data = buffer;
+            // Best-effort address/port fill for diagnostics.
+            char host[INET6_ADDRSTRLEN]{};
+            uint16_t port = 0;
+            if (addr.ss_family == AF_INET) {
+                const auto* a = reinterpret_cast<const sockaddr_in*>(&addr);
+                inet_ntop(AF_INET, &a->sin_addr, host, sizeof(host));
+                port = ntohs(a->sin_port);
+            } else if (addr.ss_family == AF_INET6) {
+                const auto* a6 = reinterpret_cast<const sockaddr_in6*>(&addr);
+                inet_ntop(AF_INET6, &a6->sin6_addr, host, sizeof(host));
+                port = ntohs(a6->sin6_port);
+            }
+            pkt.address = host;
+            pkt.port = port;
+            co_await udp_handler_->handle_packet(pkt, udp_socket);
+        }
+
+        if (quic_engine) {
+            co_await quic_engine->handle_datagram(udp_fd, addr, addr_len, buffer);
+        }
+    }
+
+    co_return;
 }
 
 Task Server::accept_connections(int listen_fd) {
