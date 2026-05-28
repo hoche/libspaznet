@@ -83,7 +83,14 @@ class PlatformIOEpoll : public PlatformIO {
 
     auto wait(std::vector<Event>& events, int timeout_ms) -> int override {
         std::array<epoll_event, MAX_EVENTS> epoll_events{};
-        int nfds = epoll_wait(epoll_fd_, epoll_events.data(), MAX_EVENTS, timeout_ms);
+        // EINTR is not a real error: a debugger attach, SIGWINCH, or any
+        // benign signal can wake epoll_wait. Retry transparently so the
+        // event loop survives. (Note: we do not adjust timeout_ms — the
+        // worst case is one extra brief loop iteration.)
+        int nfds;
+        do {
+            nfds = epoll_wait(epoll_fd_, epoll_events.data(), MAX_EVENTS, timeout_ms);
+        } while (nfds < 0 && errno == EINTR);
 
         if (nfds < 0) {
             return -1;
@@ -106,7 +113,12 @@ class PlatformIOEpoll : public PlatformIO {
                 event.events |= EVENT_WRITE;
             }
             if ((epoll_events[i].events & (EPOLLERR | EPOLLHUP)) != 0U) {
-                event.events |= EVENT_ERROR;
+                // EPOLLHUP without EPOLLIN means the peer closed cleanly;
+                // any read-waiter must be woken so recv() can return 0
+                // (orderly EOF). Without this, a reader registered for
+                // EVENT_READ would sleep forever on a half-closed
+                // connection.
+                event.events |= EVENT_READ | EVENT_ERROR;
             }
 
             events.push_back(event);

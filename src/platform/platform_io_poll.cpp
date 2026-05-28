@@ -102,7 +102,11 @@ class PlatformIOPoll : public PlatformIO {
             return 0;
         }
 
-        int nfds = poll(pollfds_.data(), pollfds_.size(), timeout_ms);
+        // EINTR is benign; retry so the loop survives signals.
+        int nfds;
+        do {
+            nfds = poll(pollfds_.data(), pollfds_.size(), timeout_ms);
+        } while (nfds < 0 && errno == EINTR);
 
         if (nfds < 0) {
             return -1;
@@ -126,7 +130,13 @@ class PlatformIOPoll : public PlatformIO {
             if ((pfd.revents & POLLOUT) != 0U) {
                 event.events |= EVENT_WRITE;
             }
-            if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0U) {
+            if ((pfd.revents & (POLLERR | POLLHUP)) != 0U) {
+                // Wake any read-waiter on EOF so recv() can return 0
+                // for an orderly half-close. POLLNVAL means the fd was
+                // closed under us — flag only as an error.
+                event.events |= EVENT_READ | EVENT_ERROR;
+            }
+            if ((pfd.revents & POLLNVAL) != 0U) {
                 event.events |= EVENT_ERROR;
             }
 
