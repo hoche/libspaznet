@@ -187,6 +187,21 @@ void IOContext::stop() {
 }
 
 void IOContext::schedule(Task task) {
+    // Single-thread fast path: with no worker threads to hand off to,
+    // putting the task on a queue just so the I/O thread will dequeue
+    // it next loop iteration is pure overhead — a fetch_add, an atomic
+    // lock acquire/release on the queue, a wakeup pipe write, and a
+    // queue dequeue on the way back. Resume inline instead.
+    //
+    // (Multi-thread mode still uses the round-robin queues so workers
+    // can pick up tasks in parallel.)
+    if (num_threads_ == 0) {
+        if (task.handle && !task.done()) {
+            task.resume();
+        }
+        return;
+    }
+
     // With reference counting, we can safely enqueue the task
     // The handle won't be destroyed while any Task references it
     // Round-robin scheduling
