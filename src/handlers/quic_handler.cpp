@@ -26,13 +26,23 @@ constexpr uint8_t kLongHeaderMarkerMask = 0x80;
 constexpr uint8_t kPacketTypeMask = 0x07;
 constexpr uint8_t kStreamFrameTypeBit = 0x08;
 constexpr int kBitsPerByte = 8;
-constexpr uint8_t kByteMask = 0xFF;
 } // namespace
 
-// QUICStream implementation
+// QUICStream implementation. The initializer order below matches the
+// declaration order in quic_handler.hpp (receive_offset_, send_offset_
+// are declared before stream_id_, bidirectional_, state_). Out-of-order
+// initializer lists are silently honored as declaration order by the
+// compiler, so the previous "logical" ordering was a latent footgun;
+// realign to silence -Wreorder-ctor and document the constraint.
 QUICStream::QUICStream(uint64_t stream_id, bool bidirectional)
-    : stream_id_(stream_id), bidirectional_(bidirectional), state_(QUICStreamState::Idle),
-      receive_offset_(0), send_offset_(0), receive_fin_(false), send_fin_(false) {
+    // Order matches quic_handler.hpp's declaration order: the public
+    // section declares receive_offset_, send_offset_, receive_fin_,
+    // send_fin_ before the private section's stream_id_, bidirectional_,
+    // state_. C++ honors declaration order regardless of how the
+    // initializer list is written; making the list match silences
+    // -Wreorder-ctor and removes a latent footgun.
+    : receive_offset_(0), send_offset_(0), receive_fin_(false), send_fin_(false),
+      stream_id_(stream_id), bidirectional_(bidirectional), state_(QUICStreamState::Idle) {
     if (bidirectional) {
         state_ = QUICStreamState::Open;
     }

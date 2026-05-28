@@ -216,8 +216,12 @@ class HTTP2Connection {
   private:
     HTTP2Settings settings_;
     std::unordered_map<uint32_t, HTTP2StreamState> streams_;
-    uint32_t next_stream_id_{};
-    bool client_preface_received_{};
+    // Placeholders for the unfinished HTTP/2 connection state machine
+    // (server-initiated stream id allocation, client preface tracking).
+    // The audit flagged them as unused; keep them so the wiring is in
+    // place for the rewrite, and silence the warning.
+    [[maybe_unused]] uint32_t next_stream_id_{};
+    [[maybe_unused]] bool client_preface_received_{};
 
     void initialize_stream(uint32_t stream_id);
     void close_stream(uint32_t stream_id);

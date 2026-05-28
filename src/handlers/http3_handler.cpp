@@ -65,7 +65,12 @@ void write_varint(std::vector<uint8_t>& out, uint64_t value, int prefix_bits) {
     }
 }
 
-// Parse HTTP/3 HEADERS frame (RFC9114 Section 7.2.2)
+// Parse HTTP/3 HEADERS frame (RFC9114 Section 7.2.2). The current
+// HTTP/3 wiring still parses headers inline in quic_server.cpp; these
+// helpers are kept as a reference scaffold for the eventual switch to
+// QPACK + nghttp3 (see TODO.md). [[maybe_unused]] silences the
+// dead-code warning without losing the reference implementation.
+[[maybe_unused]]
 bool parse_headers_frame(const std::vector<uint8_t>& data, HTTP3Request& request) {
     if (data.empty()) {
         return false;
@@ -123,7 +128,8 @@ bool parse_headers_frame(const std::vector<uint8_t>& data, HTTP3Request& request
     return true;
 }
 
-// Serialize HTTP/3 HEADERS frame
+// Serialize HTTP/3 HEADERS frame — scaffold; see note above.
+[[maybe_unused]]
 std::vector<uint8_t> serialize_headers_frame(const HTTP3Response& response) {
     std::vector<uint8_t> frame;
 
@@ -145,7 +151,8 @@ std::vector<uint8_t> serialize_headers_frame(const HTTP3Response& response) {
     return frame;
 }
 
-// Serialize HTTP/3 DATA frame
+// Serialize HTTP/3 DATA frame — scaffold; see note above.
+[[maybe_unused]]
 std::vector<uint8_t> serialize_data_frame(const std::vector<uint8_t>& data) {
     std::vector<uint8_t> frame;
 
