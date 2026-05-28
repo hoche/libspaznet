@@ -429,6 +429,37 @@ TEST_F(RFC9112ParserTest, TooManyHeadersIsError) {
     EXPECT_EQ(result, HTTPParser::ParseResult::Error);
 }
 
+// parse_request must be idempotent across calls that share the same
+// output request: a server that re-parses an extended buffer after an
+// Incomplete result must observe the same successful parse as a
+// single-shot call. The framing-headers fix introduced in commit
+// 0559935 regressed this — re-parsing concatenated each header into
+// itself via parse_header_field's duplicate-merge path, producing
+// "Content-Length: 10000, 10000" on the second attempt and failing
+// validation. Exercised end-to-end by the LargeRequestBody
+// integration test; this is the unit-level guard.
+TEST_F(RFC9112ParserTest, ParseRequestIsIdempotentOnReparse) {
+    std::string headers = "POST /x HTTP/1.1\r\n"
+                          "Host: example.com\r\n"
+                          "Content-Length: 5\r\n"
+                          "\r\n";
+    std::string full = headers + "hello";
+
+    HTTPRequest request;
+    size_t bytes_consumed = 0;
+
+    std::vector<uint8_t> partial(headers.begin(), headers.end());
+    auto r1 = HTTPParser::parse_request(partial, request, bytes_consumed);
+    EXPECT_EQ(r1, HTTPParser::ParseResult::Incomplete);
+
+    std::vector<uint8_t> complete(full.begin(), full.end());
+    auto r2 = HTTPParser::parse_request(complete, request, bytes_consumed);
+    EXPECT_EQ(r2, HTTPParser::ParseResult::Success);
+    EXPECT_EQ(request.method, "POST");
+    EXPECT_EQ(request.headers["Content-Length"], "5");
+    EXPECT_EQ(std::string(request.body.begin(), request.body.end()), "hello");
+}
+
 // A peer-declared Content-Length above kMaxBodySize is rejected without
 // allocating that buffer.
 TEST_F(RFC9112ParserTest, OversizeContentLengthIsError) {

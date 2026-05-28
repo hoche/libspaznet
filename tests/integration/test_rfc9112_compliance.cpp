@@ -398,7 +398,9 @@ TEST_F(RFC9112IntegrationTest, CaseInsensitiveHeaders) {
     EXPECT_NE(response.find("HTTP/1.1 200 OK"), std::string::npos);
 }
 
-// Test large request body
+// Test large request body — verifies the parser handles incomplete →
+// extended-buffer re-parses idempotently (the body arrives across
+// multiple async_read iterations on the server side).
 TEST_F(RFC9112IntegrationTest, LargeRequestBody) {
     std::string body(10000, 'A');
     std::string request = "POST /test HTTP/1.1\r\n"
@@ -407,6 +409,12 @@ TEST_F(RFC9112IntegrationTest, LargeRequestBody) {
                           "\r\n" +
                           body;
 
-    std::string response = send_request(request);
+    int sock = connect_to_server();
+    ASSERT_GE(sock, 0);
+    ssize_t sent = send(sock, request.c_str(), request.size(), MSG_NOSIGNAL);
+    ASSERT_EQ(static_cast<size_t>(sent), request.size());
+
+    std::string response = read_response(sock);
+    close_socket(sock);
     EXPECT_NE(response.find("HTTP/1.1 200 OK"), std::string::npos);
 }

@@ -519,6 +519,21 @@ HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& bu
                                                   HTTPRequest& request, size_t& bytes_consumed) {
     bytes_consumed = 0;
 
+    // Reset the output so this function is idempotent: a caller that
+    // re-invokes us with an extended buffer (because the first call
+    // returned Incomplete) must observe the same parsed result as
+    // calling us once with the full buffer. Without this, the
+    // per-field "merge duplicates by concatenating" path in
+    // parse_header_field would append every header again on every
+    // retry — turning "Content-Length: 10000" into
+    // "Content-Length: 10000, 10000" and tripping the framing
+    // validator.
+    request.method.clear();
+    request.request_target.clear();
+    request.version.clear();
+    request.headers.clear();
+    request.body.clear();
+
     // Bounded search for end of headers (CRLF CRLF). Refusing to scan past
     // kMaxHeaderBytes defeats Slowloris-style header drips.
     size_t header_end = 0;
@@ -612,6 +627,15 @@ HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& bu
 auto HTTPParser::parse_response(const std::vector<uint8_t>& buffer, HTTPResponse& response,
                                 size_t& bytes_consumed) -> HTTPParser::ParseResult {
     bytes_consumed = 0;
+
+    // Same idempotence story as parse_request — clear the output so a
+    // retry on an extended buffer doesn't accumulate duplicate
+    // headers via parse_header_field's list-merge path.
+    response.version.clear();
+    response.status_code = 0;
+    response.reason_phrase.clear();
+    response.headers.clear();
+    response.body.clear();
 
     size_t header_end = 0;
     switch (find_header_end(buffer, kMaxHeaderBytes, header_end)) {
