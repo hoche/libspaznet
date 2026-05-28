@@ -1,5 +1,9 @@
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -7,14 +11,44 @@
 #include <libspaznet/platform/io_context.hpp>
 #include <libspaznet/platform/platform_io.hpp>
 #include <limits>
+#include <mutex>
 
 namespace spaznet {
+
+#ifdef _WIN32
+namespace {
+// Initialize Winsock exactly once per process. Calling WSAStartup is
+// required before any socket() / send() / recv() / etc. — without it,
+// every Winsock call returns WSANOTINITIALISED and connections fail
+// in confusing ways far from the actual root cause. We pair it with
+// std::atexit so WSACleanup runs at process exit; for libraries
+// embedded in a larger process this avoids reference-counting the
+// init/cleanup pair ourselves.
+void ensure_winsock_initialised() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        WSADATA wsa_data;
+        const int err = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+        if (err != 0) {
+            throw std::runtime_error("WSAStartup failed");
+        }
+        std::atexit([]() { WSACleanup(); });
+    });
+}
+} // namespace
+#endif // _WIN32
 
 IOContext::IOContext(std::size_t num_threads)
     : platform_io_(create_platform_io()),
       thread_queues_(std::max<std::size_t>(1, num_threads == 0 ? 1 : num_threads)), running_(false),
       next_queue_(0), num_threads_(num_threads),
       queue_count_(std::max<std::size_t>(1, num_threads == 0 ? 1 : num_threads)) {
+#ifdef _WIN32
+    // Must run before platform_io_->init() — IOCP itself, and every
+    // socket call the demultiplexer subsequently makes, depends on
+    // Winsock being initialised.
+    ensure_winsock_initialised();
+#endif
     if (!platform_io_->init()) {
         throw std::runtime_error("Failed to initialize platform I/O");
     }

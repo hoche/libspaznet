@@ -1,11 +1,22 @@
 cmake_minimum_required(VERSION 3.20)
 project(libspaznet VERSION 1.0.0 LANGUAGES CXX)
 
+# ---- Language settings --------------------------------------------------
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Platform detection
+# Threads: pull pthread (or the platform equivalent) in via the modern
+# imported target so we don't rely on the compiler implicitly linking
+# libpthread.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
+# CMake helpers for install(EXPORT) below.
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+# ---- Platform demultiplexer selection -----------------------------------
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(USE_EPOLL ON)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME MATCHES "BSD")
@@ -16,10 +27,7 @@ else()
     set(USE_POLL ON)
 endif()
 
-# Include directories
-include_directories(include)
-
-# Source files
+# ---- Source / header lists ----------------------------------------------
 set(SOURCES
     src/platform/io_context.cpp
     src/platform/platform_io.cpp
@@ -37,7 +45,6 @@ set(SOURCES
     src/server_impl.cpp
 )
 
-# Header files
 set(HEADERS
     include/libspaznet/io_context.hpp
     include/libspaznet/platform_io.hpp
@@ -58,10 +65,25 @@ set(HEADERS
     include/libspaznet/server.hpp
 )
 
-# Create library
+# ---- Library target -----------------------------------------------------
 add_library(spaznet STATIC ${SOURCES} ${HEADERS})
+add_library(spaznet::spaznet ALIAS spaznet)
 
-# Platform-specific sources
+target_compile_features(spaznet PUBLIC cxx_std_20)
+
+# Target-scoped include directories. PUBLIC for the in-tree build; the
+# $<INSTALL_INTERFACE:> path is used after install() so downstream
+# find_package consumers see the installed layout instead of the source
+# tree.
+target_include_directories(spaznet
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+
+target_link_libraries(spaznet PUBLIC Threads::Threads)
+
+# Platform-specific compile defs.
 if(USE_EPOLL)
     target_compile_definitions(spaznet PRIVATE USE_EPOLL)
 elseif(USE_KQUEUE)
@@ -72,31 +94,112 @@ else()
     target_compile_definitions(spaznet PRIVATE USE_POLL)
 endif()
 
-# Windows-specific
+# Winsock + IOCP support libraries.
 if(WIN32)
-    target_link_libraries(spaznet ws2_32 mswsock)
+    target_link_libraries(spaznet PUBLIC ws2_32 mswsock)
 endif()
 
-# Example executable
-add_executable(example example/server.cpp)
-target_link_libraries(example spaznet)
+# Warnings. Applied to library + tests + example via the helper below.
+#
+#  -Wall / -Wextra / -Wpedantic:  the baseline catch-alls.
+#  -Wno-unused-parameter:         -Wextra enables -Wunused-parameter, which
+#    fires on every handler override that ignores its `Socket&` argument
+#    (a common, valid pattern). Suppress it globally rather than
+#    annotating every method with [[maybe_unused]].
+#  -Wconversion / -Wshadow:       intentionally NOT enabled yet — both
+#    fire dozens of times across existing code; cleaning them up is a
+#    separate, bounded project.
+set(spaznet_warning_flags "")
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    set(spaznet_warning_flags -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    set(spaznet_warning_flags /W4 /permissive-)
+endif()
 
-# Installation
+function(spaznet_apply_warnings target)
+    target_compile_options(${target} PRIVATE ${spaznet_warning_flags})
+endfunction()
+
+# Tests and benchmarks accumulate scratch — helper functions used by
+# only some of the tests in a TU, lambda captures retained for clarity,
+# variables held for breakpoints. Don't promote those to errors; keep
+# -Wall/-Wextra signal-worthy bits only.
+set(spaznet_test_warning_flags ${spaznet_warning_flags})
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    list(APPEND spaznet_test_warning_flags
+        -Wno-unused-function
+        -Wno-unused-variable
+        -Wno-unused-but-set-variable
+        -Wno-unused-lambda-capture)
+endif()
+
+function(spaznet_apply_test_warnings target)
+    target_compile_options(${target} PRIVATE ${spaznet_test_warning_flags})
+endfunction()
+
+spaznet_apply_warnings(spaznet)
+
+# ---- Example ------------------------------------------------------------
+add_executable(example example/server.cpp)
+target_link_libraries(example PRIVATE spaznet)
+spaznet_apply_warnings(example)
+
+# ---- Install + find_package config --------------------------------------
 install(TARGETS spaznet
-    ARCHIVE DESTINATION lib
-    LIBRARY DESTINATION lib
-    RUNTIME DESTINATION bin
+    EXPORT spaznetTargets
+    ARCHIVE  DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY  DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME  DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
 install(DIRECTORY include/libspaznet
-    DESTINATION include
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING PATTERN "*.hpp"
 )
 
-# Testing
+# Export the target set into <prefix>/lib/cmake/spaznet/ so downstream
+# CMake projects can `find_package(spaznet)` and link `spaznet::spaznet`.
+install(EXPORT spaznetTargets
+    FILE spaznetTargets.cmake
+    NAMESPACE spaznet::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/spaznet
+)
+
+# Generate a config file that pulls in spaznetTargets.cmake and re-runs
+# find_package(Threads) (so downstream sees the same pthread linkage).
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/spaznetConfig.cmake.in"
+"@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+include(\"\${CMAKE_CURRENT_LIST_DIR}/spaznetTargets.cmake\")
+
+check_required_components(spaznet)
+")
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/spaznetConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/spaznetConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/spaznet
+)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/spaznetConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/spaznetConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/spaznetConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/spaznet
+)
+
+# ---- Tests --------------------------------------------------------------
 enable_testing()
 
-# Fetch Google Test
 include(FetchContent)
 FetchContent_Declare(
     googletest
@@ -105,7 +208,19 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(googletest)
 
-# Unit tests
+# Treat googletest headers as SYSTEM so its own warnings (e.g.
+# -Wcharacter-conversion in gtest-printers.h) don't surface every
+# time we rebuild.
+foreach(gtest_target gtest gtest_main gmock gmock_main)
+    if(TARGET ${gtest_target})
+        get_target_property(_gtest_inc ${gtest_target} INTERFACE_INCLUDE_DIRECTORIES)
+        if(_gtest_inc)
+            set_target_properties(${gtest_target} PROPERTIES
+                INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_gtest_inc}")
+        endif()
+    endif()
+endforeach()
+
 add_executable(test_unit
     tests/test_main.cpp
     tests/unit/test_task_queue.cpp
@@ -120,14 +235,9 @@ add_executable(test_unit
     tests/unit/test_rfc9113_parser.cpp
     tests/unit/test_logger.cpp
 )
+target_link_libraries(test_unit PRIVATE spaznet GTest::gtest GTest::gmock)
+spaznet_apply_test_warnings(test_unit)
 
-target_link_libraries(test_unit
-    spaznet
-    GTest::gtest
-    GTest::gmock
-)
-
-# Integration tests
 add_executable(test_integration
     tests/test_main.cpp
     tests/integration/test_tcp_server.cpp
@@ -141,14 +251,9 @@ add_executable(test_integration
     tests/integration/test_quic_server.cpp
     tests/integration/test_http3_server.cpp
 )
+target_link_libraries(test_integration PRIVATE spaznet GTest::gtest GTest::gmock)
+spaznet_apply_test_warnings(test_integration)
 
-target_link_libraries(test_integration
-    spaznet
-    GTest::gtest
-    GTest::gmock
-)
-
-# Performance tests
 add_executable(test_performance
     tests/test_main.cpp
     tests/performance/test_throughput.cpp
@@ -160,21 +265,15 @@ add_executable(test_performance
     tests/performance/test_websocket_rfc6455_performance.cpp
     tests/performance/test_quic_performance.cpp
 )
+target_link_libraries(test_performance PRIVATE spaznet GTest::gtest GTest::gmock)
+spaznet_apply_test_warnings(test_performance)
 
-target_link_libraries(test_performance
-    spaznet
-    GTest::gtest
-    GTest::gmock
-)
-
-# Thread-mode benchmark runner (prints a Markdown report). Not added to CTest by default.
 add_executable(bench_thread_modes
     tests/performance/bench_thread_modes.cpp
 )
-target_link_libraries(bench_thread_modes spaznet)
+target_link_libraries(bench_thread_modes PRIVATE spaznet)
+spaznet_apply_test_warnings(bench_thread_modes)
 
-# Add tests to CTest
 add_test(NAME UnitTests COMMAND test_unit)
 add_test(NAME IntegrationTests COMMAND test_integration)
 add_test(NAME PerformanceTests COMMAND test_performance)
-

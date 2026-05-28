@@ -157,8 +157,12 @@ class QUICConnection {
     ConnectionID src_conn_id_;
     QUICConnectionState state_;
     std::unordered_map<uint64_t, std::shared_ptr<QUICStream>> streams_;
-    uint64_t next_stream_id_;
-    uint64_t max_stream_id_;
+    // Placeholders for the unfinished QUIC connection state machine
+    // (stream id allocation, peer-advertised max stream id). Audit
+    // flagged them as unused; retained so the rewrite has the field
+    // names in place.
+    [[maybe_unused]] uint64_t next_stream_id_;
+    [[maybe_unused]] uint64_t max_stream_id_;
 
     // Parse QUIC packet
     auto parse_packet(const std::vector<uint8_t>& packet, QUICPacketType& type,
