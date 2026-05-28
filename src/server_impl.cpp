@@ -272,70 +272,93 @@ std::string compute_websocket_accept(const std::string& key) {
 } // namespace
 
 // Socket implementation
+//
+// Awaiter design notes:
+//   - await_ready() does ONE non-blocking recv/send. On success or hard
+//     error it returns true and the syscall's result is read by
+//     await_resume(). On EAGAIN/EWOULDBLOCK/EINTR it suspends the
+//     coroutine, registering EVENT_READ/EVENT_WRITE with the IOContext.
+//   - await_resume() does ONE more recv/send after wakeup and returns the
+//     ssize_t directly. No sleep_for, no retry loop inside the awaiter —
+//     spurious wakeups are handled by the outer co_await loop, which
+//     re-enters the awaiter (and thus re-registers with epoll) without
+//     blocking a worker thread.
+//   - The outer Task body distinguishes:
+//        result  > 0  → got data,  buffer resized, return.
+//        result == 0  → orderly EOF, buffer cleared, return.
+//        result <  0  + EAGAIN/EWOULDBLOCK/EINTR → spurious; re-await.
+//        result <  0  otherwise → hard error, buffer cleared, return.
+
+namespace {
+
+bool is_retryable_errno(int e) {
+    return e == EAGAIN || e == EWOULDBLOCK || e == EINTR;
+}
+
+} // namespace
+
 Task Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
     buffer.resize(size);
 
-    struct ReadAwaiter {
-        Socket* socket;
-        std::vector<uint8_t>* buffer;
-        std::size_t size;
-        mutable ssize_t result = 0;
-        mutable bool ready = false;
+    while (true) {
+        struct ReadAwaiter {
+            Socket* socket;
+            std::vector<uint8_t>* buffer;
+            std::size_t size;
+            mutable ssize_t result = 0;
+            mutable int saved_errno = 0;
+            mutable bool ready_flag = false;
 
-        bool await_ready() const noexcept {
-            // Try to read immediately
-            result = recv(socket->fd(), buffer->data(), size, 0);
-            if (result >= 0) {
-                ready = true;
+            bool await_ready() const noexcept {
+                result = recv(socket->fd(), buffer->data(), size, 0);
+                if (result >= 0) {
+                    ready_flag = true;
+                    return true;
+                }
+                saved_errno = errno;
+                if (is_retryable_errno(saved_errno)) {
+                    ready_flag = false;
+                    return false;
+                }
+                ready_flag = true;
                 return true;
             }
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-                ready = false;
-                return false;
+
+            void await_suspend(std::coroutine_handle<> h) {
+                socket->context()->register_io(socket->fd(), PlatformIO::EVENT_READ, h);
             }
-            ready = true;
-            return true;
-        }
 
-        void await_suspend(std::coroutine_handle<> h) {
-            // Register for read event
-            socket->context()->register_io(socket->fd(), PlatformIO::EVENT_READ, h);
-        }
-
-        ssize_t await_resume() noexcept {
-            if (!ready) {
-                // Try reading again after resume - data should be available
-                // A few retries handle spurious wakeups and data arriving in chunks
-                for (int i = 0; i < 3; ++i) {
+            ssize_t await_resume() noexcept {
+                if (!ready_flag) {
                     result = recv(socket->fd(), buffer->data(), size, 0);
-                    trace_log("async_read fd=" + std::to_string(socket->fd()) + " attempt=" +
-                              std::to_string(i) + " result=" + std::to_string(result) +
-                              " errno=" + std::to_string(errno));
-                    if (result >= 0 ||
-                        (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
-                        break;
-                    }
-                    // Brief delay for data to arrive
-                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                    saved_errno = (result < 0) ? errno : 0;
                 }
+                return result;
             }
-            if (result > 0) {
-                buffer->resize(result);
-            } else {
-                // Treat zero (connection closed) or negative (errors) as no data read.
-                buffer->clear();
-            }
-            trace_log("async_read fd=" + std::to_string(socket->fd()) +
-                      " final_result=" + std::to_string(result));
-            return result;
+        };
+
+        ReadAwaiter awaiter{this, &buffer, size};
+        ssize_t result = co_await awaiter;
+
+        if (result > 0) {
+            buffer.resize(static_cast<std::size_t>(result));
+            co_return;
         }
-    };
-
-    ReadAwaiter awaiter{this, &buffer, size};
-    ssize_t result = co_await awaiter;
-
-    if (result < 0) {
+        if (result == 0) {
+            // Peer closed the connection (orderly EOF).
+            buffer.clear();
+            co_return;
+        }
+        // result < 0
+        if (is_retryable_errno(awaiter.saved_errno)) {
+            // Spurious wakeup or interrupted syscall — re-await. No
+            // sleeping: the IOContext will resume us when data really is
+            // available.
+            continue;
+        }
+        // Hard error.
         buffer.clear();
+        co_return;
     }
 }
 
@@ -348,45 +371,32 @@ Task Socket::async_write(std::vector<uint8_t> data) {
             const uint8_t* data_ptr;
             std::size_t remaining;
             mutable ssize_t result = 0;
-            mutable bool ready = false;
+            mutable int saved_errno = 0;
+            mutable bool ready_flag = false;
 
             bool await_ready() const noexcept {
-                // Try to write immediately
                 result = send(socket->fd(), data_ptr, remaining, MSG_NOSIGNAL);
                 if (result >= 0) {
-                    ready = true;
-                    return true; // Wrote some data
+                    ready_flag = true;
+                    return true;
                 }
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-                    ready = false;
-                    return false; // Would block, need to suspend
+                saved_errno = errno;
+                if (is_retryable_errno(saved_errno)) {
+                    ready_flag = false;
+                    return false;
                 }
-                // Error occurred
-                ready = true;
+                ready_flag = true;
                 return true;
             }
 
             void await_suspend(std::coroutine_handle<> h) {
-                // Register for write event
                 socket->context()->register_io(socket->fd(), PlatformIO::EVENT_WRITE, h);
             }
 
             ssize_t await_resume() noexcept {
-                if (!ready) {
-                    // Try writing again after resume - socket should be writable
-                    for (int i = 0; i < 3; ++i) {
-                        result = send(socket->fd(), data_ptr, remaining, MSG_NOSIGNAL);
-                        if (result >= 0 ||
-                            (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
-                            break;
-                        }
-                        // Brief delay for socket to become writable
-                        std::this_thread::sleep_for(std::chrono::microseconds(500));
-                    }
-                }
-                // On error or connection closed, report zero to break the write loop gracefully.
-                if (result < 0) {
-                    return 0;
+                if (!ready_flag) {
+                    result = send(socket->fd(), data_ptr, remaining, MSG_NOSIGNAL);
+                    saved_errno = (result < 0) ? errno : 0;
                 }
                 return result;
             }
@@ -395,11 +405,24 @@ Task Socket::async_write(std::vector<uint8_t> data) {
         WriteAwaiter awaiter{this, data.data() + total_sent, data.size() - total_sent};
         ssize_t sent = co_await awaiter;
 
-        if (sent <= 0) {
-            break; // Error or connection closed
+        if (sent > 0) {
+            total_sent += static_cast<std::size_t>(sent);
+            continue;
         }
-
-        total_sent += sent;
+        if (sent == 0) {
+            // send() returning 0 is highly unusual; treat as broken pipe
+            // and exit so the caller (which sees a partial write via
+            // unchanged total_sent / closed socket on next op) can
+            // recover.
+            break;
+        }
+        // sent < 0
+        if (is_retryable_errno(awaiter.saved_errno)) {
+            // Spurious EAGAIN — re-await without sleeping.
+            continue;
+        }
+        // Hard error.
+        break;
     }
 }
 
@@ -701,6 +724,35 @@ Task Server::handle_connection(Socket socket) {
         co_return;
     }
 
+    // RAII guard: track this connection from entry to exit (including
+    // exception unwinds and every co_return path below). Server::stop()
+    // waits on active_connections_ reaching zero so it can drain in-flight
+    // work before the IOContext is destroyed, and walks active_client_fds_
+    // to shutdown() each fd so any suspended recv/send fails out.
+    struct ConnectionGuard {
+        Server* server;
+        int fd;
+        ConnectionGuard(Server* s, int f) : server(s), fd(f) {
+            {
+                std::lock_guard<std::mutex> lock(server->client_fds_mutex_);
+                server->active_client_fds_.insert(fd);
+            }
+            server->active_connections_.fetch_add(1, std::memory_order_acq_rel);
+        }
+        ~ConnectionGuard() {
+            {
+                std::lock_guard<std::mutex> lock(server->client_fds_mutex_);
+                server->active_client_fds_.erase(fd);
+            }
+            server->active_connections_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        ConnectionGuard(const ConnectionGuard&) = delete;
+        ConnectionGuard& operator=(const ConnectionGuard&) = delete;
+        ConnectionGuard(ConnectionGuard&&) = delete;
+        ConnectionGuard& operator=(ConnectionGuard&&) = delete;
+    };
+    ConnectionGuard guard(this, socket.fd());
+
     try {
         std::vector<uint8_t> buffer;
         co_await socket.async_read(buffer, 2048);
@@ -855,40 +907,21 @@ Task Server::handle_connection(Socket socket) {
                       std::to_string(socket.fd()));
 
             auto read_exact = [&](std::size_t n, std::vector<uint8_t>& out) -> Task {
+                // async_read returns an empty buffer only on orderly EOF
+                // or a hard error — in either case we stop and let the
+                // caller see a short read via out.size() < n. Spurious
+                // EAGAIN wakeups are already absorbed inside async_read's
+                // own re-await loop, so no sleep_for is needed here.
                 out.clear();
-                std::size_t remaining = n;
-                int empty_attempts = 0;
-                const int max_empty = 20; // Allow retries for small frames arriving slowly
-                trace_log("read_exact: want=" + std::to_string(n) +
-                          " bytes, fd=" + std::to_string(socket.fd()));
-                while (remaining > 0) {
+                out.reserve(n);
+                while (out.size() < n) {
                     std::vector<uint8_t> tmp;
-                    co_await socket.async_read(tmp, remaining);
-                    trace_log("read_exact: got " + std::to_string(tmp.size()) + " bytes, " +
-                              "remaining=" + std::to_string(remaining) +
-                              ", fd=" + std::to_string(socket.fd()));
+                    co_await socket.async_read(tmp, n - out.size());
                     if (tmp.empty()) {
-                        // Empty read might be transient - retry with backoff
-                        if (++empty_attempts > max_empty) {
-                            trace_log("read_exact: too many empty reads, giving up, fd=" +
-                                      std::to_string(socket.fd()));
-                            out.clear();
-                            co_return;
-                        }
-                        // Exponential backoff: 100μs, 200μs, 400μs, 800μs, then 1ms
-                        auto delay_us = std::min(100 << std::min(empty_attempts - 1, 3), 1000);
-                        trace_log("read_exact: empty read #" + std::to_string(empty_attempts) +
-                                  ", delaying " + std::to_string(delay_us) +
-                                  "μs, fd=" + std::to_string(socket.fd()));
-                        std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
-                        continue;
+                        co_return;
                     }
-                    empty_attempts = 0;
                     out.insert(out.end(), tmp.begin(), tmp.end());
-                    remaining -= tmp.size();
                 }
-                trace_log("read_exact: complete, got " + std::to_string(out.size()) +
-                          " bytes, fd=" + std::to_string(socket.fd()));
             };
 
             auto send_frame = [&](WebSocketOpcode opcode, const std::vector<uint8_t>& payload,
@@ -1105,10 +1138,12 @@ void Server::run() {
 }
 
 void Server::stop() {
+    // Step 1: stop accepting new connections.
     running_.store(false);
-    io_context_->stop();
 
-    // Close all listening sockets. This also releases any accept coroutines suspended on them.
+    // Step 2: close listening sockets so accept coroutines unwind. We do
+    // this BEFORE asking the IOContext to stop so the event loop can keep
+    // processing the unwinds.
     std::vector<int> fds;
     {
         std::lock_guard<std::mutex> lock(listen_fds_mutex_);
@@ -1122,6 +1157,41 @@ void Server::stop() {
         io_context_->platform_io().remove_fd(fd);
         close_socket(fd);
     }
+
+    // Step 3: shutdown(2) every active client fd. This forces any
+    // coroutine suspended on recv/send for that connection to wake up
+    // with an error, unwind through its destructors, and decrement
+    // active_connections_ via the ConnectionGuard.
+    {
+        std::lock_guard<std::mutex> lock(client_fds_mutex_);
+        for (int fd : active_client_fds_) {
+            if (fd < 0) {
+                continue;
+            }
+#ifdef _WIN32
+            shutdown(fd, SD_BOTH);
+#else
+            ::shutdown(fd, SHUT_RDWR);
+#endif
+        }
+    }
+
+    // Step 4: drain in-flight coroutines, with a deadline so a wedged
+    // handler can't deadlock stop(). 1 second is a defensible upper bound
+    // for any reasonable in-flight request to either complete or fail
+    // out after its socket has been shut down.
+    const auto drain_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (active_connections_.load(std::memory_order_acquire) > 0 &&
+           std::chrono::steady_clock::now() < drain_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    // Step 5: signal the IOContext loop to exit. After this returns,
+    // worker threads (joined inside IOContext::run) will terminate. Any
+    // coroutines still suspended past the drain deadline will leak — we
+    // accept that over a deadlocked shutdown.
+    io_context_->stop();
 }
 
 // NOLINTEND(

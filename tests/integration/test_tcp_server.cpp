@@ -107,3 +107,36 @@ TEST_F(TCPServerTest, MultiplePorts) {
 TEST_F(TCPServerTest, ServerShutdown) {
     EXPECT_NO_THROW(server->stop());
 }
+
+// Server::stop() must drain in-flight connection coroutines before
+// returning so the IOContext isn't torn down with suspended awaiters
+// still pointing into it. We open an idle keep-alive connection (server
+// suspended on recv), then call stop() and assert it returns inside the
+// drain deadline.
+TEST_F(TCPServerTest, StopDrainsIdleConnection) {
+    server->listen_tcp(9996);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    int client = connect_to_server(9996);
+    ASSERT_GE(client, 0);
+
+    // Send one full request and read the response so the server-side
+    // coroutine has cycled back to async_read for the next request — i.e.,
+    // it is now suspended on recv waiting for keep-alive bytes that will
+    // never come.
+    std::string req = "GET /x HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    ASSERT_EQ(send(client, req.data(), req.size(), 0), static_cast<ssize_t>(req.size()));
+    char buf[512]{};
+    ssize_t n = recv(client, buf, sizeof(buf) - 1, 0);
+    ASSERT_GT(n, 0);
+
+    // The server coroutine is now parked on async_read. stop() must
+    // shutdown() the client fd, wake the coroutine with an error, and
+    // wait for it to unwind. Must return well inside the 1s deadline.
+    auto t0 = std::chrono::steady_clock::now();
+    server->stop();
+    auto elapsed = std::chrono::steady_clock::now() - t0;
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 1500);
+
+    close_socket(client);
+}

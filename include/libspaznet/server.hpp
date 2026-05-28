@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Server/public API header: suppress noisy style checks.
@@ -114,6 +115,15 @@ class Server {
     // currently suspended on accept.
     std::mutex listen_fds_mutex_;
     std::vector<int> listen_fds_;
+    // Track active per-connection coroutines so stop() can drain them
+    // before the IOContext is torn down. Each handle_connection
+    // increments active_connections_ on entry and decrements on exit (RAII
+    // guard, fires on every co_return / unwind), and registers the client
+    // fd here so stop() can shutdown(2) it and force the suspended
+    // recv/send to fail.
+    std::mutex client_fds_mutex_;
+    std::unordered_set<int> active_client_fds_;
+    std::atomic<int> active_connections_{0};
     std::atomic<bool> running_;
 
     Task handle_connection(Socket socket);
