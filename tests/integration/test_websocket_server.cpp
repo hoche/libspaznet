@@ -370,3 +370,141 @@ TEST_F(WebSocketServerTest, RejectsUnmaskedClientFrame) {
     EXPECT_EQ(close_frame.opcode, WebSocketOpcode::Close);
     close_socket(fd);
 }
+
+// --- RFC 6455 server-side compliance tests ---
+
+namespace {
+
+// Open a connection, complete the handshake, and discard the response.
+int open_and_handshake(uint16_t port) {
+    int fd = connect_client(port);
+    if (fd < 0) {
+        return -1;
+    }
+    auto req = handshake_request("dGhlIHNhbXBsZSBub25jZQ==");
+    if (!send_all(fd, std::vector<uint8_t>(req.begin(), req.end()))) {
+        close_socket(fd);
+        return -1;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    char resp[256]{};
+    recv(fd, resp, sizeof(resp), 0);
+    return fd;
+}
+
+// Extract the 2-byte close code from a Close frame's payload (RFC 6455 §5.5.1).
+uint16_t close_code(const WebSocketFrame& f) {
+    if (f.payload.size() < 2) {
+        return 0;
+    }
+    return static_cast<uint16_t>(
+        (static_cast<uint32_t>(f.payload[0]) << 8) | static_cast<uint32_t>(f.payload[1]));
+}
+
+} // namespace
+
+TEST_F(WebSocketServerTest, RejectsReservedOpcode) {
+    int fd = open_and_handshake(port);
+    ASSERT_GE(fd, 0);
+
+    // FIN + reserved opcode 0x3, MASKED, length 0, mask key 4 bytes.
+    std::vector<uint8_t> raw = {0x83, 0x80, 0x00, 0x00, 0x00, 0x00};
+    ASSERT_TRUE(send_all(fd, raw));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto frame = read_frame(fd);
+    EXPECT_EQ(frame.opcode, WebSocketOpcode::Close);
+    EXPECT_EQ(close_code(frame), 1002);
+    close_socket(fd);
+}
+
+TEST_F(WebSocketServerTest, RejectsRsvBitSet) {
+    int fd = open_and_handshake(port);
+    ASSERT_GE(fd, 0);
+
+    // FIN + RSV1 + Text, MASKED, length 0, mask key.
+    std::vector<uint8_t> raw = {0xC1, 0x80, 0x00, 0x00, 0x00, 0x00};
+    ASSERT_TRUE(send_all(fd, raw));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto frame = read_frame(fd);
+    EXPECT_EQ(frame.opcode, WebSocketOpcode::Close);
+    EXPECT_EQ(close_code(frame), 1002);
+    close_socket(fd);
+}
+
+TEST_F(WebSocketServerTest, RejectsNonMinimal16BitLength) {
+    int fd = open_and_handshake(port);
+    ASSERT_GE(fd, 0);
+
+    // FIN + Text, MASKED, 16-bit length form claiming length=5 (must be ≥126).
+    // mask key, then 5 mask-XORed payload bytes — server must reject after
+    // reading the length, before consuming the body.
+    std::vector<uint8_t> raw = {0x81, 0xFE, 0x00, 0x05,
+                                0x00, 0x00, 0x00, 0x00, // mask key
+                                'h',  'e',  'l',  'l', 'o'};
+    ASSERT_TRUE(send_all(fd, raw));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto frame = read_frame(fd);
+    EXPECT_EQ(frame.opcode, WebSocketOpcode::Close);
+    EXPECT_EQ(close_code(frame), 1002);
+    close_socket(fd);
+}
+
+TEST_F(WebSocketServerTest, RejectsNonMinimal64BitLength) {
+    int fd = open_and_handshake(port);
+    ASSERT_GE(fd, 0);
+
+    // FIN + Binary, MASKED, 64-bit length form claiming length=256 (must be ≥65536).
+    std::vector<uint8_t> raw = {0x82, 0xFF, 0x00, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x01, 0x00, // length = 256
+                                0x00, 0x00, 0x00, 0x00};
+    ASSERT_TRUE(send_all(fd, raw));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto frame = read_frame(fd);
+    EXPECT_EQ(frame.opcode, WebSocketOpcode::Close);
+    EXPECT_EQ(close_code(frame), 1002);
+    close_socket(fd);
+}
+
+TEST_F(WebSocketServerTest, RejectsLength64HighBitSet) {
+    int fd = open_and_handshake(port);
+    ASSERT_GE(fd, 0);
+
+    // FIN + Binary, MASKED, 64-bit length with high bit set.
+    std::vector<uint8_t> raw = {0x82, 0xFF, 0x80, 0x00, 0x00, 0x00,
+                                0x00, 0x00, 0x00, 0x00, // high bit set
+                                0x00, 0x00, 0x00, 0x00};
+    ASSERT_TRUE(send_all(fd, raw));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto frame = read_frame(fd);
+    EXPECT_EQ(frame.opcode, WebSocketOpcode::Close);
+    EXPECT_EQ(close_code(frame), 1002);
+    close_socket(fd);
+}
+
+// A peer declaring a payload larger than kMaxPayloadBytes must be rejected
+// with 1009 (message too big) BEFORE the server allocates the payload buffer
+// or reads any payload bytes. We send the header bytes only and expect the
+// server to respond with Close 1009 without us ever sending the body.
+TEST_F(WebSocketServerTest, RejectsOversizePayloadWithoutAllocating) {
+    int fd = open_and_handshake(port);
+    ASSERT_GE(fd, 0);
+
+    const uint64_t huge = WebSocketFrame::kMaxPayloadBytes + 1;
+    std::vector<uint8_t> raw = {0x82, 0xFF}; // FIN + Binary, MASKED, 64-bit length
+    for (int i = 7; i >= 0; --i) {
+        raw.push_back(static_cast<uint8_t>((huge >> (i * 8)) & 0xFF));
+    }
+    raw.insert(raw.end(), {0x00, 0x00, 0x00, 0x00}); // mask key
+    ASSERT_TRUE(send_all(fd, raw));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto frame = read_frame(fd);
+    EXPECT_EQ(frame.opcode, WebSocketOpcode::Close);
+    EXPECT_EQ(close_code(frame), 1009);
+    close_socket(fd);
+}
