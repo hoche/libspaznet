@@ -7,6 +7,7 @@
 #include <libspaznet/utils/header_utils.hpp>
 #include <libspaznet/utils/number_utils.hpp>
 #include <libspaznet/utils/string_utils.hpp>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -86,12 +87,26 @@ std::optional<size_t> HTTPRequest::get_content_length() const {
 }
 
 bool HTTPRequest::is_chunked() const {
+    // RFC 9112 §6.1: chunked is recognized only when it is the final coding in
+    // the Transfer-Encoding list. Anything else (e.g. "chunked, gzip") means
+    // the message body length cannot be determined and the recipient must
+    // close the connection — callers should treat it as not chunked here and
+    // reject the request at the parser level (see parse_request).
     auto te = get_header("Transfer-Encoding");
-    if (te) {
-        std::string te_lower = HTTPParser::to_lower(*te);
-        return te_lower.find("chunked") != std::string::npos;
+    if (!te) {
+        return false;
     }
-    return false;
+    std::string te_lower = HTTPParser::to_lower(*te);
+    std::string last_token;
+    std::istringstream iss(te_lower);
+    std::string part;
+    while (std::getline(iss, part, ',')) {
+        part = HTTPParser::trim_ows(part);
+        if (!part.empty()) {
+            last_token = part;
+        }
+    }
+    return last_token == "chunked";
 }
 
 // HTTPResponse helper methods
@@ -294,13 +309,23 @@ bool HTTPParser::parse_header_field(const std::string& line,
         return false;
     }
 
+    // RFC 9112 §5.1: "A server MUST reject ... any received request message
+    // that contains whitespace between a header field name and colon." This
+    // closes a request-smuggling primitive where front-ends and back-ends
+    // disagree on field-name normalization.
+    const char before_colon = line[colon - 1];
+    if (before_colon == ' ' || before_colon == '\t') {
+        return false;
+    }
+
     std::string field_name = line.substr(0, colon);
     std::string field_value = line.substr(colon + 1);
 
-    // Trim OWS from field name
-    field_name = trim_ows(field_name);
-
-    // Validate field name is a token
+    // Validate field name is a token (no trimming — OWS before ':' is now an
+    // error above, and OWS inside the name would be a non-token character).
+    if (field_name.empty()) {
+        return false;
+    }
     for (char c : field_name) {
         if (!is_token_char(c)) {
             return false;
@@ -310,35 +335,160 @@ bool HTTPParser::parse_header_field(const std::string& line,
     // Trim OWS from field value (and handle obs-fold)
     field_value = trim_ows(field_value);
 
-    // Store header (preserve original case for field name, but allow case-insensitive lookup)
+    // Store header (preserve original case for field name, but allow case-insensitive lookup).
+    // Duplicate-header detection (e.g. two Content-Length fields) is handled
+    // by parse_request after all headers are in, since the map collapses
+    // same-case duplicates.
+    auto existing = headers.find(field_name);
+    if (existing != headers.end()) {
+        // Multiple entries under the same exact-case key: RFC 9110 §5.3 allows
+        // combining only if the field is list-valued. We don't know the field
+        // semantics here, so we keep the first value and let parse_request
+        // reject critical headers (Content-Length) at validation time. For
+        // any other field we tolerate the duplicate by concatenating per
+        // RFC 9110 §5.3 list rules.
+        existing->second.append(", ");
+        existing->second.append(field_value);
+        return true;
+    }
     headers[field_name] = field_value;
 
     return true;
 }
 
-HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& buffer,
-                                                  HTTPRequest& request, size_t& bytes_consumed) {
-    bytes_consumed = 0;
+namespace {
 
-    // Find end of headers (CRLF CRLF)
-    size_t header_end = 0;
+// Case-insensitive equality (ASCII) — local helper to avoid pulling the
+// HeaderUtils-internal predicate out of header_utils.cpp.
+bool ci_equal(const std::string& lhs, const std::string& rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(lhs[i])) !=
+            std::tolower(static_cast<unsigned char>(rhs[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Locate end of header block (the byte AFTER the terminating CRLF CRLF), or
+// 0 if not yet present. Returns Error if the search exceeds max_bytes (the
+// peer is shipping an oversize header block).
+enum class HeaderEndState : uint8_t { Found, Incomplete, TooLarge };
+HeaderEndState find_header_end(const std::vector<uint8_t>& buffer, size_t max_bytes,
+                               size_t& header_end_out) {
+    header_end_out = 0;
     bool found_crlf = false;
-    for (size_t i = 0; i + 1 < buffer.size(); ++i) {
+    const size_t scan_limit = std::min(buffer.size(), max_bytes);
+    for (size_t i = 0; i + 1 < scan_limit; ++i) {
         if (buffer[i] == '\r' && buffer[i + 1] == '\n') {
             if (found_crlf) {
-                // Found second CRLF - end of headers
-                header_end = i + 2;
-                break;
+                header_end_out = i + 2;
+                return HeaderEndState::Found;
             }
             found_crlf = true;
-            i++; // Skip LF
+            ++i; // skip LF
         } else if (buffer[i] != '\r' && buffer[i] != '\n') {
             found_crlf = false;
         }
     }
+    if (buffer.size() >= max_bytes) {
+        return HeaderEndState::TooLarge;
+    }
+    return HeaderEndState::Incomplete;
+}
 
-    if (header_end == 0) {
-        return ParseResult::Incomplete;
+// Validate critical message-framing headers per RFC 9112 §6 to close
+// request-smuggling vectors:
+//   - Content-Length and Transfer-Encoding must not both be present.
+//   - At most one Content-Length value (and any case-folded duplicates must
+//     hold the same numeric value).
+//   - Transfer-Encoding, if present, must have "chunked" as the final coding
+//     (other codings imply the recipient cannot determine framing).
+bool validate_framing_headers(const std::unordered_map<std::string, std::string>& headers) {
+    const std::string* cl_value = nullptr;
+    const std::string* te_value = nullptr;
+    for (const auto& [key, value] : headers) {
+        if (ci_equal(key, "Content-Length")) {
+            if (cl_value != nullptr && *cl_value != value) {
+                return false;
+            }
+            cl_value = &value;
+        } else if (ci_equal(key, "Transfer-Encoding")) {
+            te_value = &value;
+        }
+    }
+
+    if (cl_value != nullptr) {
+        // A Content-Length value may be a singleton; parse_header_field merges
+        // duplicates with ", " — accept only the singleton form here.
+        if (cl_value->find(',') != std::string::npos) {
+            return false;
+        }
+        // It must also be a well-formed non-negative integer.
+        for (char c : *cl_value) {
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        if (cl_value->empty()) {
+            return false;
+        }
+    }
+
+    if (cl_value != nullptr && te_value != nullptr) {
+        // RFC 9112 §6.1: if both fields appear the message must be rejected.
+        return false;
+    }
+
+    if (te_value != nullptr) {
+        // RFC 9112 §6.1: a recipient that receives a Transfer-Encoding whose
+        // final coding is not chunked cannot determine framing — must close
+        // the connection (we reject the message at parse time).
+        std::string te_lower;
+        te_lower.reserve(te_value->size());
+        for (char c : *te_value) {
+            te_lower.push_back(
+                static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        }
+        std::string last_token;
+        std::istringstream te_iss(te_lower);
+        std::string part;
+        while (std::getline(te_iss, part, ',')) {
+            // Inline trim (avoid pulling in trim_ows here, which lives on the
+            // outer class and would force this helper to friend it).
+            size_t b = part.find_first_not_of(" \t");
+            size_t e = part.find_last_not_of(" \t");
+            if (b == std::string::npos) {
+                continue;
+            }
+            last_token = part.substr(b, e - b + 1);
+        }
+        if (last_token != "chunked") {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& buffer,
+                                                  HTTPRequest& request, size_t& bytes_consumed) {
+    bytes_consumed = 0;
+
+    // Bounded search for end of headers (CRLF CRLF). Refusing to scan past
+    // kMaxHeaderBytes defeats Slowloris-style header drips.
+    size_t header_end = 0;
+    switch (find_header_end(buffer, kMaxHeaderBytes, header_end)) {
+        case HeaderEndState::Found:
+            break;
+        case HeaderEndState::Incomplete:
+            return ParseResult::Incomplete;
+        case HeaderEndState::TooLarge:
+            return ParseResult::Error;
     }
 
     // Parse request line and headers
@@ -360,7 +510,8 @@ HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& bu
         return ParseResult::Error;
     }
 
-    // Parse headers
+    // Parse headers, with an upper bound on the count.
+    size_t header_count = 0;
     while (std::getline(iss, line)) {
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
@@ -370,9 +521,17 @@ HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& bu
             break; // End of headers
         }
 
+        if (++header_count > kMaxHeaders) {
+            return ParseResult::Error;
+        }
+
         if (!parse_header_field(line, request.headers)) {
             return ParseResult::Error;
         }
+    }
+
+    if (!validate_framing_headers(request.headers)) {
+        return ParseResult::Error;
     }
 
     bytes_consumed = header_end;
@@ -381,6 +540,9 @@ HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& bu
     auto content_length = request.get_content_length();
     if (content_length) {
         size_t body_size = *content_length;
+        if (body_size > kMaxBodySize) {
+            return ParseResult::Error;
+        }
         if (buffer.size() < header_end + body_size) {
             return ParseResult::Incomplete;
         }
@@ -399,6 +561,9 @@ HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& bu
             return chunk_result;
         }
         bytes_consumed += chunk_bytes;
+    } else {
+        // Transfer-Encoding present but not chunked (rejected above), or
+        // neither header — request has no body. Nothing more to do.
     }
 
     return ParseResult::Success;
@@ -408,24 +573,14 @@ auto HTTPParser::parse_response(const std::vector<uint8_t>& buffer, HTTPResponse
                                 size_t& bytes_consumed) -> HTTPParser::ParseResult {
     bytes_consumed = 0;
 
-    // Find end of headers
     size_t header_end = 0;
-    bool found_crlf = false;
-    for (size_t i = 0; i + 1 < buffer.size(); ++i) {
-        if (buffer[i] == '\r' && buffer[i + 1] == '\n') {
-            if (found_crlf) {
-                header_end = i + 2;
-                break;
-            }
-            found_crlf = true;
-            i++;
-        } else if (buffer[i] != '\r' && buffer[i] != '\n') {
-            found_crlf = false;
-        }
-    }
-
-    if (header_end == 0) {
-        return ParseResult::Incomplete;
+    switch (find_header_end(buffer, kMaxHeaderBytes, header_end)) {
+        case HeaderEndState::Found:
+            break;
+        case HeaderEndState::Incomplete:
+            return ParseResult::Incomplete;
+        case HeaderEndState::TooLarge:
+            return ParseResult::Error;
     }
 
     // Parse status line and headers
@@ -447,6 +602,7 @@ auto HTTPParser::parse_response(const std::vector<uint8_t>& buffer, HTTPResponse
     }
 
     // Parse headers
+    size_t header_count = 0;
     while (std::getline(iss, line)) {
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
@@ -456,9 +612,19 @@ auto HTTPParser::parse_response(const std::vector<uint8_t>& buffer, HTTPResponse
             break;
         }
 
+        if (++header_count > kMaxHeaders) {
+            return ParseResult::Error;
+        }
+
         if (!parse_header_field(line, response.headers)) {
             return ParseResult::Error;
         }
+    }
+
+    // Same framing-header validation as on the request path: defense in depth
+    // even though responses are typically generated by our own upstream.
+    if (!validate_framing_headers(response.headers)) {
+        return ParseResult::Error;
     }
 
     bytes_consumed = header_end;
@@ -471,6 +637,9 @@ auto HTTPParser::parse_response(const std::vector<uint8_t>& buffer, HTTPResponse
             return ParseResult::Error;
         }
         size_t body_size = *body_size_opt;
+        if (body_size > kMaxBodySize) {
+            return ParseResult::Error;
+        }
         if (buffer.size() < header_end + body_size) {
             return ParseResult::Incomplete;
         }
@@ -480,8 +649,22 @@ auto HTTPParser::parse_response(const std::vector<uint8_t>& buffer, HTTPResponse
         bytes_consumed += body_size;
     } else {
         auto transfer_encoding_header = response.get_header("Transfer-Encoding");
-        if (transfer_encoding_header &&
-            to_lower(*transfer_encoding_header).find("chunked") != std::string::npos) {
+        if (transfer_encoding_header) {
+            // Mirror HTTPRequest::is_chunked: only honor chunked when it is
+            // the final coding.
+            std::string te_lower = to_lower(*transfer_encoding_header);
+            std::string last_token;
+            std::istringstream te_iss(te_lower);
+            std::string part;
+            while (std::getline(te_iss, part, ',')) {
+                part = trim_ows(part);
+                if (!part.empty()) {
+                    last_token = part;
+                }
+            }
+            if (last_token != "chunked") {
+                return ParseResult::Error;
+            }
             size_t chunk_bytes = 0;
             ParseResult chunk_result = parse_chunked_body(
                 std::vector<uint8_t>(buffer.begin() + static_cast<std::ptrdiff_t>(header_end),
@@ -497,14 +680,43 @@ auto HTTPParser::parse_response(const std::vector<uint8_t>& buffer, HTTPResponse
     return ParseResult::Success;
 }
 
-auto HTTPParser::parse_chunk_size(const std::string& line) -> size_t {
-    // Chunk size is hex number per RFC 9112 Section 7.1
-    try {
-        constexpr int kHexBase = 16;
-        return std::stoull(line, nullptr, kHexBase);
-    } catch (...) {
-        return 0;
+auto HTTPParser::parse_chunk_size(const std::string& line) -> std::optional<size_t> {
+    // RFC 9112 §7.1:  chunk-size = 1*HEXDIG
+    //                 chunk      = chunk-size [ chunk-ext ] CRLF chunk-data CRLF
+    // Be strict: no leading sign, no whitespace, at least one hex digit; stop
+    // at ';' (chunk-ext) or end-of-string. Returning an optional lets callers
+    // distinguish a real last-chunk (value 0) from a parse failure — the
+    // previous size_t-with-0-on-error contract was a request-smuggling
+    // primitive (malformed chunk-size was silently treated as end-of-body).
+    size_t value = 0;
+    bool saw_digit = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        char c = line[i];
+        if (c == ';') {
+            // chunk-extensions — ignored, but require ≥1 hex digit before.
+            break;
+        }
+        int digit;
+        if (c >= '0' && c <= '9') {
+            digit = c - '0';
+        } else if (c >= 'a' && c <= 'f') {
+            digit = 10 + (c - 'a');
+        } else if (c >= 'A' && c <= 'F') {
+            digit = 10 + (c - 'A');
+        } else {
+            return std::nullopt;
+        }
+        // Overflow guard before the shift: value*16 would exceed size_t.
+        if (value > (std::numeric_limits<size_t>::max() - static_cast<size_t>(digit)) / 16) {
+            return std::nullopt;
+        }
+        value = value * 16 + static_cast<size_t>(digit);
+        saw_digit = true;
     }
+    if (!saw_digit) {
+        return std::nullopt;
+    }
+    return value;
 }
 
 auto HTTPParser::parse_chunked_body(const std::vector<uint8_t>& buffer, std::vector<uint8_t>& body,
@@ -515,10 +727,15 @@ auto HTTPParser::parse_chunked_body(const std::vector<uint8_t>& buffer, std::vec
     size_t pos = 0;
 
     while (pos < buffer.size()) {
-        // Find chunk size line (ends with CRLF)
+        // Cap the chunk-size line length so a peer cannot make us scan an
+        // unbounded buffer looking for CRLF.
+        const size_t chunk_line_max = 64;
         size_t crlf_pos = pos;
         while (crlf_pos + 1 < buffer.size() &&
                (buffer[crlf_pos] != '\r' || buffer[crlf_pos + 1] != '\n')) {
+            if (crlf_pos - pos > chunk_line_max) {
+                return ParseResult::Error;
+            }
             crlf_pos++;
         }
 
@@ -528,7 +745,14 @@ auto HTTPParser::parse_chunked_body(const std::vector<uint8_t>& buffer, std::vec
 
         std::string chunk_size_line(buffer.begin() + static_cast<std::ptrdiff_t>(pos),
                                     buffer.begin() + static_cast<std::ptrdiff_t>(crlf_pos));
-        size_t chunk_size = parse_chunk_size(chunk_size_line);
+        auto chunk_size_opt = parse_chunk_size(chunk_size_line);
+        if (!chunk_size_opt) {
+            return ParseResult::Error;
+        }
+        size_t chunk_size = *chunk_size_opt;
+        if (chunk_size > kMaxChunkSize) {
+            return ParseResult::Error;
+        }
 
         pos = crlf_pos + 2; // Skip CRLF
 
@@ -546,6 +770,9 @@ auto HTTPParser::parse_chunked_body(const std::vector<uint8_t>& buffer, std::vec
             return ParseResult::Incomplete;
         }
 
+        if (body.size() + chunk_size > kMaxBodySize) {
+            return ParseResult::Error;
+        }
         body.insert(body.end(), buffer.begin() + static_cast<std::ptrdiff_t>(pos),
                     buffer.begin() + static_cast<std::ptrdiff_t>(pos + chunk_size));
         pos += chunk_size;

@@ -77,6 +77,15 @@ class HTTPParser {
         Error       // Parse error
     };
 
+    // Protocol bounds. These exist to defeat Slowloris-style and unbounded-
+    // allocation attacks. Values are deliberately conservative; callers that
+    // need different limits can fork the parser or wrap it with their own
+    // pre-bounded buffers.
+    static constexpr size_t kMaxHeaderBytes = 16 * 1024;     // header block (incl. request line + CRLFs)
+    static constexpr size_t kMaxHeaders = 100;               // number of header fields
+    static constexpr size_t kMaxBodySize = 64ULL * 1024 * 1024;  // declared Content-Length / total chunk bytes
+    static constexpr size_t kMaxChunkSize = 16ULL * 1024 * 1024; // any single chunk
+
     // Parse HTTP request from buffer
     static auto parse_request(const std::vector<uint8_t>& buffer, HTTPRequest& request,
                               size_t& bytes_consumed) -> ParseResult;
@@ -98,7 +107,10 @@ class HTTPParser {
     static auto parse_status_line(const std::string& line, HTTPResponse& response) -> bool;
     static auto parse_header_field(const std::string& line,
                                    std::unordered_map<std::string, std::string>& headers) -> bool;
-    static auto parse_chunk_size(const std::string& line) -> size_t;
+    // Parse a chunk-size line ("hexdigits [ ; chunk-ext ]"). Returns nullopt
+    // on any malformed input (per RFC 9112 §7.1) so callers can distinguish a
+    // legitimate last-chunk (size == 0) from a parse failure.
+    static auto parse_chunk_size(const std::string& line) -> std::optional<size_t>;
 };
 
 class HTTPHandler {

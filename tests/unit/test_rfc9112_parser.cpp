@@ -297,3 +297,150 @@ TEST_F(RFC9112ParserTest, ParseRequestTargetForms) {
     EXPECT_TRUE(HTTPParser::parse_request_line("CONNECT example.com:443 HTTP/1.1", req3));
     EXPECT_EQ(req3.request_target, "example.com:443");
 }
+
+// --- Request-smuggling defenses (RFC 9112 §5.1, §6.1, §7.1) ---
+
+// A message must not declare both Content-Length and Transfer-Encoding.
+TEST_F(RFC9112ParserTest, RejectContentLengthAndTransferEncoding) {
+    std::string request_str = "POST /x HTTP/1.1\r\n"
+                              "Host: example.com\r\n"
+                              "Content-Length: 5\r\n"
+                              "Transfer-Encoding: chunked\r\n"
+                              "\r\n"
+                              "hello";
+    std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
+    HTTPRequest request;
+    size_t bytes_consumed = 0;
+    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+}
+
+// Two Content-Length headers with different values must be rejected.
+TEST_F(RFC9112ParserTest, RejectDuplicateContentLengthDifferentValues) {
+    std::string request_str = "POST /x HTTP/1.1\r\n"
+                              "Host: example.com\r\n"
+                              "Content-Length: 5\r\n"
+                              "content-length: 17\r\n"
+                              "\r\n"
+                              "hello";
+    std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
+    HTTPRequest request;
+    size_t bytes_consumed = 0;
+    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+}
+
+// Repeated Content-Length headers with the same value are tolerated.
+TEST_F(RFC9112ParserTest, AllowDuplicateContentLengthSameValue) {
+    std::string request_str = "POST /x HTTP/1.1\r\n"
+                              "Host: example.com\r\n"
+                              "Content-Length: 5\r\n"
+                              "content-length: 5\r\n"
+                              "\r\n"
+                              "hello";
+    std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
+    HTTPRequest request;
+    size_t bytes_consumed = 0;
+    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, HTTPParser::ParseResult::Success);
+    EXPECT_EQ(std::string(request.body.begin(), request.body.end()), "hello");
+}
+
+// A Content-Length value that is a comma-separated list must be rejected.
+TEST_F(RFC9112ParserTest, RejectContentLengthCommaList) {
+    std::string request_str = "POST /x HTTP/1.1\r\n"
+                              "Host: example.com\r\n"
+                              "Content-Length: 5, 5\r\n"
+                              "\r\n"
+                              "hello";
+    std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
+    HTTPRequest request;
+    size_t bytes_consumed = 0;
+    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+}
+
+// RFC 9112 §5.1: OWS between field name and colon must be rejected.
+TEST_F(RFC9112ParserTest, RejectWhitespaceBeforeColon) {
+    std::unordered_map<std::string, std::string> headers;
+    EXPECT_FALSE(HTTPParser::parse_header_field("Host : example.com", headers));
+    EXPECT_FALSE(HTTPParser::parse_header_field("Host\t: example.com", headers));
+}
+
+// Transfer-Encoding whose final coding is not chunked is unsupported framing.
+TEST_F(RFC9112ParserTest, RejectTransferEncodingNotEndingInChunked) {
+    std::string request_str = "POST /x HTTP/1.1\r\n"
+                              "Host: example.com\r\n"
+                              "Transfer-Encoding: chunked, gzip\r\n"
+                              "\r\n";
+    std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
+    HTTPRequest request;
+    size_t bytes_consumed = 0;
+    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+}
+
+// Malformed chunk-size must be a hard parse error, not silently treated as
+// the last-chunk (size 0).
+TEST_F(RFC9112ParserTest, MalformedChunkSizeIsError) {
+    std::string chunked_data = "garbage\r\n";
+    std::vector<uint8_t> buffer(chunked_data.begin(), chunked_data.end());
+    std::vector<uint8_t> body;
+    size_t bytes_consumed = 0;
+    auto result = HTTPParser::parse_chunked_body(buffer, body, bytes_consumed);
+    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+}
+
+// parse_chunk_size returns nullopt on parse failure but Some(0) on legitimate
+// last-chunk.
+TEST_F(RFC9112ParserTest, ChunkSizeOptionalDistinguishesErrorFromZero) {
+    EXPECT_EQ(HTTPParser::parse_chunk_size("0"), std::optional<size_t>{0});
+    EXPECT_EQ(HTTPParser::parse_chunk_size("ff"), std::optional<size_t>{255});
+    EXPECT_EQ(HTTPParser::parse_chunk_size("FF;ext=1"), std::optional<size_t>{255});
+    EXPECT_FALSE(HTTPParser::parse_chunk_size("").has_value());
+    EXPECT_FALSE(HTTPParser::parse_chunk_size("-1").has_value());
+    EXPECT_FALSE(HTTPParser::parse_chunk_size("garbage").has_value());
+    EXPECT_FALSE(HTTPParser::parse_chunk_size(" 1").has_value());
+}
+
+// An oversize header block is rejected before unbounded memory growth.
+TEST_F(RFC9112ParserTest, OversizeHeaderBlockIsError) {
+    std::string request_str = "GET / HTTP/1.1\r\nX-Huge: ";
+    request_str.append(HTTPParser::kMaxHeaderBytes, 'a');
+    request_str.append("\r\n\r\n");
+    std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
+    HTTPRequest request;
+    size_t bytes_consumed = 0;
+    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+}
+
+// A request declaring too many headers is rejected.
+TEST_F(RFC9112ParserTest, TooManyHeadersIsError) {
+    std::string request_str = "GET / HTTP/1.1\r\n";
+    for (size_t i = 0; i < HTTPParser::kMaxHeaders + 5; ++i) {
+        request_str += "X-H" + std::to_string(i) + ": v\r\n";
+    }
+    request_str += "\r\n";
+    std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
+    HTTPRequest request;
+    size_t bytes_consumed = 0;
+    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+}
+
+// A peer-declared Content-Length above kMaxBodySize is rejected without
+// allocating that buffer.
+TEST_F(RFC9112ParserTest, OversizeContentLengthIsError) {
+    std::string request_str = "POST / HTTP/1.1\r\n"
+                              "Host: example.com\r\n"
+                              "Content-Length: " +
+                              std::to_string(HTTPParser::kMaxBodySize + 1) +
+                              "\r\n"
+                              "\r\n";
+    std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
+    HTTPRequest request;
+    size_t bytes_consumed = 0;
+    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+}
