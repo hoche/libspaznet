@@ -46,7 +46,37 @@ TEST(HTTPResponseTest, SerializeEmptyBody) {
     std::string result(serialized.begin(), serialized.end());
 
     EXPECT_NE(result.find("204 No Content"), std::string::npos);
-    // Should not have Content-Length for empty body
+    // 204 status forbids a message body, so no Content-Length either.
+    EXPECT_EQ(result.find("Content-Length"), std::string::npos);
+}
+
+TEST(HTTPResponseTest, SerializeEmptyBody200EmitsContentLengthZero) {
+    // Regression: a 200 OK with an empty body under keep-alive must carry
+    // explicit framing (Content-Length: 0) so the client knows the
+    // response ends at the header terminator and the next pipelined
+    // response begins where it does. Omitting the header was an RFC
+    // 9112 §6.1 violation that broke keep-alive clients.
+    HTTPResponse response;
+    response.status_code = 200;
+    response.reason_phrase = "OK";
+
+    auto serialized = response.serialize();
+    std::string result(serialized.begin(), serialized.end());
+
+    EXPECT_NE(result.find("200 OK"), std::string::npos);
+    EXPECT_NE(result.find("Content-Length: 0"), std::string::npos);
+}
+
+TEST(HTTPResponseTest, SerializeEmptyBody304NoContentLength) {
+    // 304 Not Modified forbids a body (RFC 9110 §15.4.5).
+    HTTPResponse response;
+    response.status_code = 304;
+    response.reason_phrase = "Not Modified";
+
+    auto serialized = response.serialize();
+    std::string result(serialized.begin(), serialized.end());
+
+    EXPECT_EQ(result.find("Content-Length"), std::string::npos);
 }
 
 TEST(HTTPResponseTest, SerializeLargeBody) {

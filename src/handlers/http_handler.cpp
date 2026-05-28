@@ -169,9 +169,17 @@ std::vector<uint8_t> HTTPResponse::serialize() const {
         oss << key << ": " << value << "\r\n";
     }
 
-    // Automatically add Content-Length if body is present and not already set
-    // and not using chunked transfer encoding
-    if (!body.empty() && headers.find("Content-Length") == headers.end() &&
+    // Auto-emit Content-Length whenever the response uses Content-Length
+    // framing (no Transfer-Encoding) and the status code permits a body.
+    // RFC 9112 §6.1: under a persistent connection, recipients need
+    // explicit framing on every response — omitting Content-Length on an
+    // empty body was an interop bug (clients would block waiting for a
+    // body byte that never came, or read into the next pipelined
+    // response). 1xx/204/304 responses MUST NOT include body content per
+    // RFC 9110 §15, so we skip the header there.
+    const bool status_forbids_body = (status_code >= 100 && status_code < 200) ||
+                                     status_code == 204 || status_code == 304;
+    if (!status_forbids_body && headers.find("Content-Length") == headers.end() &&
         headers.find("Transfer-Encoding") == headers.end()) {
         oss << "Content-Length: " << body.size() << "\r\n";
     }
