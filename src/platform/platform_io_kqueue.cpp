@@ -101,7 +101,14 @@ class PlatformIOKqueue : public PlatformIO {
             timeout_ptr = &timeout;
         }
 
-        int nfds = kevent(kqueue_fd_, nullptr, 0, kevents, MAX_EVENTS, timeout_ptr);
+        // EINTR is benign — debugger attach, SIGWINCH, etc. — and must
+        // not kill the event loop. Retry transparently. The kqueue
+        // timeout is reset each call; the cost of EINTR is at most one
+        // extra spurious wait with the original timeout.
+        int nfds;
+        do {
+            nfds = kevent(kqueue_fd_, nullptr, 0, kevents, MAX_EVENTS, timeout_ptr);
+        } while (nfds < 0 && errno == EINTR);
 
         if (nfds < 0) {
             return -1;
@@ -123,7 +130,12 @@ class PlatformIOKqueue : public PlatformIO {
             }
 
             if ((kevents[i].flags & EV_EOF) != 0U) {
-                event.events |= EVENT_ERROR;
+                // EV_EOF fires on half-close. Map it to EVENT_READ as
+                // well as EVENT_ERROR so a coroutine suspended on
+                // async_read wakes and recv() can return 0. Without
+                // this, the reader sleeps forever after the peer
+                // closes its write side.
+                event.events |= EVENT_READ | EVENT_ERROR;
             }
 
             events.push_back(event);

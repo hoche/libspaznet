@@ -23,13 +23,13 @@
   </defs>
 
   <rect class="group" x="20" y="40" width="840" height="180" rx="8"/>
-  <text class="group-label" x="40" y="60">TaskQueue — lock-free enqueue / mutex-protected dequeue</text>
+  <text class="group-label" x="40" y="60">TaskQueue — both ends serialized under one mutex</text>
 
-  <!-- head_ and tail_ atomic pointers, anchored above the chain -->
+  <!-- head_ and tail_ are now plain Node*; the mutex covers both -->
   <rect class="ptr" x="50" y="80" width="140" height="40" rx="6"/>
-  <text class="label" x="120" y="105">head_  (atomic Node*)</text>
+  <text class="label" x="120" y="105">head_  (Node*)</text>
   <rect class="ptr" x="710" y="80" width="140" height="40" rx="6"/>
-  <text class="label" x="780" y="105">tail_  (atomic Node*)</text>
+  <text class="label" x="780" y="105">tail_  (Node*)</text>
 
   <!-- Chain of nodes: dummy -> N1 -> N2 -> N3 -> null -->
   <rect class="dummy" x="60" y="160" width="120" height="46" rx="6"/>
@@ -65,22 +65,22 @@
   <path class="ptr-edge" d="M120,120 L120,160" marker-end="url(#arrow)"/>
   <path class="ptr-edge" d="M780,120 L780,140 L600,140 L600,160" marker-end="url(#arrow)"/>
 
-  <!-- Operations: enqueue and dequeue -->
+  <!-- Operations: enqueue and dequeue (both take the mutex) -->
   <rect class="enq" x="60" y="260" width="180" height="46" rx="6"/>
   <text class="label" x="150" y="280">enqueue(Task)</text>
-  <text class="small" x="150" y="297">CAS tail_ atomically</text>
+  <text class="small" x="150" y="297">acquires mutex_</text>
 
   <rect class="deq" x="340" y="260" width="180" height="46" rx="6"/>
   <text class="label" x="430" y="280">dequeue(Task)</text>
-  <text class="small" x="430" y="297">mutex-protected</text>
+  <text class="small" x="430" y="297">acquires mutex_</text>
 
   <rect class="out" x="600" y="266" width="220" height="34" rx="6"/>
   <text class="label" x="710" y="287">→ Task (moved out)</text>
 
   <!-- enqueue -> tail_ -->
   <path class="edge" d="M150,260 L150,140 L780,140 L780,120" marker-end="url(#arrow)"/>
-  <rect class="edge-label-bg" x="380" y="132" width="120" height="16"/>
-  <text class="edge-label" x="440" y="144">new Node → tail_</text>
+  <rect class="edge-label-bg" x="380" y="132" width="160" height="16"/>
+  <text class="edge-label" x="460" y="144">lock, append, advance tail_</text>
 
   <!-- dequeue -> head_ -->
   <path class="edge" d="M430,260 L430,140 L120,140 L120,120" marker-end="url(#arrow)"/>
@@ -94,9 +94,9 @@
 
   <!-- Caption -->
   <text class="label" x="440" y="350" style="font-size:12px; fill:#666">
-    See docs/mutex-vs-atomics.md for why dequeue keeps the mutex
+    Earlier "lock-free enqueue + mutex dequeue" design had a UAF
   </text>
   <text class="label" x="440" y="368" style="font-size:12px; fill:#666">
-    while enqueue is fully atomic.
+    between the tail exchange and the next-store; see commit log.
   </text>
 </svg>
