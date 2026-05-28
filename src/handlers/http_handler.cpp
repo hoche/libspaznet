@@ -447,10 +447,10 @@ HeaderEndState find_header_end(const std::vector<uint8_t>& buffer, size_t max_by
 //     hold the same numeric value).
 //   - Transfer-Encoding, if present, must have "chunked" as the final coding
 //     (other codings imply the recipient cannot determine framing).
-bool validate_framing_headers(const std::unordered_map<std::string, std::string>& headers) {
-    const std::string* cl_value = nullptr;
+bool validate_framing_headers(std::unordered_map<std::string, std::string>& headers) {
+    std::string* cl_value = nullptr;
     const std::string* te_value = nullptr;
-    for (const auto& [key, value] : headers) {
+    for (auto& [key, value] : headers) {
         if (ci_equal(key, "Content-Length")) {
             if (cl_value != nullptr && *cl_value != value) {
                 return false;
@@ -462,20 +462,60 @@ bool validate_framing_headers(const std::unordered_map<std::string, std::string>
     }
 
     if (cl_value != nullptr) {
-        // A Content-Length value may be a singleton; parse_header_field merges
-        // duplicates with ", " — accept only the singleton form here.
-        if (cl_value->find(',') != std::string::npos) {
-            return false;
-        }
-        // It must also be a well-formed non-negative integer.
-        for (char c : *cl_value) {
-            if (c < '0' || c > '9') {
-                return false;
+        // RFC 9112 §6.3 explicitly allows repeated Content-Length headers
+        // when every value is identical (and §8.6 lets a single header
+        // carry a comma-separated list of identical values). Anything
+        // else is a framing ambiguity and must be rejected.
+        //
+        // parse_header_field merges identical-cased duplicates into the
+        // same map entry with ", " between values, so we may see either
+        // a bare "10" (one header) or "10, 10" (two headers that
+        // merged). Validate by splitting on commas, trimming, and
+        // requiring all tokens to be the same well-formed non-negative
+        // integer.
+        std::string first_token;
+        bool seen_any = false;
+        size_t pos = 0;
+        while (pos <= cl_value->size()) {
+            const size_t comma = cl_value->find(',', pos);
+            const size_t end = (comma == std::string::npos) ? cl_value->size() : comma;
+            size_t b = pos;
+            while (b < end && (cl_value->at(b) == ' ' || cl_value->at(b) == '\t')) {
+                ++b;
             }
+            size_t e = end;
+            while (e > b && (cl_value->at(e - 1) == ' ' || cl_value->at(e - 1) == '\t')) {
+                --e;
+            }
+            if (b == e) {
+                return false; // empty token (e.g. "10,, 10")
+            }
+            for (size_t i = b; i < e; ++i) {
+                const char c = cl_value->at(i);
+                if (c < '0' || c > '9') {
+                    return false;
+                }
+            }
+            std::string token = cl_value->substr(b, e - b);
+            if (!seen_any) {
+                first_token = std::move(token);
+                seen_any = true;
+            } else if (token != first_token) {
+                return false; // distinct CL values — framing is ambiguous
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            pos = comma + 1;
         }
-        if (cl_value->empty()) {
+        if (!seen_any) {
             return false;
         }
+        // Normalize the merged "10, 10" form back to a single value so
+        // downstream get_content_length() (which uses std::stoull, not
+        // a strict parser) sees the canonical integer rather than a
+        // list whose tokens it would silently truncate at the comma.
+        *cl_value = first_token;
     }
 
     if (cl_value != nullptr && te_value != nullptr) {

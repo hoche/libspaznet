@@ -140,3 +140,44 @@ TEST_F(TCPServerTest, StopDrainsIdleConnection) {
 
     close_socket(client);
 }
+
+// Regression for the ConnectionGuard / Socket::close TOCTOU: each
+// completed connection must remove its fd from active_client_fds_
+// BEFORE Socket::close() returns the fd to the kernel, otherwise a
+// subsequent accept() could reuse the fd number while it's still
+// "tracked", and a concurrent Server::stop() would shutdown(2) the
+// foreign socket.
+//
+// We can't easily inspect active_client_fds_ from a test, but we
+// CAN drive many short-lived connections in sequence and then call
+// stop(); if the guard's release path is wrong, stop() will block
+// for ~1s waiting on a phantom active_connections_ count.
+TEST_F(TCPServerTest, StopReturnsImmediatelyAfterShortLivedConnections) {
+    server->listen_tcp(9995);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    constexpr int kNumConnections = 25;
+    for (int i = 0; i < kNumConnections; ++i) {
+        int client = connect_to_server(9995);
+        ASSERT_GE(client, 0);
+        std::string req = "GET /x HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Connection: close\r\n\r\n";
+        ASSERT_EQ(send(client, req.data(), req.size(), 0), static_cast<ssize_t>(req.size()));
+        char buf[512]{};
+        // Drain until peer closes; this lets the server-side coroutine
+        // run its socket.close() + guard.release() and exit cleanly.
+        while (recv(client, buf, sizeof(buf), 0) > 0) {
+        }
+        close_socket(client);
+    }
+
+    // All 25 coroutines should have unwound by now. stop() must
+    // return promptly — anything close to the 1 s drain deadline
+    // means stale entries are still in active_client_fds_.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    auto t0 = std::chrono::steady_clock::now();
+    server->stop();
+    auto elapsed = std::chrono::steady_clock::now() - t0;
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 250);
+}

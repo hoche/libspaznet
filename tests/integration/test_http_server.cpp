@@ -51,9 +51,15 @@ class HTTPServerTestHandler : public HTTPHandler {
 class HTTPServerTest : public ::testing::Test {
   protected:
     void SetUp() override {
-        handler = std::make_unique<HTTPServerTestHandler>();
+        // Keep a raw pointer to the handler the server owns, so tests
+        // can inspect its request_count. The old code constructed two
+        // separate handlers — one stored in the fixture, a different
+        // one passed to set_http_handler — leaving handler->request_count
+        // pinned at 0 forever and making the counter assertion vacuous.
+        auto handler_unique = std::make_unique<HTTPServerTestHandler>();
+        handler = handler_unique.get();
         server = std::make_unique<Server>(2);
-        server->set_http_handler(std::make_unique<HTTPServerTestHandler>());
+        server->set_http_handler(std::move(handler_unique));
         server->listen_tcp(8888);
 
         server_thread = std::thread([this]() { server->run(); });
@@ -177,7 +183,7 @@ class HTTPServerTest : public ::testing::Test {
         return response;
     }
 
-    std::unique_ptr<HTTPServerTestHandler> handler;
+    HTTPServerTestHandler* handler{nullptr}; // owned by the server
     std::unique_ptr<Server> server;
     std::thread server_thread;
 };
@@ -224,15 +230,10 @@ TEST_F(HTTPServerTest, ResponseBody) {
 
     std::string response = send_http_request("GET", "/");
 
-    // Debug output
-    std::cout << "Response length: " << response.length() << std::endl;
-    std::cout << "Handler request_count: " << handler->request_count.load() << std::endl;
-    if (response.length() > 0) {
-        std::cout << "Response (first 500 chars): "
-                  << response.substr(0, std::min(500UL, response.length())) << std::endl;
-    } else {
-        std::cout << "Response is empty!" << std::endl;
-    }
-
     EXPECT_NE(response.find("Hello"), std::string::npos);
+    // The fixture now stores a raw pointer to the server-owned handler;
+    // this assertion would have been impossible before the fix (the
+    // fixture's handler was a separate, unused instance whose counter
+    // never moved).
+    EXPECT_GE(handler->request_count.load(), 1);
 }

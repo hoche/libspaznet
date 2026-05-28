@@ -207,9 +207,15 @@ class EchoWebSocketHandler : public WebSocketHandler {
 class WebSocketServerTest : public ::testing::Test {
   protected:
     void SetUp() override {
-        handler = std::make_unique<EchoWebSocketHandler>();
+        // Keep a raw pointer to the server-owned handler so the
+        // open_count / close_count assertions below actually observe
+        // the handler the server is calling into. (The old code
+        // constructed two separate handler instances and read counters
+        // off the wrong one.)
+        auto handler_unique = std::make_unique<EchoWebSocketHandler>();
+        handler = handler_unique.get();
         server = std::make_unique<Server>(2);
-        server->set_websocket_handler(std::make_unique<EchoWebSocketHandler>());
+        server->set_websocket_handler(std::move(handler_unique));
         port = 7877;
         server->listen_tcp(port);
         server_thread = std::thread([this]() { server->run(); });
@@ -224,7 +230,7 @@ class WebSocketServerTest : public ::testing::Test {
     }
 
     uint16_t port{};
-    std::unique_ptr<EchoWebSocketHandler> handler;
+    EchoWebSocketHandler* handler{nullptr}; // owned by the server
     std::unique_ptr<Server> server;
     std::thread server_thread;
 };
@@ -244,6 +250,9 @@ TEST_F(WebSocketServerTest, PerformsRFC6455Handshake) {
     EXPECT_NE(resp_str.find("Upgrade: websocket"), std::string::npos);
     EXPECT_NE(resp_str.find("Connection: Upgrade"), std::string::npos);
     EXPECT_NE(resp_str.find("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), std::string::npos);
+    // Give the server a beat to invoke on_open after the 101 response.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(handler->open_count.load(), 1);
     close_socket(fd);
 }
 

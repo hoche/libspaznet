@@ -36,9 +36,13 @@ class TestUDPHandler : public UDPHandler {
 class UDPServerTest : public ::testing::Test {
   protected:
     void SetUp() override {
-        handler = std::make_unique<TestUDPHandler>();
+        // Keep a raw pointer to the server-owned handler so packet_count
+        // assertions actually observe the right instance (the previous
+        // pattern stashed a separate, unused handler in the fixture).
+        auto handler_unique = std::make_unique<TestUDPHandler>();
+        handler = handler_unique.get();
         server = std::make_unique<Server>(2);
-        server->set_udp_handler(std::make_unique<TestUDPHandler>());
+        server->set_udp_handler(std::move(handler_unique));
         server->listen_udp(6666);
 
         server_thread = std::thread([this]() { server->run(); });
@@ -69,7 +73,7 @@ class UDPServerTest : public ::testing::Test {
         return sent == static_cast<int>(message.size());
     }
 
-    std::unique_ptr<TestUDPHandler> handler;
+    TestUDPHandler* handler{nullptr}; // owned by the server
     std::unique_ptr<Server> server;
     std::thread server_thread;
 };
@@ -93,13 +97,17 @@ TEST_F(UDPServerTest, SendUDPPacket) {
 TEST_F(UDPServerTest, MultiplePackets) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    for (int i = 0; i < 5; ++i) {
+    constexpr int kPackets = 5;
+    for (int i = 0; i < kPackets; ++i) {
         std::string message = "Packet " + std::to_string(i);
         send_udp_packet(message, 6666);
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // Now that the fixture holds a pointer to the actual server-owned
+    // handler, we can verify the packets reached it.
+    EXPECT_EQ(handler->packet_count.load(), kPackets);
 }
 
 TEST_F(UDPServerTest, DifferentPacketSizes) {

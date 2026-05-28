@@ -14,7 +14,16 @@ namespace spaznet {
 class PlatformIOKqueue : public PlatformIO {
   private:
     int kqueue_fd_;
-    std::unordered_map<int, void*> fd_to_user_data_;
+    // Per-fd record: which filters are currently registered (so
+    // remove_fd / modify_fd only issue EV_DELETE for filters we
+    // actually have — kqueue returns -1/ENOENT otherwise, which the
+    // test suite previously caught as a spurious remove_fd failure on
+    // macOS), and the user_data token to re-attach on modify.
+    struct FdRecord {
+        void* user_data;
+        uint32_t events; // EVENT_READ / EVENT_WRITE bits currently active
+    };
+    std::unordered_map<int, FdRecord> fd_records_;
     static constexpr int MAX_EVENTS = 64;
 
   public:
@@ -55,38 +64,72 @@ class PlatformIOKqueue : public PlatformIO {
             return false;
         }
 
-        fd_to_user_data_[file_descriptor] = user_data;
-
-        return kevent(kqueue_fd_, changes, nchanges, nullptr, 0, nullptr) == 0;
+        if (kevent(kqueue_fd_, changes, nchanges, nullptr, 0, nullptr) != 0) {
+            return false;
+        }
+        fd_records_[file_descriptor] = {user_data, events & (EVENT_READ | EVENT_WRITE)};
+        return true;
     }
 
     auto modify_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
-        // Remove existing filters
-        struct kevent changes[2];
-        int nchanges = 0;
-
-        if (fd_to_user_data_.find(file_descriptor) != fd_to_user_data_.end()) {
-            EV_SET(&changes[nchanges], file_descriptor, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
-            nchanges++;
-            EV_SET(&changes[nchanges], file_descriptor, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
-            nchanges++;
-            kevent(kqueue_fd_, changes, nchanges, nullptr, 0, nullptr);
+        auto it = fd_records_.find(file_descriptor);
+        if (it == fd_records_.end()) {
+            return add_fd(file_descriptor, events, user_data);
         }
 
-        return add_fd(file_descriptor, events, user_data);
+        struct kevent changes[4];
+        int nchanges = 0;
+        const uint32_t old_events = it->second.events;
+        const uint32_t new_events = events & (EVENT_READ | EVENT_WRITE);
+
+        // Drop filters that are no longer wanted; add/refresh the ones
+        // that are. EV_ADD acts as "add or replace" so we don't need a
+        // separate EV_DELETE pass for filters that are staying.
+        if ((old_events & EVENT_READ) != 0U && (new_events & EVENT_READ) == 0U) {
+            EV_SET(&changes[nchanges++], file_descriptor, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+        }
+        if ((old_events & EVENT_WRITE) != 0U && (new_events & EVENT_WRITE) == 0U) {
+            EV_SET(&changes[nchanges++], file_descriptor, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+        }
+        if ((new_events & EVENT_READ) != 0U) {
+            EV_SET(&changes[nchanges++], file_descriptor, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0,
+                   user_data);
+        }
+        if ((new_events & EVENT_WRITE) != 0U) {
+            EV_SET(&changes[nchanges++], file_descriptor, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0,
+                   user_data);
+        }
+
+        if (nchanges == 0) {
+            it->second.user_data = user_data;
+            it->second.events = new_events;
+            return true;
+        }
+        if (kevent(kqueue_fd_, changes, nchanges, nullptr, 0, nullptr) != 0) {
+            return false;
+        }
+        it->second.user_data = user_data;
+        it->second.events = new_events;
+        return true;
     }
 
     auto remove_fd(int file_descriptor) -> bool override {
+        auto it = fd_records_.find(file_descriptor);
+        if (it == fd_records_.end()) {
+            return false; // never registered
+        }
         struct kevent changes[2];
         int nchanges = 0;
-
-        EV_SET(&changes[nchanges], file_descriptor, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
-        nchanges++;
-        EV_SET(&changes[nchanges], file_descriptor, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
-        nchanges++;
-
-        fd_to_user_data_.erase(file_descriptor);
-
+        if ((it->second.events & EVENT_READ) != 0U) {
+            EV_SET(&changes[nchanges++], file_descriptor, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+        }
+        if ((it->second.events & EVENT_WRITE) != 0U) {
+            EV_SET(&changes[nchanges++], file_descriptor, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+        }
+        fd_records_.erase(it);
+        if (nchanges == 0) {
+            return true; // nothing to actually delete
+        }
         return kevent(kqueue_fd_, changes, nchanges, nullptr, 0, nullptr) == 0;
     }
 
@@ -149,7 +192,7 @@ class PlatformIOKqueue : public PlatformIO {
             close(kqueue_fd_);
             kqueue_fd_ = -1;
         }
-        fd_to_user_data_.clear();
+        fd_records_.clear();
     }
 };
 
