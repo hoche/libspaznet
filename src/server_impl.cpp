@@ -724,6 +724,35 @@ Task Server::handle_connection(Socket socket) {
         co_return;
     }
 
+    // RAII guard: track this connection from entry to exit (including
+    // exception unwinds and every co_return path below). Server::stop()
+    // waits on active_connections_ reaching zero so it can drain in-flight
+    // work before the IOContext is destroyed, and walks active_client_fds_
+    // to shutdown() each fd so any suspended recv/send fails out.
+    struct ConnectionGuard {
+        Server* server;
+        int fd;
+        ConnectionGuard(Server* s, int f) : server(s), fd(f) {
+            {
+                std::lock_guard<std::mutex> lock(server->client_fds_mutex_);
+                server->active_client_fds_.insert(fd);
+            }
+            server->active_connections_.fetch_add(1, std::memory_order_acq_rel);
+        }
+        ~ConnectionGuard() {
+            {
+                std::lock_guard<std::mutex> lock(server->client_fds_mutex_);
+                server->active_client_fds_.erase(fd);
+            }
+            server->active_connections_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        ConnectionGuard(const ConnectionGuard&) = delete;
+        ConnectionGuard& operator=(const ConnectionGuard&) = delete;
+        ConnectionGuard(ConnectionGuard&&) = delete;
+        ConnectionGuard& operator=(ConnectionGuard&&) = delete;
+    };
+    ConnectionGuard guard(this, socket.fd());
+
     try {
         std::vector<uint8_t> buffer;
         co_await socket.async_read(buffer, 2048);
@@ -1109,10 +1138,12 @@ void Server::run() {
 }
 
 void Server::stop() {
+    // Step 1: stop accepting new connections.
     running_.store(false);
-    io_context_->stop();
 
-    // Close all listening sockets. This also releases any accept coroutines suspended on them.
+    // Step 2: close listening sockets so accept coroutines unwind. We do
+    // this BEFORE asking the IOContext to stop so the event loop can keep
+    // processing the unwinds.
     std::vector<int> fds;
     {
         std::lock_guard<std::mutex> lock(listen_fds_mutex_);
@@ -1126,6 +1157,41 @@ void Server::stop() {
         io_context_->platform_io().remove_fd(fd);
         close_socket(fd);
     }
+
+    // Step 3: shutdown(2) every active client fd. This forces any
+    // coroutine suspended on recv/send for that connection to wake up
+    // with an error, unwind through its destructors, and decrement
+    // active_connections_ via the ConnectionGuard.
+    {
+        std::lock_guard<std::mutex> lock(client_fds_mutex_);
+        for (int fd : active_client_fds_) {
+            if (fd < 0) {
+                continue;
+            }
+#ifdef _WIN32
+            shutdown(fd, SD_BOTH);
+#else
+            ::shutdown(fd, SHUT_RDWR);
+#endif
+        }
+    }
+
+    // Step 4: drain in-flight coroutines, with a deadline so a wedged
+    // handler can't deadlock stop(). 1 second is a defensible upper bound
+    // for any reasonable in-flight request to either complete or fail
+    // out after its socket has been shut down.
+    const auto drain_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (active_connections_.load(std::memory_order_acquire) > 0 &&
+           std::chrono::steady_clock::now() < drain_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    // Step 5: signal the IOContext loop to exit. After this returns,
+    // worker threads (joined inside IOContext::run) will terminate. Any
+    // coroutines still suspended past the drain deadline will leak — we
+    // accept that over a deadlocked shutdown.
+    io_context_->stop();
 }
 
 // NOLINTEND(
