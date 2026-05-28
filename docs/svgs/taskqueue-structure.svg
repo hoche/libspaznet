@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 380" role="img" aria-labelledby="title">
+  <title id="title">TaskQueue internal structure (Michael-Scott style linked list)</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#444"/>
+    </marker>
+    <style>
+      .group { fill: none; stroke: #888; stroke-dasharray: 5 3; stroke-width: 1; }
+      .group-label { font: 600 12px sans-serif; fill: #555; }
+      .dummy  { fill: #ffe1e1; stroke: #555; stroke-width: 1.4; }
+      .ptr    { fill: #e1ffe1; stroke: #555; stroke-width: 1.4; }
+      .node   { fill: #f0e1ff; stroke: #555; stroke-width: 1.4; }
+      .enq    { fill: #fff4e1; stroke: #555; stroke-width: 1.4; }
+      .deq    { fill: #f0e1ff; stroke: #555; stroke-width: 1.4; }
+      .out    { fill: #ffffff; stroke: #555; stroke-width: 1.4; }
+      .label  { font: 13px sans-serif; fill: #222; text-anchor: middle; }
+      .small  { font: 11px sans-serif; fill: #555; text-anchor: middle; }
+      .edge   { stroke: #444; stroke-width: 1.4; fill: none; }
+      .ptr-edge { stroke: #444; stroke-width: 1.4; fill: none; stroke-dasharray: 4 3; }
+      .edge-label { font: 11px sans-serif; fill: #333; text-anchor: middle; }
+      .edge-label-bg { fill: white; }
+    </style>
+  </defs>
+
+  <rect class="group" x="20" y="40" width="840" height="180" rx="8"/>
+  <text class="group-label" x="40" y="60">TaskQueue — lock-free enqueue / mutex-protected dequeue</text>
+
+  <!-- head_ and tail_ atomic pointers, anchored above the chain -->
+  <rect class="ptr" x="50" y="80" width="140" height="40" rx="6"/>
+  <text class="label" x="120" y="105">head_  (atomic Node*)</text>
+  <rect class="ptr" x="710" y="80" width="140" height="40" rx="6"/>
+  <text class="label" x="780" y="105">tail_  (atomic Node*)</text>
+
+  <!-- Chain of nodes: dummy -> N1 -> N2 -> N3 -> null -->
+  <rect class="dummy" x="60" y="160" width="120" height="46" rx="6"/>
+  <text class="label" x="120" y="180">Dummy</text>
+  <text class="small" x="120" y="196">(sentinel)</text>
+
+  <rect class="node" x="220" y="160" width="120" height="46" rx="6"/>
+  <text class="label" x="280" y="180">Node 1</text>
+  <text class="small" x="280" y="196">Task A</text>
+
+  <rect class="node" x="380" y="160" width="120" height="46" rx="6"/>
+  <text class="label" x="440" y="180">Node 2</text>
+  <text class="small" x="440" y="196">Task B</text>
+
+  <rect class="node" x="540" y="160" width="120" height="46" rx="6"/>
+  <text class="label" x="600" y="180">Node 3</text>
+  <text class="small" x="600" y="196">Task C</text>
+
+  <rect class="out" x="700" y="170" width="60" height="26" rx="6"/>
+  <text class="label" x="730" y="187">null</text>
+
+  <!-- next pointers along the chain -->
+  <line class="edge" x1="180" y1="183" x2="220" y2="183" marker-end="url(#arrow)"/>
+  <line class="edge" x1="340" y1="183" x2="380" y2="183" marker-end="url(#arrow)"/>
+  <line class="edge" x1="500" y1="183" x2="540" y2="183" marker-end="url(#arrow)"/>
+  <line class="edge" x1="660" y1="183" x2="700" y2="183" marker-end="url(#arrow)"/>
+  <text class="edge-label" x="200" y="178">next</text>
+  <text class="edge-label" x="360" y="178">next</text>
+  <text class="edge-label" x="520" y="178">next</text>
+  <text class="edge-label" x="680" y="178">next</text>
+
+  <!-- head_ points to dummy; tail_ points to N3 -->
+  <path class="ptr-edge" d="M120,120 L120,160" marker-end="url(#arrow)"/>
+  <path class="ptr-edge" d="M780,120 L780,140 L600,140 L600,160" marker-end="url(#arrow)"/>
+
+  <!-- Operations: enqueue and dequeue -->
+  <rect class="enq" x="60" y="260" width="180" height="46" rx="6"/>
+  <text class="label" x="150" y="280">enqueue(Task)</text>
+  <text class="small" x="150" y="297">CAS tail_ atomically</text>
+
+  <rect class="deq" x="340" y="260" width="180" height="46" rx="6"/>
+  <text class="label" x="430" y="280">dequeue(Task)</text>
+  <text class="small" x="430" y="297">mutex-protected</text>
+
+  <rect class="out" x="600" y="266" width="220" height="34" rx="6"/>
+  <text class="label" x="710" y="287">→ Task (moved out)</text>
+
+  <!-- enqueue -> tail_ -->
+  <path class="edge" d="M150,260 L150,140 L780,140 L780,120" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="380" y="132" width="120" height="16"/>
+  <text class="edge-label" x="440" y="144">new Node → tail_</text>
+
+  <!-- dequeue -> head_ -->
+  <path class="edge" d="M430,260 L430,140 L120,140 L120,120" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="190" y="252" width="160" height="16"/>
+  <text class="edge-label" x="270" y="264">lock, advance head_</text>
+
+  <!-- dequeue -> output -->
+  <line class="edge" x1="520" y1="283" x2="600" y2="283" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="535" y="266" width="50" height="16"/>
+  <text class="edge-label" x="560" y="278">return</text>
+
+  <!-- Caption -->
+  <text class="label" x="440" y="350" style="font-size:12px; fill:#666">
+    See docs/mutex-vs-atomics.md for why dequeue keeps the mutex
+  </text>
+  <text class="label" x="440" y="368" style="font-size:12px; fill:#666">
+    while enqueue is fully atomic.
+  </text>
+</svg>

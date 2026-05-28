@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 520" role="img" aria-labelledby="title">
+  <title id="title">I/O operation state machine</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#444"/>
+    </marker>
+    <style>
+      .state { fill: #e1f5ff; stroke: #555; stroke-width: 1.4; }
+      .terminal { fill: #222; }
+      .label { font: 13px sans-serif; fill: #222; text-anchor: middle; }
+      .note  { fill: #fffbe6; stroke: #c9a341; stroke-width: 1; }
+      .note-label { font: 11px sans-serif; fill: #5a4710; text-anchor: middle; }
+      .edge  { stroke: #444; stroke-width: 1.4; fill: none; }
+      .edge-label { font: 11px sans-serif; fill: #333; text-anchor: middle; }
+      .edge-label-bg { fill: white; }
+    </style>
+  </defs>
+
+  <!-- Start dot -->
+  <circle class="terminal" cx="60" cy="80" r="9"/>
+
+  <!-- Created -->
+  <rect class="state" x="130" y="60" width="130" height="40" rx="20"/>
+  <text class="label" x="195" y="84">Created</text>
+
+  <!-- Scheduled -->
+  <rect class="state" x="310" y="60" width="130" height="40" rx="20"/>
+  <text class="label" x="375" y="84">Scheduled</text>
+
+  <!-- Running -->
+  <rect class="state" x="490" y="60" width="130" height="40" rx="20"/>
+  <text class="label" x="555" y="84">Running</text>
+
+  <!-- Suspended -->
+  <rect class="state" x="670" y="60" width="130" height="40" rx="20"/>
+  <text class="label" x="735" y="84">Suspended</text>
+
+  <!-- Registered -->
+  <rect class="state" x="670" y="180" width="130" height="40" rx="20"/>
+  <text class="label" x="735" y="204">Registered</text>
+
+  <!-- Waiting -->
+  <rect class="state" x="490" y="180" width="130" height="40" rx="20"/>
+  <text class="label" x="555" y="204">Waiting</text>
+
+  <!-- Ready -->
+  <rect class="state" x="310" y="180" width="130" height="40" rx="20"/>
+  <text class="label" x="375" y="204">Ready</text>
+
+  <!-- Extracted -->
+  <rect class="state" x="130" y="180" width="130" height="40" rx="20"/>
+  <text class="label" x="195" y="204">Extracted</text>
+
+  <!-- Rescheduled -->
+  <rect class="state" x="130" y="300" width="130" height="40" rx="20"/>
+  <text class="label" x="195" y="324">Rescheduled</text>
+
+  <!-- Running (again) → Completed -->
+  <rect class="state" x="310" y="300" width="130" height="40" rx="20"/>
+  <text class="label" x="375" y="324">Completed</text>
+
+  <!-- Final dot -->
+  <circle class="terminal" cx="500" cy="320" r="9"/>
+  <circle cx="500" cy="320" r="5" fill="white"/>
+
+  <!-- Edges along the top row left → right -->
+  <line class="edge" x1="69" y1="80" x2="130" y2="80" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="75" y="63" width="60" height="14"/>
+  <text class="edge-label" x="105" y="74">schedule</text>
+
+  <line class="edge" x1="260" y1="80" x2="310" y2="80" marker-end="url(#arrow)"/>
+  <text class="edge-label" x="285" y="74">enqueue</text>
+
+  <line class="edge" x1="440" y1="80" x2="490" y2="80" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="445" y="63" width="40" height="14"/>
+  <text class="edge-label" x="465" y="74">resume</text>
+
+  <line class="edge" x1="620" y1="80" x2="670" y2="80" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="625" y="63" width="40" height="14"/>
+  <text class="edge-label" x="645" y="74">co_await</text>
+
+  <!-- top-right turn: Suspended -> Registered -->
+  <line class="edge" x1="735" y1="100" x2="735" y2="180" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="740" y="130" width="80" height="14"/>
+  <text class="edge-label" x="780" y="141" text-anchor="start">register_io</text>
+
+  <!-- Registered -> Waiting -->
+  <line class="edge" x1="670" y1="200" x2="620" y2="200" marker-end="url(#arrow)"/>
+
+  <!-- Waiting -> Ready -->
+  <line class="edge" x1="490" y1="200" x2="440" y2="200" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="445" y="184" width="40" height="14"/>
+  <text class="edge-label" x="465" y="195">fd ready</text>
+
+  <!-- Ready -> Extracted -->
+  <line class="edge" x1="310" y1="200" x2="260" y2="200" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="262" y="184" width="50" height="14"/>
+  <text class="edge-label" x="287" y="195">process</text>
+
+  <!-- Extracted -> Rescheduled (left column down) -->
+  <line class="edge" x1="195" y1="220" x2="195" y2="300" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="200" y="250" width="80" height="14"/>
+  <text class="edge-label" x="240" y="261" text-anchor="start">schedule</text>
+
+  <!-- Rescheduled -> Running(Completed) -->
+  <line class="edge" x1="260" y1="320" x2="310" y2="320" marker-end="url(#arrow)"/>
+  <text class="edge-label" x="285" y="312">resume</text>
+
+  <!-- Completed -> end dot -->
+  <line class="edge" x1="440" y1="320" x2="491" y2="320" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="445" y="304" width="40" height="14"/>
+  <text class="edge-label" x="465" y="315">co_return</text>
+
+  <!-- Notes -->
+  <rect class="note" x="670" y="280" width="200" height="60" rx="6"/>
+  <text class="note-label" x="770" y="300">Coroutine handle stored</text>
+  <text class="note-label" x="770" y="316">atomically in pending_io_</text>
+  <text class="note-label" x="770" y="332">across the suspension</text>
+  <line class="edge" x1="735" y1="100" x2="735" y2="120" stroke-dasharray="3 2"/>
+
+  <rect class="note" x="40" y="380" width="240" height="60" rx="6"/>
+  <text class="note-label" x="160" y="400">When the fd becomes readable, the</text>
+  <text class="note-label" x="160" y="416">main loop extracts the handle and</text>
+  <text class="note-label" x="160" y="432">re-schedules the coroutine to a worker.</text>
+</svg>

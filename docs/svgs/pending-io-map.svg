@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 520" role="img" aria-labelledby="title">
+  <title id="title">pending_io_ map structure</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#444"/>
+    </marker>
+    <style>
+      .group { fill: none; stroke: #888; stroke-dasharray: 5 3; stroke-width: 1; }
+      .group-label { font: 600 12px sans-serif; fill: #555; }
+      .map   { fill: #e1f5ff; stroke: #555; stroke-width: 1.4; }
+      .io    { fill: #fff4e1; stroke: #555; stroke-width: 1.4; }
+      .coro  { fill: #f0e1ff; stroke: #555; stroke-width: 1.4; }
+      .lock  { fill: #ffe1e1; stroke: #555; stroke-width: 1.4; }
+      .label { font: 13px sans-serif; fill: #222; text-anchor: middle; }
+      .small { font: 11px sans-serif; fill: #555; text-anchor: middle; }
+      .edge  { stroke: #444; stroke-width: 1.4; fill: none; }
+      .ptr-edge { stroke: #444; stroke-width: 1.4; fill: none; stroke-dasharray: 4 3; }
+      .edge-label { font: 11px sans-serif; fill: #333; text-anchor: middle; }
+      .edge-label-bg { fill: white; }
+    </style>
+  </defs>
+
+  <!-- map column -->
+  <rect class="group" x="40" y="60" width="200" height="320" rx="8"/>
+  <text class="group-label" x="60" y="80">pending_io_  (unordered_map)</text>
+  <rect class="map" x="80" y="110" width="120" height="46" rx="6"/>
+  <text class="label" x="140" y="138">fd: 5</text>
+  <rect class="map" x="80" y="200" width="120" height="46" rx="6"/>
+  <text class="label" x="140" y="228">fd: 7</text>
+  <rect class="map" x="80" y="290" width="120" height="46" rx="6"/>
+  <text class="label" x="140" y="318">fd: 12</text>
+
+  <!-- map_lock_ -->
+  <rect class="lock" x="40" y="410" width="200" height="50" rx="6"/>
+  <text class="label" x="140" y="432">map_lock_  (spinlock)</text>
+  <text class="small" x="140" y="452">held only during map mutation</text>
+
+  <!-- PendingIO column -->
+  <rect class="group" x="320" y="60" width="270" height="320" rx="8"/>
+  <text class="group-label" x="340" y="80">PendingIO  (per-fd record)</text>
+
+  <!-- PendingIO 1 -->
+  <rect class="io" x="350" y="100" width="220" height="70" rx="6"/>
+  <text class="label" x="460" y="120">PendingIO for fd: 5</text>
+  <rect x="365" y="130" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="141">read_handle  (atomic void*)</text>
+  <rect x="365" y="148" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="159">write_handle (atomic void*)</text>
+
+  <!-- PendingIO 2 -->
+  <rect class="io" x="350" y="190" width="220" height="70" rx="6"/>
+  <text class="label" x="460" y="210">PendingIO for fd: 7</text>
+  <rect x="365" y="220" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="231">read_handle  (atomic void*)</text>
+  <rect x="365" y="238" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="249">write_handle (atomic void*)</text>
+
+  <!-- PendingIO 3 -->
+  <rect class="io" x="350" y="280" width="220" height="70" rx="6"/>
+  <text class="label" x="460" y="300">PendingIO for fd: 12</text>
+  <rect x="365" y="310" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="321">read_handle  (atomic void*)</text>
+  <rect x="365" y="328" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="339">write_handle (atomic void*)</text>
+
+  <!-- Coroutines column -->
+  <rect class="group" x="660" y="60" width="200" height="320" rx="8"/>
+  <text class="group-label" x="680" y="80">Suspended coroutines</text>
+  <rect class="coro" x="690" y="110" width="140" height="46" rx="6"/>
+  <text class="label" x="760" y="138">Coroutine A</text>
+  <rect class="coro" x="690" y="200" width="140" height="46" rx="6"/>
+  <text class="label" x="760" y="228">Coroutine B</text>
+  <rect class="coro" x="690" y="290" width="140" height="46" rx="6"/>
+  <text class="label" x="760" y="318">Coroutine C</text>
+
+  <!-- map -> PendingIO edges -->
+  <line class="edge" x1="200" y1="133" x2="350" y2="133" marker-end="url(#arrow)"/>
+  <line class="edge" x1="200" y1="223" x2="350" y2="223" marker-end="url(#arrow)"/>
+  <line class="edge" x1="200" y1="313" x2="350" y2="313" marker-end="url(#arrow)"/>
+
+  <!-- PendingIO read_handle -> coroutine (dashed) -->
+  <path class="ptr-edge" d="M570,137 L690,133" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="588" y="125" width="86" height="14"/>
+  <text class="edge-label" x="631" y="136">read awaits</text>
+
+  <path class="ptr-edge" d="M570,155 L690,223" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="592" y="180" width="86" height="14"/>
+  <text class="edge-label" x="635" y="191">write awaits</text>
+
+  <path class="ptr-edge" d="M570,227 L690,313" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="592" y="265" width="86" height="14"/>
+  <text class="edge-label" x="635" y="276">read awaits</text>
+
+  <!-- lock annotation pointing at map -->
+  <path class="edge" d="M140,410 L140,380" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="150" y="385" width="84" height="14"/>
+  <text class="edge-label" x="192" y="396">guards map</text>
+
+  <!-- Caption -->
+  <text class="label" x="450" y="490" style="font-size:12px; fill:#666">
+    Lookup is keyed by file descriptor; each PendingIO holds two atomic handles so
+  </text>
+  <text class="label" x="450" y="506" style="font-size:12px; fill:#666">
+    independent read- and write-waiters on the same fd don't collide.
+  </text>
+</svg>

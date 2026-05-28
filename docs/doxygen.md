@@ -55,9 +55,17 @@ Consider grouping related APIs to improve navigation:
 
 Attach symbols with `\ingroup core` (etc.) in their comments.
 
-## Mermaid in Doxygen
+## Diagrams
 
-Doxygen preserves fenced code blocks; GitHub-compatible Mermaid diagrams in `docs/*.md` (e.g., `concurrency-and-coroutines.md`) render on GitHub and remain readable in generated HTML as code blocks. Keep them fenced with ```mermaid for consistency.
+Diagrams live under `docs/svgs/` as standalone, hand-authored SVG files
+(no Mermaid or other runtime dependency). Markdown references them with
+plain image syntax — e.g. `![Architecture overview](svgs/architecture-overview.svg)` —
+which renders identically on GitHub and in Doxygen-generated HTML.
+
+To revise a diagram, edit the `.svg` directly; there is no source format
+to keep in sync. SVG XML is small and verbose but readable in a text
+editor, and tools like Inkscape, Boxy SVG, or a browser's devtools work
+well for visual tweaks.
 
 
 

@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1020 740" role="img" aria-labelledby="title">
+  <title id="title">Core execution model — main loop, workers, queues, platform I/O, timers</title>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#444"/>
+    </marker>
+    <style>
+      .group { fill: none; stroke: #888; stroke-dasharray: 5 3; stroke-width: 1; }
+      .group-label { font: 600 12px sans-serif; fill: #555; }
+      .main  { fill: #e1f5ff; stroke: #555; stroke-width: 1.4; }
+      .work  { fill: #fff4e1; stroke: #555; stroke-width: 1.4; }
+      .queue { fill: #f0e1ff; stroke: #555; stroke-width: 1.4; }
+      .plat  { fill: #e1ffe1; stroke: #555; stroke-width: 1.4; }
+      .timer { fill: #ffe1f5; stroke: #555; stroke-width: 1.4; }
+      .kern  { fill: #fdf6e3; stroke: #777; stroke-width: 1.4; }
+      .label { font: 13px sans-serif; fill: #222; text-anchor: middle; }
+      .small { font: 11px sans-serif; fill: #555; text-anchor: middle; }
+      .edge  { stroke: #444; stroke-width: 1.4; fill: none; }
+      .edge-label { font: 11px sans-serif; fill: #333; text-anchor: middle; }
+      .edge-label-bg { fill: white; }
+    </style>
+  </defs>
+
+  <!-- Main loop column (left) -->
+  <rect class="group" x="40" y="40" width="240" height="430" rx="8"/>
+  <text class="group-label" x="60" y="60">Main event loop thread</text>
+  <rect class="main" x="70" y="80"  width="180" height="40" rx="6"/>
+  <text class="label" x="160" y="104">IOContext::run()</text>
+  <rect class="main" x="70" y="140" width="180" height="40" rx="6"/>
+  <text class="label" x="160" y="164">process_timers()</text>
+  <rect class="main" x="70" y="200" width="180" height="40" rx="6"/>
+  <text class="label" x="160" y="224">platform_io_-&gt;wait()</text>
+  <rect class="main" x="70" y="260" width="180" height="40" rx="6"/>
+  <text class="label" x="160" y="284">process_io_events()</text>
+  <rect class="main" x="70" y="320" width="180" height="40" rx="6"/>
+  <text class="label" x="160" y="344">Steal from queues</text>
+
+  <!-- Internal main-loop edges -->
+  <line class="edge" x1="160" y1="120" x2="160" y2="140" marker-end="url(#arrow)"/>
+  <line class="edge" x1="160" y1="180" x2="160" y2="200" marker-end="url(#arrow)"/>
+  <line class="edge" x1="160" y1="240" x2="160" y2="260" marker-end="url(#arrow)"/>
+  <line class="edge" x1="160" y1="300" x2="160" y2="320" marker-end="url(#arrow)"/>
+  <path class="edge" d="M70,340 L40,340 L40,100 L70,100" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="0" y="212" width="40" height="14"/>
+  <text class="edge-label" x="20" y="223">loop</text>
+
+  <!-- TaskQueues column (middle) -->
+  <rect class="group" x="350" y="160" width="220" height="170" rx="8"/>
+  <text class="group-label" x="370" y="180">TaskQueues</text>
+  <rect class="queue" x="380" y="200" width="160" height="32" rx="6"/>
+  <text class="label" x="460" y="220">TaskQueue 0</text>
+  <rect class="queue" x="380" y="240" width="160" height="32" rx="6"/>
+  <text class="label" x="460" y="260">TaskQueue 1</text>
+  <rect class="queue" x="380" y="280" width="160" height="32" rx="6"/>
+  <text class="label" x="460" y="300">TaskQueue N-1</text>
+
+  <!-- Worker pool (top right) -->
+  <rect class="group" x="630" y="40" width="220" height="220" rx="8"/>
+  <text class="group-label" x="650" y="60">Worker threads 0..N-1</text>
+  <rect class="work" x="660" y="80"  width="160" height="36" rx="6"/>
+  <text class="label" x="740" y="103">Worker 0</text>
+  <rect class="work" x="660" y="130" width="160" height="36" rx="6"/>
+  <text class="label" x="740" y="153">Worker 1</text>
+  <rect class="work" x="660" y="180" width="160" height="36" rx="6"/>
+  <text class="label" x="740" y="203">Worker N-1</text>
+
+  <!-- Coroutines (bottom right of workers) -->
+  <rect class="queue" x="660" y="290" width="160" height="40" rx="6"/>
+  <text class="label" x="740" y="314">Coroutines</text>
+
+  <!-- Platform I/O (lower left) -->
+  <rect class="group" x="350" y="380" width="320" height="160" rx="8"/>
+  <text class="group-label" x="370" y="400">Platform I/O</text>
+  <rect class="plat" x="390" y="420" width="220" height="36" rx="6"/>
+  <text class="label" x="500" y="443">epoll / kqueue / poll / IOCP</text>
+  <rect class="plat" x="390" y="470" width="220" height="40" rx="6"/>
+  <text class="label" x="500" y="494">pending_io_  (fd → handles)</text>
+
+  <!-- Timer heap (lower right) -->
+  <rect class="group" x="730" y="380" width="240" height="160" rx="8"/>
+  <text class="group-label" x="750" y="400">Timer management</text>
+  <rect class="timer" x="760" y="420" width="180" height="36" rx="6"/>
+  <text class="label" x="850" y="443">Priority queue</text>
+  <rect class="timer" x="760" y="470" width="180" height="36" rx="6"/>
+  <text class="label" x="850" y="493">Cancelled set</text>
+
+  <!-- OS kernel (bottom) -->
+  <rect class="group" x="350" y="580" width="620" height="120" rx="8"/>
+  <text class="group-label" x="370" y="600">OS kernel</text>
+  <rect class="kern" x="390" y="620" width="220" height="40" rx="6"/>
+  <text class="label" x="500" y="644">I/O events (fd ready)</text>
+  <rect class="kern" x="730" y="620" width="240" height="40" rx="6"/>
+  <text class="label" x="850" y="644">System clock</text>
+
+  <!-- process_io_events -> queues -->
+  <path class="edge" d="M250,280 L350,250" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="265" y="252" width="58" height="14"/>
+  <text class="edge-label" x="294" y="263">schedule</text>
+
+  <!-- process_io_events -> pending_io_ -->
+  <path class="edge" d="M250,290 L390,470" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="280" y="370" width="98" height="14"/>
+  <text class="edge-label" x="329" y="381">extract handles</text>
+
+  <!-- process_timers -> heap -->
+  <path class="edge" d="M250,160 L760,438" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="540" y="288" width="68" height="14"/>
+  <text class="edge-label" x="574" y="299">check due</text>
+
+  <!-- timers -> queues (schedule) -->
+  <path class="edge" d="M760,438 L570,280" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="612" y="358" width="58" height="14"/>
+  <text class="edge-label" x="641" y="369">schedule</text>
+
+  <!-- platform_io_ -> process_io_events -->
+  <path class="edge" d="M390,438 L260,280" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="290" y="354" width="70" height="14"/>
+  <text class="edge-label" x="325" y="365">events</text>
+
+  <!-- Queues -> workers (dequeue) -->
+  <path class="edge" d="M540,260 L660,160" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="552" y="210" width="60" height="14"/>
+  <text class="edge-label" x="582" y="221">dequeue</text>
+
+  <!-- Workers -> coroutines (resume) -->
+  <line class="edge" x1="740" y1="216" x2="740" y2="290" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="745" y="244" width="50" height="14"/>
+  <text class="edge-label" x="770" y="255" text-anchor="start">resume</text>
+
+  <!-- Coroutines -> queues (yield) -->
+  <path class="edge" d="M660,310 L540,290" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="556" y="298" width="76" height="14"/>
+  <text class="edge-label" x="594" y="309">yield/suspend</text>
+
+  <!-- Kernel -> PlatformIO -->
+  <line class="edge" x1="500" y1="620" x2="500" y2="510" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="505" y="555" width="62" height="14"/>
+  <text class="edge-label" x="536" y="566" text-anchor="start">fd ready</text>
+
+  <!-- Clock -> process_timers -->
+  <path class="edge" d="M850,620 L850,540 L300,540 L260,180" marker-end="url(#arrow)"/>
+  <rect class="edge-label-bg" x="520" y="528" width="80" height="14"/>
+  <text class="edge-label" x="560" y="539">tick</text>
+
+  <!-- heap -> cancelled -->
+  <line class="edge" x1="850" y1="456" x2="850" y2="470" marker-end="url(#arrow)"/>
+
+  <!-- Caption -->
+  <text class="label" x="510" y="725" style="font-size:12px; fill:#666">
+    The main loop alternates between firing due timers and waiting on platform I/O; both paths schedule
+  </text>
+</svg>
