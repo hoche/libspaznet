@@ -65,6 +65,41 @@ TEST_F(PlatformIOTest, AddRemoveFd) {
 #endif
 }
 
+// Regression: kqueue's remove_fd used to issue EV_DELETE for both
+// EVFILT_READ and EVFILT_WRITE regardless of which filters had
+// actually been registered, returning ENOENT for the absent filter
+// and reporting failure. Verify that adding only one direction lets
+// remove_fd succeed.
+TEST_F(PlatformIOTest, AddOnlyReadThenRemoveSucceeds) {
+    int fd = create_test_socket();
+    ASSERT_GE(fd, 0);
+
+    void* user_data = reinterpret_cast<void*>(0xABCD);
+    EXPECT_TRUE(platform_io->add_fd(fd, PlatformIO::EVENT_READ, user_data));
+    EXPECT_TRUE(platform_io->remove_fd(fd));
+
+#ifdef _WIN32
+    closesocket(fd);
+#else
+    close(fd);
+#endif
+}
+
+TEST_F(PlatformIOTest, AddOnlyWriteThenRemoveSucceeds) {
+    int fd = create_test_socket();
+    ASSERT_GE(fd, 0);
+
+    void* user_data = reinterpret_cast<void*>(0xABCD);
+    EXPECT_TRUE(platform_io->add_fd(fd, PlatformIO::EVENT_WRITE, user_data));
+    EXPECT_TRUE(platform_io->remove_fd(fd));
+
+#ifdef _WIN32
+    closesocket(fd);
+#else
+    close(fd);
+#endif
+}
+
 TEST_F(PlatformIOTest, ModifyFd) {
     int fd = create_test_socket();
     ASSERT_GE(fd, 0);
