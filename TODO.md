@@ -39,12 +39,15 @@
     drop entries whose name isn't a valid token or whose value
     contains CR/LF/NUL. 7 unit tests cover the rejection paths.
 
-- [ ] Build hygiene
-  - Add -Wall -Wextra -Wpedantic -Wconversion -Wshadow to release/debug.
-  - Wire up sanitizer build configs (ASan, UBSan, TSan).
-  - find_package(Threads REQUIRED) and link Threads::Threads (Linux).
-  - Add WSAStartup/WSACleanup on Windows.
-  - Add install(EXPORT) so downstream find_package(spaznet) works.
+- [x] Build hygiene
+  - Shipped on branch fix/build-hygiene, merged via 5b5a1b9.
+    -Wall/-Wextra/-Wpedantic on the library (tests run a slightly
+    looser set); googletest treated as SYSTEM; find_package(Threads)
+    + Threads::Threads; install(EXPORT) + spaznetConfig.cmake so
+    downstream find_package(spaznet) works; WSAStartup via call_once
+    on Windows; verified ASan + UBSan suites are still clean.
+  - -Wconversion / -Wshadow intentionally deferred — both fire across
+    existing code; cleaning them up is a separate, bounded project.
 
 ## Other
 
