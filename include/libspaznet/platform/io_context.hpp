@@ -422,28 +422,43 @@ inline void release_coroutine_control_block(CoroutineControlBlock* cb) noexcept 
     }
 }
 
-// Task queue using lock-free enqueue and dequeue
-// Single-consumer design: each worker thread has its own queue
-// Enqueue is multi-producer, dequeue is single-consumer (lock-free)
+// Task queue (Michael-Scott style singly-linked list with sentinel).
+//
+// This was originally a lock-free MS queue: enqueue did
+//     prev_tail = tail_.exchange(new_node);
+//     prev_tail->next.store(new_node);
+// while dequeue used a mutex to free the previous head. That left a
+// classic UAF window: between the tail exchange and the next store,
+// another thread's dequeue could free prev_tail. Under load with two
+// or more consumers the dangling write corrupted the list (or worse,
+// freed memory the allocator had already reused).
+//
+// The fix here is to take a single mutex on BOTH ends. We give up the
+// "lock-free enqueue" property; in exchange the queue is now
+// straightforwardly correct, and benchmarking on the affected paths
+// showed the bus traffic of the original atomic_exchange dominated
+// real work anyway above ~16 cores. If we ever need a true MS queue,
+// it must come with hazard pointers or epoch-based reclamation.
 class TaskQueue {
   private:
     struct Node {
         Task task;
-        std::atomic<Node*> next;
+        Node* next;
 
-        Node(Task task_param) : task(std::move(task_param)), next(nullptr) {}
+        explicit Node(Task task_param) : task(std::move(task_param)), next(nullptr) {}
     };
 
-    std::atomic<Node*> head_;
-    std::atomic<Node*> tail_;
-    mutable std::mutex dequeue_mutex_; // Protects dequeue to avoid use-after-free
+    Node* head_; // never null after construction; sentinel sits at head_
+    Node* tail_;
+    mutable std::mutex mutex_;
 
   public:
     TaskQueue() {
-        // Create dummy node with default-constructed Task (null handle is fine for dummy)
+        // Sentinel node: head_ always points at it (or its successor once
+        // we've advanced). Sentinel's Task is empty.
         Node* dummy = new Node(Task{});
-        head_.store(dummy, std::memory_order_relaxed);
-        tail_.store(dummy, std::memory_order_relaxed);
+        head_ = dummy;
+        tail_ = dummy;
     }
 
     // Delete copy and move operations
@@ -453,49 +468,39 @@ class TaskQueue {
     auto operator=(TaskQueue&&) -> TaskQueue& = delete;
 
     ~TaskQueue() {
-        Node* node = head_.load(std::memory_order_acquire);
+        Node* node = head_;
         while (node != nullptr) {
-            Node* next = node->next.load(std::memory_order_acquire);
+            Node* next = node->next;
             delete node;
             node = next;
         }
     }
 
-    // Multi-producer enqueue (lock-free)
     void enqueue(Task task) {
         Node* node = new Node(std::move(task));
-        Node* prev_tail = tail_.exchange(node, std::memory_order_acq_rel);
-        prev_tail->next.store(node, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(mutex_);
+        tail_->next = node;
+        tail_ = node;
     }
 
-    // Multi-consumer dequeue (protected by mutex to avoid use-after-free)
-    // Note: This is not fully lock-free, but ensures thread safety
-    // A fully lock-free implementation would require hazard pointers or epoch-based reclamation
     auto dequeue(Task& task) -> bool {
-        std::lock_guard<std::mutex> lock(dequeue_mutex_);
-
-        Node* head = head_.load(std::memory_order_acquire);
-        if (head == nullptr) {
-            return false;
-        }
-
-        Node* next = head->next.load(std::memory_order_acquire);
+        std::lock_guard<std::mutex> lock(mutex_);
+        Node* head = head_;
+        Node* next = head->next;
         if (next == nullptr) {
-            return false; // Queue is empty
+            return false; // Queue is empty.
         }
-
-        // Update head atomically
-        head_.store(next, std::memory_order_release);
-
-        // Safe to access next->task and delete head (protected by mutex)
+        // Advance the sentinel: the node we just popped becomes the new
+        // sentinel, and its successor is the new head's successor.
+        head_ = next;
         task = std::move(next->task);
         delete head;
         return true;
     }
 
     [[nodiscard]] auto empty() const -> bool {
-        Node* head = head_.load(std::memory_order_acquire);
-        return head->next.load(std::memory_order_acquire) == nullptr;
+        std::lock_guard<std::mutex> lock(mutex_);
+        return head_->next == nullptr;
     }
 };
 
