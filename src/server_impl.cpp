@@ -726,12 +726,24 @@ Task Server::handle_connection(Socket socket) {
 
     // RAII guard: track this connection from entry to exit (including
     // exception unwinds and every co_return path below). Server::stop()
-    // waits on active_connections_ reaching zero so it can drain in-flight
-    // work before the IOContext is destroyed, and walks active_client_fds_
-    // to shutdown() each fd so any suspended recv/send fails out.
+    // waits on active_connections_ reaching zero so it can drain
+    // in-flight work before the IOContext is destroyed, and walks
+    // active_client_fds_ to shutdown() each fd so any suspended
+    // recv/send fails out.
+    //
+    // The release() method exists to close a TOCTOU window: several
+    // paths below call `socket.close()` mid-coroutine. Without an
+    // explicit release, the fd would be closed but its number would
+    // still sit in active_client_fds_ until the guard destructs at
+    // co_return — and between those two events the kernel could
+    // hand the same number back to a fresh accept(), at which point
+    // Server::stop() iterating the set would shutdown(2) the wrong
+    // (newly-accepted) socket. We therefore drop the fd from the set
+    // BEFORE we close the socket, in every path.
     struct ConnectionGuard {
         Server* server;
         int fd;
+        bool released = false;
         ConnectionGuard(Server* s, int f) : server(s), fd(f) {
             {
                 std::lock_guard<std::mutex> lock(server->client_fds_mutex_);
@@ -739,12 +751,23 @@ Task Server::handle_connection(Socket socket) {
             }
             server->active_connections_.fetch_add(1, std::memory_order_acq_rel);
         }
-        ~ConnectionGuard() {
+        // Idempotent: safe to call multiple times. Drops the fd from
+        // active_client_fds_ and decrements active_connections_ so a
+        // subsequent Server::stop() drain doesn't shutdown(2) the fd
+        // after it's closed and (possibly) recycled.
+        void release() {
+            if (released) {
+                return;
+            }
+            released = true;
             {
                 std::lock_guard<std::mutex> lock(server->client_fds_mutex_);
                 server->active_client_fds_.erase(fd);
             }
             server->active_connections_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        ~ConnectionGuard() {
+            release();
         }
         ConnectionGuard(const ConnectionGuard&) = delete;
         ConnectionGuard& operator=(const ConnectionGuard&) = delete;
@@ -759,6 +782,7 @@ Task Server::handle_connection(Socket socket) {
         co_await socket.async_read(buffer, 2048);
 
         if (buffer.empty()) {
+            guard.release();
             socket.close();
             co_return;
         }
@@ -816,6 +840,7 @@ Task Server::handle_connection(Socket socket) {
                     co_await socket.async_read(more_data, kReadChunk);
                     if (more_data.empty()) {
                         // Client closed connection (or read error).
+                        guard.release();
                         socket.close();
                         co_return;
                     }
@@ -833,11 +858,13 @@ Task Server::handle_connection(Socket socket) {
 
                     auto error_data = error_response.serialize();
                     co_await socket.async_write(std::move(error_data));
+                    guard.release();
                     socket.close();
                     co_return;
                 }
 
                 if (bytes_consumed > buffer.size()) {
+                    guard.release();
                     socket.close();
                     co_return;
                 }
@@ -878,6 +905,7 @@ Task Server::handle_connection(Socket socket) {
                     socket.context()->decrement_active_requests();
 
                     if (!keep_alive) {
+                        guard.release();
                         socket.close();
                         co_return;
                     }
@@ -1131,6 +1159,9 @@ Task Server::handle_connection(Socket socket) {
         // Catch any exceptions to prevent coroutine crashes
     }
 
+    // Drop the fd from active_client_fds_ before closing the socket —
+    // see the TOCTOU note on ConnectionGuard above.
+    guard.release();
     socket.close();
 }
 
