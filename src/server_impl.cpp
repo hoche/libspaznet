@@ -947,6 +947,17 @@ Task Server::handle_connection(Socket socket) {
                     break;
                 }
                 if (!masked) {
+                    // RFC 6455 §5.1: every client→server frame MUST be masked.
+                    co_await fail_close(1002);
+                    break;
+                }
+                // RFC 6455 §5.2: only 0x0..0x2 (data) and 0x8..0xA (control)
+                // are defined; everything else is reserved and MUST fail.
+                const bool opcode_known =
+                    opcode == WebSocketOpcode::Continuation || opcode == WebSocketOpcode::Text ||
+                    opcode == WebSocketOpcode::Binary || opcode == WebSocketOpcode::Close ||
+                    opcode == WebSocketOpcode::Ping || opcode == WebSocketOpcode::Pong;
+                if (!opcode_known) {
                     co_await fail_close(1002);
                     break;
                 }
@@ -958,6 +969,13 @@ Task Server::handle_connection(Socket socket) {
                         break;
                     }
                     payload_len = (static_cast<uint64_t>(ext[0]) << 8) | ext[1];
+                    // RFC 6455 §5.2: the 16-bit form must be used only when
+                    // length >= 126; otherwise the peer should have used the
+                    // 7-bit form.
+                    if (payload_len < 126) {
+                        co_await fail_close(1002);
+                        break;
+                    }
                 } else if (payload_len == 127) {
                     std::vector<uint8_t> ext;
                     co_await read_exact(8, ext);
@@ -972,6 +990,22 @@ Task Server::handle_connection(Socket socket) {
                         co_await fail_close(1002);
                         break;
                     }
+                    // RFC 6455 §5.2: the 64-bit form must be used only when
+                    // length >= 65536.
+                    if (payload_len < 65536) {
+                        co_await fail_close(1002);
+                        break;
+                    }
+                }
+
+                // Application-level cap: refuse any frame whose declared
+                // payload exceeds kMaxPayloadBytes BEFORE allocating, then
+                // close with 1009 (message too big). Without this, a peer
+                // could declare a payload_len of (2^63 - 1) and trigger an
+                // arbitrarily large allocation in the std::vector below.
+                if (payload_len > WebSocketFrame::kMaxPayloadBytes) {
+                    co_await fail_close(1009);
+                    break;
                 }
 
                 std::vector<uint8_t> mask_key_buf;
@@ -979,8 +1013,14 @@ Task Server::handle_connection(Socket socket) {
                 if (mask_key_buf.size() != 4) {
                     break;
                 }
-                uint32_t masking_key = (mask_key_buf[0] << 24) | (mask_key_buf[1] << 16) |
-                                       (mask_key_buf[2] << 8) | mask_key_buf[3];
+                // Promote each byte to uint32_t before shifting — shifting an
+                // unsigned-char-promoted-to-int by 24 puts the value bit in
+                // the int's sign bit, which is undefined behavior when bit 7
+                // of mask_key_buf[0] is set.
+                uint32_t masking_key = (static_cast<uint32_t>(mask_key_buf[0]) << 24) |
+                                       (static_cast<uint32_t>(mask_key_buf[1]) << 16) |
+                                       (static_cast<uint32_t>(mask_key_buf[2]) << 8) |
+                                       static_cast<uint32_t>(mask_key_buf[3]);
 
                 std::vector<uint8_t> payload(static_cast<std::size_t>(payload_len));
                 if (payload_len > 0) {

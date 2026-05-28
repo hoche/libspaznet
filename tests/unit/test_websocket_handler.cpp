@@ -179,3 +179,88 @@ TEST(WebSocketFrameTest, SerializeAndParse64BitLength) {
     EXPECT_EQ(parsed.payload.front(), 0xAA);
     EXPECT_EQ(parsed.payload.back(), 0xAA);
 }
+
+// --- RFC 6455 compliance tests ---
+
+// Reserved opcodes (0x3–0x7, 0xB–0xF) MUST cause the connection to fail.
+TEST(WebSocketFrameTest, RejectReservedOpcode) {
+    std::vector<uint8_t> data = {0x83, 0x00}; // FIN + reserved opcode 0x3
+    EXPECT_THROW(WebSocketFrame::parse(data), std::runtime_error);
+
+    std::vector<uint8_t> data2 = {0x8B, 0x00}; // FIN + reserved opcode 0xB
+    EXPECT_THROW(WebSocketFrame::parse(data2), std::runtime_error);
+}
+
+// RSV1/2/3 bits set without a negotiated extension MUST fail.
+TEST(WebSocketFrameTest, RejectRsvBits) {
+    std::vector<uint8_t> rsv1 = {0xC1, 0x00}; // FIN + RSV1 + Text
+    EXPECT_THROW(WebSocketFrame::parse(rsv1), std::runtime_error);
+
+    std::vector<uint8_t> rsv2 = {0xA1, 0x00}; // FIN + RSV2 + Text
+    EXPECT_THROW(WebSocketFrame::parse(rsv2), std::runtime_error);
+
+    std::vector<uint8_t> rsv3 = {0x91, 0x00}; // FIN + RSV3 + Text
+    EXPECT_THROW(WebSocketFrame::parse(rsv3), std::runtime_error);
+}
+
+// 16-bit length must be used only when length >= 126.
+TEST(WebSocketFrameTest, RejectNonMinimal16BitLength) {
+    std::vector<uint8_t> data = {
+        0x82,       // FIN + Binary
+        0x7E,       // 16-bit length form
+        0x00, 0x05, // Length 5 — should have used 7-bit form
+    };
+    data.resize(4 + 5, 0); // pad to make the payload itself complete
+    EXPECT_THROW(WebSocketFrame::parse(data), std::runtime_error);
+}
+
+// 64-bit length must be used only when length >= 65536.
+TEST(WebSocketFrameTest, RejectNonMinimal64BitLength) {
+    std::vector<uint8_t> data = {
+        0x82, // FIN + Binary
+        0x7F, // 64-bit length form
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x00, // Length 256 — should have used 16-bit form
+    };
+    EXPECT_THROW(WebSocketFrame::parse(data), std::runtime_error);
+}
+
+// 64-bit length with the high bit set is invalid (RFC 6455 §5.2).
+TEST(WebSocketFrameTest, Reject64BitLengthWithHighBit) {
+    std::vector<uint8_t> data = {
+        0x82, // FIN + Binary
+        0x7F, // 64-bit length form
+        0x80, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, // High bit set
+    };
+    EXPECT_THROW(WebSocketFrame::parse(data), std::runtime_error);
+}
+
+// Control frames MUST NOT be fragmented (FIN must be set).
+TEST(WebSocketFrameTest, RejectFragmentedControlFrame) {
+    std::vector<uint8_t> ping_no_fin = {0x09, 0x00}; // !FIN + Ping
+    EXPECT_THROW(WebSocketFrame::parse(ping_no_fin), std::runtime_error);
+
+    std::vector<uint8_t> close_no_fin = {0x08, 0x00}; // !FIN + Close
+    EXPECT_THROW(WebSocketFrame::parse(close_no_fin), std::runtime_error);
+}
+
+// Control frames MUST have a payload length of 125 or less.
+TEST(WebSocketFrameTest, RejectOversizeControlFrame) {
+    // FIN + Ping, 16-bit length form claiming 200 bytes
+    std::vector<uint8_t> data = {0x89, 0x7E, 0x00, 0xC8};
+    data.resize(4 + 200, 0);
+    EXPECT_THROW(WebSocketFrame::parse(data), std::runtime_error);
+}
+
+// Payload above kMaxPayloadBytes must not be allocated.
+TEST(WebSocketFrameTest, RejectOversizePayload) {
+    const uint64_t huge = WebSocketFrame::kMaxPayloadBytes + 1;
+    std::vector<uint8_t> data = {0x82, 0x7F};
+    for (int i = 7; i >= 0; --i) {
+        data.push_back(static_cast<uint8_t>((huge >> (i * 8)) & 0xFF));
+    }
+    // Note: we do NOT extend data to the full declared length — parse must
+    // reject before even attempting to read that much.
+    EXPECT_THROW(WebSocketFrame::parse(data), std::runtime_error);
+}
