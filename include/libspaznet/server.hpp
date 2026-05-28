@@ -8,6 +8,7 @@
 #include <libspaznet/platform_io.hpp>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -26,6 +27,10 @@ class HTTP2Handler;
 class WebSocketHandler;
 class QUICHandler;
 class HTTP3Handler;
+
+// Forward-declared so Socket::send_websocket_message can name it before
+// websocket_handler.hpp (which depends on Socket) is included below.
+enum class WebSocketOpcode : std::uint8_t;
 
 // Socket wrapper
 class Socket {
@@ -81,6 +86,27 @@ class Socket {
 
     // Async write
     Task async_write(std::vector<uint8_t> data);
+
+    // Build and send a server-origin (unmasked) WebSocket frame in one
+    // allocation, skipping the WebSocketFrame value type entirely. The
+    // typical handler pattern was:
+    //
+    //     WebSocketFrame f;          // ctor
+    //     f.payload = m.data;        // payload-sized copy
+    //     auto bytes = f.serialize();// alloc + payload-sized copy
+    //     co_await s.async_write(std::move(bytes));
+    //
+    // That's two copies of the payload + two heap allocs to send one
+    // frame. This method bypasses both: it sizes the output once
+    // (header + payload), writes header bytes directly, copies payload
+    // once, and hands the buffer to async_write by move.
+    //
+    // `fin` defaults to true (a single self-contained frame). Pass
+    // span<const uint8_t>{} for an empty payload (e.g. a Pong with no
+    // data, or a Close without a body).
+    Task send_websocket_message(WebSocketOpcode opcode,
+                                std::span<const std::uint8_t> payload,
+                                bool fin = true);
 
     void close();
 };

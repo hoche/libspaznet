@@ -426,6 +426,50 @@ Task Socket::async_write(std::vector<uint8_t> data) {
     }
 }
 
+Task Socket::send_websocket_message(WebSocketOpcode opcode,
+                                    std::span<const std::uint8_t> payload, bool fin) {
+    const std::size_t len = payload.size();
+
+    // RFC 6455 §5.2: 2-byte minimum header; +2 bytes for the 16-bit
+    // length form (126..65535) or +8 bytes for the 64-bit form.
+    std::size_t header_size = 2;
+    if (len > 65535) {
+        header_size += 8;
+    } else if (len > 125) {
+        header_size += 2;
+    }
+
+    std::vector<std::uint8_t> buf;
+    buf.resize(header_size + len);
+
+    buf[0] = static_cast<std::uint8_t>((fin ? 0x80 : 0x00) |
+                                       (static_cast<std::uint8_t>(opcode) & 0x0F));
+
+    if (len > 65535) {
+        buf[1] = 127; // server-origin frame: mask bit always 0
+        buf[2] = static_cast<std::uint8_t>((static_cast<std::uint64_t>(len) >> 56) & 0xFF);
+        buf[3] = static_cast<std::uint8_t>((static_cast<std::uint64_t>(len) >> 48) & 0xFF);
+        buf[4] = static_cast<std::uint8_t>((static_cast<std::uint64_t>(len) >> 40) & 0xFF);
+        buf[5] = static_cast<std::uint8_t>((static_cast<std::uint64_t>(len) >> 32) & 0xFF);
+        buf[6] = static_cast<std::uint8_t>((static_cast<std::uint64_t>(len) >> 24) & 0xFF);
+        buf[7] = static_cast<std::uint8_t>((static_cast<std::uint64_t>(len) >> 16) & 0xFF);
+        buf[8] = static_cast<std::uint8_t>((static_cast<std::uint64_t>(len) >> 8) & 0xFF);
+        buf[9] = static_cast<std::uint8_t>(static_cast<std::uint64_t>(len) & 0xFF);
+    } else if (len > 125) {
+        buf[1] = 126;
+        buf[2] = static_cast<std::uint8_t>((len >> 8) & 0xFF);
+        buf[3] = static_cast<std::uint8_t>(len & 0xFF);
+    } else {
+        buf[1] = static_cast<std::uint8_t>(len);
+    }
+
+    if (len > 0) {
+        std::memcpy(buf.data() + header_size, payload.data(), len);
+    }
+
+    co_await async_write(std::move(buf));
+}
+
 void Socket::close() {
     if (owns_fd_ && fd_ >= 0) {
         // Remove from both platform I/O and pending I/O map
@@ -960,24 +1004,19 @@ Task Server::handle_connection(Socket socket) {
                 }
             };
 
-            auto send_frame = [&](WebSocketOpcode opcode, const std::vector<uint8_t>& payload,
+            auto send_frame = [&](WebSocketOpcode opcode, std::span<const std::uint8_t> payload,
                                   uint16_t close_code = 0) -> Task {
-                WebSocketFrame frame;
-                frame.fin = true;
-                frame.rsv1 = frame.rsv2 = frame.rsv3 = false;
-                frame.opcode = opcode;
-                frame.masked = false;
-                frame.payload = payload;
                 if (opcode == WebSocketOpcode::Close && close_code != 0) {
-                    std::vector<uint8_t> body;
-                    body.push_back(static_cast<uint8_t>((close_code >> 8) & 0xFF));
-                    body.push_back(static_cast<uint8_t>(close_code & 0xFF));
+                    // Close frame with a 2-byte status code prefix (RFC 6455 §5.5.1).
+                    std::vector<std::uint8_t> body;
+                    body.reserve(2 + payload.size());
+                    body.push_back(static_cast<std::uint8_t>((close_code >> 8) & 0xFF));
+                    body.push_back(static_cast<std::uint8_t>(close_code & 0xFF));
                     body.insert(body.end(), payload.begin(), payload.end());
-                    frame.payload.swap(body);
+                    co_await socket.send_websocket_message(opcode, body);
+                } else {
+                    co_await socket.send_websocket_message(opcode, payload);
                 }
-                frame.payload_length = frame.payload.size();
-                auto data = frame.serialize();
-                co_await socket.async_write(std::move(data));
             };
 
             bool sent_close = false;
@@ -1121,15 +1160,9 @@ Task Server::handle_connection(Socket socket) {
                     if (opcode == WebSocketOpcode::Close) {
                         if (!sent_close) {
                             sent_close = true;
-                            WebSocketFrame close_frame;
-                            close_frame.fin = true;
-                            close_frame.rsv1 = close_frame.rsv2 = close_frame.rsv3 = false;
-                            close_frame.opcode = WebSocketOpcode::Close;
-                            close_frame.masked = false;
-                            close_frame.payload = payload;
-                            close_frame.payload_length = close_frame.payload.size();
-                            auto data = close_frame.serialize();
-                            co_await socket.async_write(std::move(data));
+                            // Echo the peer's close payload back unmodified
+                            // (this preserves the code + reason if present).
+                            co_await socket.send_websocket_message(WebSocketOpcode::Close, payload);
                         }
                         break;
                     } else if (opcode == WebSocketOpcode::Ping) {
