@@ -281,6 +281,32 @@ TEST_F(RFC9113ParserTest, ResponseToFrames) {
     EXPECT_TRUE(frames.back().flags & HTTP2Flags::END_STREAM);
 }
 
+// build_headers_frame must drop response headers whose value contains
+// CR/LF/NUL or whose name isn't a valid HTTP/2 token, so a smuggled
+// pseudo-header (e.g. ":status: 200\r\nX-Pwn: 1") cannot reach the
+// peer. We can't fully introspect the HPACK output without a real
+// decoder, but we can confirm the encoded payload no longer contains
+// the raw bytes of the malicious value.
+TEST_F(RFC9113ParserTest, BuildHeadersFrameDropsInjectedValues) {
+    HTTP2Response response;
+    response.stream_id = 1;
+    response.status_code = 200;
+    response.headers["x-inject"] = "evil\r\nset-cookie: pwn=1";
+    response.headers["UPPERCASE"] = "rfc9113 §8.2.1 forbids this";
+    response.headers["bad name"] = "space in name";
+    response.headers["x-ok"] = "harmless";
+
+    auto frame = HTTP2Parser::build_headers_frame(response, 1, true, true);
+    // The HPACK payload must not contain the raw bytes of the injected
+    // value, regardless of literal vs indexed encoding.
+    std::string blob(frame.payload.begin(), frame.payload.end());
+    EXPECT_EQ(blob.find("evil\r\nset-cookie"), std::string::npos);
+    EXPECT_EQ(blob.find("UPPERCASE"), std::string::npos);
+    EXPECT_EQ(blob.find("bad name"), std::string::npos);
+    // The harmless header should survive.
+    EXPECT_NE(blob.find("x-ok"), std::string::npos);
+}
+
 // Test HPACK Encoding/Decoding (simplified)
 TEST_F(RFC9113ParserTest, HPACKEncodeDecode) {
     std::unordered_map<std::string, std::string> headers;

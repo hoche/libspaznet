@@ -109,6 +109,37 @@ bool HTTPRequest::is_chunked() const {
     return last_token == "chunked";
 }
 
+namespace {
+
+// RFC 9112 §5.6.2: field-name = token. Reject anything else so a caller
+// can't smuggle CR/LF/SP/etc into the name and cause response splitting.
+bool is_valid_field_name(const std::string& name) {
+    if (name.empty()) {
+        return false;
+    }
+    for (char c : name) {
+        if (!HTTPParser::is_token_char(c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// RFC 9110 §5.5: field-value = *( field-content / obs-fold )
+// field-content = field-vchar [ 1*( SP / HTAB / field-vchar ) field-vchar ]
+// We forbid CR, LF, and NUL outright (response-splitting / header
+// injection). Permit SP and HTAB so existing valid headers keep working.
+bool is_valid_field_value(const std::string& value) {
+    for (char c : value) {
+        if (c == '\r' || c == '\n' || c == '\0') {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 // HTTPResponse helper methods
 std::optional<std::string> HTTPResponse::get_header(const std::string& name) const {
     return HeaderUtils::get_header_case_insensitive(headers, name);
@@ -128,9 +159,13 @@ std::vector<uint8_t> HTTPResponse::serialize() const {
     // Status line per RFC 9112 Section 6.1
     oss << "HTTP/" << version << " " << status_code << " " << reason_phrase << "\r\n";
 
-    // Headers per RFC 9112 Section 6.3
+    // Headers per RFC 9112 Section 6.3. Validate field name and value at
+    // emission time so a caller-supplied CR/LF/NUL (or a non-token name)
+    // can't split the response into a smuggled second message.
     for (const auto& [key, value] : headers) {
-        // Field name must be a token
+        if (!is_valid_field_name(key) || !is_valid_field_value(value)) {
+            continue; // drop the offending entry rather than emit it
+        }
         oss << key << ": " << value << "\r\n";
     }
 
@@ -160,9 +195,14 @@ std::vector<uint8_t> HTTPResponse::serialize_chunked() const {
     // Status line
     oss << "HTTP/" << version << " " << status_code << " " << reason_phrase << "\r\n";
 
-    // Headers (ensure Transfer-Encoding: chunked is set)
+    // Headers (ensure Transfer-Encoding: chunked is set). Same validation
+    // as serialize() — drop entries whose name isn't a token or whose
+    // value contains CR/LF/NUL.
     bool has_transfer_encoding = false;
     for (const auto& [key, value] : headers) {
+        if (!is_valid_field_name(key) || !is_valid_field_value(value)) {
+            continue;
+        }
         if (HTTPParser::to_lower(key) == "transfer-encoding") {
             has_transfer_encoding = true;
         }

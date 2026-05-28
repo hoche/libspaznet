@@ -536,6 +536,61 @@ HTTP2Parser::ParseResult HTTP2Parser::parse_headers_frame(const HTTP2Frame& fram
     return ParseResult::Success;
 }
 
+namespace {
+
+// RFC 9113 §8.2.1: HTTP/2 field names must be lowercase ASCII tokens.
+// Pseudo-header names begin with ':' (which is otherwise not a tchar).
+// We forbid CR/LF/NUL in any name or value to keep us aligned with the
+// HTTP/1.x sanitization done in HTTPResponse::serialize.
+bool is_valid_http2_name(const std::string& name) {
+    if (name.empty()) {
+        return false;
+    }
+    size_t start = 0;
+    if (name[0] == ':') {
+        if (name.size() < 2) {
+            return false;
+        }
+        start = 1;
+    }
+    for (size_t i = start; i < name.size(); ++i) {
+        char c = name[i];
+        // tchar minus uppercase letters; lowercase only per §8.2.1.
+        const bool is_lower_alpha = c >= 'a' && c <= 'z';
+        const bool is_digit = c >= '0' && c <= '9';
+        const bool is_other_tchar = c == '!' || c == '#' || c == '$' || c == '%' || c == '&' ||
+                                    c == '\'' || c == '*' || c == '+' || c == '-' || c == '.' ||
+                                    c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+        if (!(is_lower_alpha || is_digit || is_other_tchar)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool is_valid_http2_value(const std::string& value) {
+    for (char c : value) {
+        if (c == '\r' || c == '\n' || c == '\0') {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::unordered_map<std::string, std::string>
+sanitize_http2_headers(const std::unordered_map<std::string, std::string>& in) {
+    std::unordered_map<std::string, std::string> out;
+    out.reserve(in.size());
+    for (const auto& [k, v] : in) {
+        if (is_valid_http2_name(k) && is_valid_http2_value(v)) {
+            out.emplace(k, v);
+        }
+    }
+    return out;
+}
+
+} // namespace
+
 HTTP2Frame HTTP2Parser::build_headers_frame(const HTTP2Request& request, uint32_t stream_id,
                                             bool end_headers, bool end_stream) {
     HTTP2Frame frame;
@@ -547,8 +602,10 @@ HTTP2Frame HTTP2Parser::build_headers_frame(const HTTP2Request& request, uint32_
         frame.flags |= HTTP2Flags::END_STREAM;
     frame.stream_id = stream_id;
 
-    // Encode headers with HPACK
-    frame.payload = HPACK::encode_headers(request.headers);
+    // Sanitize before HPACK encoding so a caller cannot smuggle CR/LF
+    // (which would corrupt downstream HTTP/1.x framing if this server
+    // were ever proxied) or invalid characters in field names.
+    frame.payload = HPACK::encode_headers(sanitize_http2_headers(request.headers));
     frame.length = frame.payload.size();
 
     return frame;
@@ -565,13 +622,13 @@ HTTP2Frame HTTP2Parser::build_headers_frame(const HTTP2Response& response, uint3
         frame.flags |= HTTP2Flags::END_STREAM;
     frame.stream_id = stream_id;
 
-    // Ensure :status is set
-    std::unordered_map<std::string, std::string> headers = response.headers;
+    // Sanitize before adding the mandatory :status pseudo-header; status
+    // is integer-formatted by us, so it's known-good.
+    std::unordered_map<std::string, std::string> headers = sanitize_http2_headers(response.headers);
     if (headers.find(":status") == headers.end()) {
         headers[":status"] = std::format("{}", response.status_code);
     }
 
-    // Encode headers with HPACK
     frame.payload = HPACK::encode_headers(headers);
     frame.length = frame.payload.size();
 
