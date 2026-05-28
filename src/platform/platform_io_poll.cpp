@@ -14,6 +14,9 @@ namespace spaznet {
 class PlatformIOPoll : public PlatformIO {
   private:
     std::vector<pollfd> pollfds_;
+    // fd → (user_data token, requested events). poll has no place on the
+    // wire to round-trip caller-supplied data, so we keep it here and
+    // hand it back in wait().
     std::unordered_map<int, std::pair<void*, uint32_t>> fd_info_;
 
   public:
@@ -33,7 +36,7 @@ class PlatformIOPoll : public PlatformIO {
         return true;
     }
 
-    auto add_fd(int file_descriptor, uint32_t events, void* /*user_data*/) -> bool override {
+    auto add_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
         if (fd_info_.find(file_descriptor) != fd_info_.end()) {
             return false; // Already exists
         }
@@ -50,18 +53,18 @@ class PlatformIOPoll : public PlatformIO {
         pfd.revents = 0;
 
         pollfds_.push_back(pfd);
-        fd_info_[file_descriptor] = {nullptr, events}; // user_data unused
+        fd_info_[file_descriptor] = {user_data, events};
 
         return true;
     }
 
-    auto modify_fd(int file_descriptor, uint32_t events, void* /*user_data*/) -> bool override {
+    auto modify_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
         auto it = fd_info_.find(file_descriptor);
         if (it == fd_info_.end()) {
-            return add_fd(file_descriptor, events, nullptr);
+            return add_fd(file_descriptor, events, user_data);
         }
 
-        it->second = {nullptr, events}; // user_data unused
+        it->second = {user_data, events};
 
         for (auto& pfd : pollfds_) {
             if (pfd.fd == file_descriptor) {
@@ -140,7 +143,10 @@ class PlatformIOPoll : public PlatformIO {
                 event.events |= EVENT_ERROR;
             }
 
-            event.user_data = nullptr; // we only rely on fd lookup in IOContext
+            // Hand the caller's token back unchanged so IOContext can
+            // verify the registration generation.
+            auto info_it = fd_info_.find(pfd.fd);
+            event.user_data = (info_it != fd_info_.end()) ? info_it->second.first : nullptr;
 
             events.push_back(event);
         }

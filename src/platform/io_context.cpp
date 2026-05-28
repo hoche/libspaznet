@@ -196,6 +196,12 @@ void IOContext::register_io(int file_descriptor, uint32_t events, std::coroutine
     bool already_registered = pending_it != pending_io_.end();
     PendingIO& pending = already_registered ? pending_it->second : pending_io_[file_descriptor];
 
+    // Bump the generation on first registration AND on every re-registration:
+    // any event still in the kernel's queue (or already returned to
+    // userspace but not yet dispatched) for the previous instance carries
+    // the old generation and will be filtered out by process_io_events.
+    pending.generation = next_generation_.fetch_add(1, std::memory_order_relaxed);
+
     // Convert to our TaskPromise coroutine handle and keep it alive while registered.
     // NOTE: Storing only the raw address is not enough; the coroutine frame may be destroyed
     // while suspended. We must retain a strong reference here.
@@ -220,11 +226,14 @@ void IOContext::register_io(int file_descriptor, uint32_t events, std::coroutine
         new_events |= PlatformIO::EVENT_WRITE;
     }
 
-    // Keep the map lock until after add/modify to avoid rehash invalidating &pending.
+    // Pack (generation, fd) as the user_data token so the platform layer
+    // can hand it back verbatim on event delivery. The token is opaque
+    // to the platform — it must NOT be dereferenced.
+    void* token = encode_token(pending.generation, file_descriptor);
     if (already_registered) {
-        platform_io_->modify_fd(file_descriptor, new_events, &pending);
+        platform_io_->modify_fd(file_descriptor, new_events, token);
     } else {
-        platform_io_->add_fd(file_descriptor, new_events, &pending);
+        platform_io_->add_fd(file_descriptor, new_events, token);
     }
 
     map_lock_.clear(std::memory_order_release);
@@ -249,18 +258,28 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
         }
 
         for (const auto& evt : events) {
-            // Wakeup pipe event: drain and continue.
-            if (evt.fd == wake_read_fd_) {
+            // A null token identifies the wakeup pipe (registered with
+            // user_data = nullptr in the constructor).
+            if (evt.user_data == nullptr) {
                 drain_wakeup_pipe();
                 continue;
             }
-            // Look up by fd (safe), not by pointer (can be invalidated)
-            auto pending_it = pending_io_.find(evt.fd);
+            // Decode the token and verify the generation matches the
+            // currently-registered one. A mismatch means this event was
+            // produced for an earlier registration of (potentially) the
+            // same fd that has since been closed and reused.
+            uint32_t token_gen = 0;
+            int token_fd = 0;
+            decode_token(evt.user_data, token_gen, token_fd);
+
+            auto pending_it = pending_io_.find(token_fd);
             if (pending_it == pending_io_.end()) {
                 continue; // fd was removed
             }
-
             PendingIO& pending = pending_it->second;
+            if (pending.generation != token_gen) {
+                continue; // stale event for a previous registration on this fd
+            }
 
             bool changed = false;
             if ((evt.events & PlatformIO::EVENT_READ) != 0) {
@@ -278,7 +297,8 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
                 }
             }
 
-            // Update interest mask to avoid spurious wakeups.
+            // Update interest mask to avoid spurious wakeups. Re-issue
+            // the token (same generation; nothing new was registered).
             if (changed) {
                 uint32_t new_events = 0;
                 if (pending.read) {
@@ -287,7 +307,8 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
                 if (pending.write) {
                     new_events |= PlatformIO::EVENT_WRITE;
                 }
-                platform_io_->modify_fd(evt.fd, new_events, &pending);
+                platform_io_->modify_fd(token_fd, new_events,
+                                        encode_token(pending.generation, token_fd));
             }
         }
 

@@ -544,16 +544,41 @@ class IOContext {
     std::mutex timer_mutex_;
     std::atomic<uint64_t> next_timer_id_{1};
 
-    // Map from file descriptor to pending coroutine handles
-    // Handles stored as raw addresses for atomic access
+    // Map from file descriptor to pending coroutine handles.
+    //
+    // Each entry carries a per-registration generation. Every time a
+    // coroutine registers on an fd we bump the generation; when an
+    // event is delivered from the kernel we compare the generation
+    // stored in the event's user_data against the current value here,
+    // and drop the event if they disagree. That defeats the fd-reuse
+    // race where a close()+accept() reuses a numeric fd while an
+    // event for the old registration was still queued.
     struct PendingIO {
         CoroutineHandle read;
         CoroutineHandle write;
+        uint32_t generation = 0;
 
         PendingIO() = default;
     };
     std::unordered_map<int, PendingIO> pending_io_;
     mutable std::atomic_flag map_lock_ = ATOMIC_FLAG_INIT; // Spinlock for map structure only
+    std::atomic<uint32_t> next_generation_{1};             // 0 reserved for the wakeup pipe
+
+    // The user_data we hand to the platform layer is an opaque token,
+    // not a pointer to anything dereferenceable. It packs (generation,
+    // fd) into 64 bits. A null user_data identifies the wakeup pipe.
+    static_assert(sizeof(void*) >= sizeof(uint64_t),
+                  "IOContext requires a 64-bit address space to round-trip its event token.");
+    static auto encode_token(uint32_t generation, int fd) -> void* {
+        const auto packed = (static_cast<uint64_t>(generation) << 32) |
+                            static_cast<uint64_t>(static_cast<uint32_t>(fd));
+        return reinterpret_cast<void*>(static_cast<uintptr_t>(packed));
+    }
+    static auto decode_token(void* token, uint32_t& generation_out, int& fd_out) -> void {
+        const auto packed = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(token));
+        generation_out = static_cast<uint32_t>(packed >> 32);
+        fd_out = static_cast<int>(static_cast<int32_t>(packed & 0xFFFFFFFFU));
+    }
 
     // Statistics tracking (lock-free)
     StatisticsInternal statistics_;

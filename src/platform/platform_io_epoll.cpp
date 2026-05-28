@@ -33,7 +33,6 @@ class PlatformIOEpoll : public PlatformIO {
     }
 
     auto add_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
-        (void)user_data; // unused for epoll implementation
         epoll_event event{};
         event.events = 0;
         if ((events & EVENT_READ) != 0U) {
@@ -48,14 +47,16 @@ class PlatformIOEpoll : public PlatformIO {
         if ((events & EVENT_EDGE_TRIGGER) != 0U) {
             event.events |= EPOLLET;
         }
-        // Store the file descriptor so IOContext can map the event back to PendingIO.
-        event.data.fd = file_descriptor;
+        // Round-trip the caller's token through epoll's data union. The
+        // IOContext encodes (generation, fd) here and decodes it on
+        // event delivery to filter out events from a previous
+        // registration on a recycled fd.
+        event.data.ptr = user_data;
 
         return epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, file_descriptor, &event) == 0;
     }
 
     auto modify_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
-        (void)user_data; // unused for epoll implementation
         epoll_event event{};
         event.events = 0;
         if ((events & EVENT_READ) != 0U) {
@@ -70,8 +71,7 @@ class PlatformIOEpoll : public PlatformIO {
         if ((events & EVENT_EDGE_TRIGGER) != 0U) {
             event.events |= EPOLLET;
         }
-        // Keep fd in the event payload (IOContext does fd-based lookup).
-        event.data.fd = file_descriptor;
+        event.data.ptr = user_data;
 
         return epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, file_descriptor, &event) == 0;
     }
@@ -102,8 +102,15 @@ class PlatformIOEpoll : public PlatformIO {
         // NOLINTBEGIN(cppcoreguidelines-pro-bounds-constant-array-index)
         for (int i = 0; i < nfds; ++i) {
             Event event{};
-            event.fd = epoll_events[i].data.fd;
-            event.user_data = nullptr;
+            event.user_data = epoll_events[i].data.ptr;
+            // The caller (IOContext) encodes its fd in the low 32 bits
+            // of user_data. We expose evt.fd as a convenience for any
+            // consumer that needs it without decoding the token. A
+            // null user_data (wakeup pipe registration) gives fd 0,
+            // which is harmless because the IOContext keys off
+            // user_data == nullptr, not the fd value.
+            const auto packed = reinterpret_cast<uintptr_t>(event.user_data);
+            event.fd = static_cast<int>(static_cast<int32_t>(packed & 0xFFFFFFFFU));
             event.events = 0;
 
             if ((epoll_events[i].events & EPOLLIN) != 0U) {
