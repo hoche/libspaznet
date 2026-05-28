@@ -1,5 +1,23 @@
 #ifdef USE_IOCP
 
+// The IOCP backend is incomplete and known-broken: it never calls
+// WSAStartup, issues zero-byte WSARecv probes (so a legitimate
+// 0-byte completion is indistinguishable from a closed connection),
+// fails to CancelIoEx outstanding overlapped operations on remove_fd
+// (leaking OverlappedContext heap blocks for every cancelled op),
+// and conflates ERROR_OPERATION_ABORTED with fatal I/O failures.
+// Wiring it onto the per-registration token used by the other
+// backends would compound those defects rather than fix them.
+//
+// Pending a proper rewrite, fail loudly if anyone tries to compile
+// this in. Define SPAZNET_ENABLE_BROKEN_IOCP to opt in for
+// development work; the suite's CMake configurations do NOT.
+#ifndef SPAZNET_ENABLE_BROKEN_IOCP
+#error "The IOCP backend is incomplete; see comment in platform_io_iocp.cpp. \
+Define SPAZNET_ENABLE_BROKEN_IOCP to compile it anyway for development, \
+or use the epoll / kqueue / poll backends in the meantime."
+#endif
+
 #include <mswsock.h>
 #include <windows.h>
 #include <winsock2.h>
