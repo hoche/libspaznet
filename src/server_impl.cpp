@@ -753,6 +753,7 @@ Task Server::handle_connection(Socket socket) {
     };
     ConnectionGuard guard(this, socket.fd());
 
+
     try {
         std::vector<uint8_t> buffer;
         co_await socket.async_read(buffer, 2048);

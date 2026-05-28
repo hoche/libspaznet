@@ -236,6 +236,7 @@ void IOContext::register_io(int file_descriptor, uint32_t events, std::coroutine
     // the old generation and will be filtered out by process_io_events.
     pending.generation = next_generation_.fetch_add(1, std::memory_order_relaxed);
 
+
     // Convert to our TaskPromise coroutine handle and keep it alive while registered.
     // NOTE: Storing only the raw address is not enough; the coroutine frame may be destroyed
     // while suspended. We must retain a strong reference here.

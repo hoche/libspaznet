@@ -104,6 +104,7 @@ bool is_control_opcode(WebSocketOpcode op) {
 
 } // namespace
 
+
 auto WebSocketFrame::parse(const std::vector<uint8_t>& data) -> WebSocketFrame {
     WebSocketFrame frame;
 

@@ -25,6 +25,7 @@ struct WebSocketFrame {
     // request a 16-EiB allocation. Cap at a sane application limit.
     static constexpr uint64_t kMaxPayloadBytes = 16ULL * 1024 * 1024;
 
+
     bool fin{};
     bool rsv1{};
     bool rsv2{};
