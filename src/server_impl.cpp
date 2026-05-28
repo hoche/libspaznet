@@ -935,6 +935,14 @@ Task Server::handle_connection(Socket socket) {
             trace_log("WS: on_open complete, starting frame loop, fd=" +
                       std::to_string(socket.fd()));
 
+            // Per-connection scratch buffer reused by every read_exact call.
+            // Without this each read_exact would default-construct a fresh
+            // `tmp` vector and async_read would resize it from zero,
+            // causing 4 small heap allocations per WS frame (header + ext
+            // length + mask + payload). Hoisting it amortizes the capacity
+            // grow to the first frame on the connection.
+            std::vector<uint8_t> read_chunk;
+
             auto read_exact = [&](std::size_t n, std::vector<uint8_t>& out) -> Task {
                 // async_read returns an empty buffer only on orderly EOF
                 // or a hard error — in either case we stop and let the
@@ -944,12 +952,11 @@ Task Server::handle_connection(Socket socket) {
                 out.clear();
                 out.reserve(n);
                 while (out.size() < n) {
-                    std::vector<uint8_t> tmp;
-                    co_await socket.async_read(tmp, n - out.size());
-                    if (tmp.empty()) {
+                    co_await socket.async_read(read_chunk, n - out.size());
+                    if (read_chunk.empty()) {
                         co_return;
                     }
-                    out.insert(out.end(), tmp.begin(), tmp.end());
+                    out.insert(out.end(), read_chunk.begin(), read_chunk.end());
                 }
             };
 
@@ -985,9 +992,16 @@ Task Server::handle_connection(Socket socket) {
             WebSocketOpcode current_message_opcode = WebSocketOpcode::Continuation;
             bool fragmented = false;
 
+            // Hoisted per-frame scratch. Capacity persists across loop
+            // iterations, so a steady-state connection allocates none of
+            // these once each has been sized for the largest frame it sees.
+            std::vector<uint8_t> header;
+            std::vector<uint8_t> ext;
+            std::vector<uint8_t> mask_key_buf;
+            std::vector<uint8_t> payload;
+
             while (true) {
                 trace_log("WS: Reading frame header, fd=" + std::to_string(socket.fd()));
-                std::vector<uint8_t> header;
                 co_await read_exact(2, header);
                 trace_log("WS: Got header bytes=" + std::to_string(header.size()) +
                           ", fd=" + std::to_string(socket.fd()));
@@ -1025,7 +1039,6 @@ Task Server::handle_connection(Socket socket) {
                 }
 
                 if (payload_len == 126) {
-                    std::vector<uint8_t> ext;
                     co_await read_exact(2, ext);
                     if (ext.size() != 2) {
                         break;
@@ -1039,7 +1052,6 @@ Task Server::handle_connection(Socket socket) {
                         break;
                     }
                 } else if (payload_len == 127) {
-                    std::vector<uint8_t> ext;
                     co_await read_exact(8, ext);
                     if (ext.size() != 8) {
                         break;
@@ -1070,7 +1082,6 @@ Task Server::handle_connection(Socket socket) {
                     break;
                 }
 
-                std::vector<uint8_t> mask_key_buf;
                 co_await read_exact(4, mask_key_buf);
                 if (mask_key_buf.size() != 4) {
                     break;
@@ -1084,16 +1095,19 @@ Task Server::handle_connection(Socket socket) {
                                        (static_cast<uint32_t>(mask_key_buf[2]) << 8) |
                                        static_cast<uint32_t>(mask_key_buf[3]);
 
-                std::vector<uint8_t> payload(static_cast<std::size_t>(payload_len));
-                if (payload_len > 0) {
-                    std::vector<uint8_t> payload_buf;
-                    co_await read_exact(static_cast<std::size_t>(payload_len), payload_buf);
-                    if (payload_buf.size() != payload_len) {
-                        break;
-                    }
-                    for (std::size_t i = 0; i < payload_len; ++i) {
-                        payload[i] = payload_buf[i] ^ ((masking_key >> ((3 - (i % 4)) * 8)) & 0xFF);
-                    }
+                // Read directly into `payload` (resized in place, capacity
+                // preserved across frames) and unmask in place. The previous
+                // version allocated a separate payload_buf, read into that,
+                // then copied + XORed into a freshly-default-constructed
+                // `payload` of equal size — two allocations and a full copy
+                // per frame that we can collapse to one allocation and
+                // one in-place pass.
+                co_await read_exact(static_cast<std::size_t>(payload_len), payload);
+                if (payload.size() != payload_len) {
+                    break;
+                }
+                for (std::size_t i = 0; i < payload_len; ++i) {
+                    payload[i] ^= ((masking_key >> ((3 - (i % 4)) * 8)) & 0xFF);
                 }
 
                 bool is_control = opcode == WebSocketOpcode::Close ||
@@ -1131,7 +1145,12 @@ Task Server::handle_connection(Socket socket) {
                             break;
                         }
                         current_message_opcode = opcode;
-                        message_buffer = payload;
+                        // Swap the freshly-read payload into message_buffer
+                        // instead of copy-assigning. After the swap, `payload`
+                        // holds message_buffer's previous storage (empty,
+                        // but with retained capacity from prior frames) so
+                        // the next read_exact reuses it.
+                        std::swap(message_buffer, payload);
                         fragmented = !fin;
                     } else {
                         if (!fragmented) {
@@ -1142,13 +1161,19 @@ Task Server::handle_connection(Socket socket) {
                     }
 
                     if (fin) {
-                        // Message is complete (either single frame or last fragment)
+                        // Message is complete (either single frame or last
+                        // fragment). Swap message_buffer into msg.data so
+                        // the handler sees the assembled message without a
+                        // copy; the handler signature is by const&, so
+                        // it can't move out — but on return we swap back
+                        // and reclaim the capacity for the next frame.
                         WebSocketMessage msg;
                         msg.opcode = current_message_opcode;
-                        msg.data = message_buffer;
+                        std::swap(msg.data, message_buffer);
                         fragmented = false;
-                        message_buffer.clear();
                         co_await websocket_handler_->handle_message(msg, socket);
+                        std::swap(message_buffer, msg.data);
+                        message_buffer.clear();
                     }
                 }
             }
