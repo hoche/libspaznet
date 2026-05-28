@@ -346,8 +346,9 @@ TEST_F(RFC9112ParserTest, AllowDuplicateContentLengthSameValue) {
     EXPECT_EQ(std::string(request.body.begin(), request.body.end()), "hello");
 }
 
-// A Content-Length value that is a comma-separated list must be rejected.
-TEST_F(RFC9112ParserTest, RejectContentLengthCommaList) {
+// A Content-Length value that is a comma-separated list of identical
+// integers is permitted by RFC 9112 §6.3.
+TEST_F(RFC9112ParserTest, AllowContentLengthListWithIdenticalValues) {
     std::string request_str = "POST /x HTTP/1.1\r\n"
                               "Host: example.com\r\n"
                               "Content-Length: 5, 5\r\n"
@@ -357,7 +358,44 @@ TEST_F(RFC9112ParserTest, RejectContentLengthCommaList) {
     HTTPRequest request;
     size_t bytes_consumed = 0;
     auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, HTTPParser::ParseResult::Success);
+    EXPECT_EQ(std::string(request.body.begin(), request.body.end()), "hello");
+    // Validation should normalize the merged list back to a single
+    // value so downstream parsing doesn't depend on stoull's quirks.
+    EXPECT_EQ(request.headers["Content-Length"], "5");
+}
+
+// A Content-Length list with differing values is still a framing error.
+TEST_F(RFC9112ParserTest, RejectContentLengthListWithDifferentValues) {
+    std::string request_str = "POST /x HTTP/1.1\r\n"
+                              "Host: example.com\r\n"
+                              "Content-Length: 5, 17\r\n"
+                              "\r\n"
+                              "hello";
+    std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
+    HTTPRequest request;
+    size_t bytes_consumed = 0;
+    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
     EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+}
+
+// And two same-cased Content-Length headers with identical values, which
+// parse_header_field merges into "5, 5", must reach the same accepted
+// state as the explicit list above.
+TEST_F(RFC9112ParserTest, AllowTwoIdenticalContentLengthHeaders) {
+    std::string request_str = "POST /x HTTP/1.1\r\n"
+                              "Host: example.com\r\n"
+                              "Content-Length: 5\r\n"
+                              "Content-Length: 5\r\n"
+                              "\r\n"
+                              "hello";
+    std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
+    HTTPRequest request;
+    size_t bytes_consumed = 0;
+    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, HTTPParser::ParseResult::Success);
+    EXPECT_EQ(std::string(request.body.begin(), request.body.end()), "hello");
+    EXPECT_EQ(request.headers["Content-Length"], "5");
 }
 
 // RFC 9112 §5.1: OWS between field name and colon must be rejected.
