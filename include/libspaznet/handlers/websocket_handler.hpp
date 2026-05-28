@@ -62,8 +62,25 @@ class WebSocketHandler {
     WebSocketHandler(WebSocketHandler&&) = delete;
     auto operator=(WebSocketHandler&&) -> WebSocketHandler& = delete;
 
-    // Handle WebSocket message
+    // Handle a WebSocket message.
+    //
+    // The dispatch site (Server::handle_connection) always calls the
+    // rvalue overload first, so a handler that wants to *consume* the
+    // payload (move it into a parser, into a response body, etc.) can
+    // override that overload and avoid copying the data vector.
+    //
+    // The default implementation of the rvalue overload forwards to the
+    // const& overload, which keeps existing handlers working unchanged
+    // (they continue to see a const reference and copy as before).
+    // Handlers MUST override exactly one — typically the const& form
+    // for read-only use, or the rvalue form for move-consume — leaving
+    // the other to its default forwarder.
     virtual auto handle_message(const WebSocketMessage& message, Socket& socket) -> Task = 0;
+    virtual auto handle_message(WebSocketMessage&& message, Socket& socket) -> Task {
+        // Default: forward to the const& overload. Override this in your
+        // handler to take ownership of `message.data` via std::move.
+        return handle_message(static_cast<const WebSocketMessage&>(message), socket);
+    }
 
     // Handle WebSocket connection open
     virtual auto on_open(Socket& socket) -> Task = 0;

@@ -1197,14 +1197,19 @@ Task Server::handle_connection(Socket socket) {
                         // Message is complete (either single frame or last
                         // fragment). Swap message_buffer into msg.data so
                         // the handler sees the assembled message without a
-                        // copy; the handler signature is by const&, so
-                        // it can't move out — but on return we swap back
-                        // and reclaim the capacity for the next frame.
+                        // copy. Dispatch through the rvalue overload of
+                        // handle_message so a handler that wants to move
+                        // m.data into its response can do so; the default
+                        // overload forwards to the const& form for legacy
+                        // handlers. On return we swap back and reclaim
+                        // the capacity for the next frame (no-op if the
+                        // handler moved out — that's fine, payload-sized
+                        // alloc next frame either way).
                         WebSocketMessage msg;
                         msg.opcode = current_message_opcode;
                         std::swap(msg.data, message_buffer);
                         fragmented = false;
-                        co_await websocket_handler_->handle_message(msg, socket);
+                        co_await websocket_handler_->handle_message(std::move(msg), socket);
                         std::swap(message_buffer, msg.data);
                         message_buffer.clear();
                     }
