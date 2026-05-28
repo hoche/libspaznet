@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 520" role="img" aria-labelledby="title">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 540" role="img" aria-labelledby="title">
   <title id="title">pending_io_ map structure</title>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
@@ -39,29 +39,35 @@
   <rect class="group" x="320" y="60" width="270" height="320" rx="8"/>
   <text class="group-label" x="340" y="80">PendingIO  (per-fd record)</text>
 
-  <!-- PendingIO 1 -->
-  <rect class="io" x="350" y="100" width="220" height="70" rx="6"/>
-  <text class="label" x="460" y="120">PendingIO for fd: 5</text>
-  <rect x="365" y="130" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
-  <text class="small" x="460" y="141">read_handle  (atomic void*)</text>
-  <rect x="365" y="148" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
-  <text class="small" x="460" y="159">write_handle (atomic void*)</text>
+  <!-- PendingIO 1 (fd 5) -->
+  <rect class="io" x="350" y="100" width="220" height="84" rx="6"/>
+  <text class="label" x="460" y="118">PendingIO for fd: 5</text>
+  <rect x="365" y="126" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="137">read_handle  (CoroutineHandle)</text>
+  <rect x="365" y="144" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="155">write_handle (CoroutineHandle)</text>
+  <rect x="365" y="162" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="173">generation = 14</text>
 
-  <!-- PendingIO 2 -->
-  <rect class="io" x="350" y="190" width="220" height="70" rx="6"/>
-  <text class="label" x="460" y="210">PendingIO for fd: 7</text>
-  <rect x="365" y="220" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
-  <text class="small" x="460" y="231">read_handle  (atomic void*)</text>
-  <rect x="365" y="238" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
-  <text class="small" x="460" y="249">write_handle (atomic void*)</text>
+  <!-- PendingIO 2 (fd 7) -->
+  <rect class="io" x="350" y="200" width="220" height="84" rx="6"/>
+  <text class="label" x="460" y="218">PendingIO for fd: 7</text>
+  <rect x="365" y="226" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="237">read_handle  (CoroutineHandle)</text>
+  <rect x="365" y="244" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="255">write_handle (CoroutineHandle)</text>
+  <rect x="365" y="262" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="273">generation = 22</text>
 
-  <!-- PendingIO 3 -->
-  <rect class="io" x="350" y="280" width="220" height="70" rx="6"/>
-  <text class="label" x="460" y="300">PendingIO for fd: 12</text>
-  <rect x="365" y="310" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
-  <text class="small" x="460" y="321">read_handle  (atomic void*)</text>
-  <rect x="365" y="328" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
-  <text class="small" x="460" y="339">write_handle (atomic void*)</text>
+  <!-- PendingIO 3 (fd 12) -->
+  <rect class="io" x="350" y="300" width="220" height="84" rx="6"/>
+  <text class="label" x="460" y="318">PendingIO for fd: 12</text>
+  <rect x="365" y="326" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="337">read_handle  (CoroutineHandle)</text>
+  <rect x="365" y="344" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="355">write_handle (CoroutineHandle)</text>
+  <rect x="365" y="362" width="190" height="14" fill="#fff7e0" stroke="#aaa" stroke-width="1"/>
+  <text class="small" x="460" y="373">generation = 33</text>
 
   <!-- Coroutines column -->
   <rect class="group" x="660" y="60" width="200" height="320" rx="8"/>
@@ -97,10 +103,13 @@
   <text class="edge-label" x="192" y="396">guards map</text>
 
   <!-- Caption -->
-  <text class="label" x="450" y="490" style="font-size:12px; fill:#666">
-    Lookup is keyed by file descriptor; each PendingIO holds two atomic handles so
+  <text class="label" x="450" y="488" style="font-size:12px; fill:#666">
+    On every register_io we bump the entry's generation and pack (gen, fd) into the user_data
   </text>
-  <text class="label" x="450" y="506" style="font-size:12px; fill:#666">
-    independent read- and write-waiters on the same fd don't collide.
+  <text class="label" x="450" y="504" style="font-size:12px; fill:#666">
+    token handed to the kernel. On event delivery we re-lock the map, look up by fd, and only
+  </text>
+  <text class="label" x="450" y="520" style="font-size:12px; fill:#666">
+    resume the coroutine if the token's generation matches — defeating the fd-reuse race.
   </text>
 </svg>

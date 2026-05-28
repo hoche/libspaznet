@@ -10,8 +10,8 @@ This document explains how `libspaznet` schedules work, how coroutines move betw
 
 - **IOContext** owns the event loop, worker threads, timer wheel, and platform-specific I/O demultiplexer.
 - **Task** is a coroutine return type; its promise (`TaskPromise`) stores a continuation handle so `co_await` chains resume correctly.
-- **TaskQueue** is a multi-producer/single-consumer queue per worker thread; enqueue is atomic, dequeue is mutex-protected to simplify correctness. See `mutex-vs-atomics.md` for detailed explanation of why mutexes are used instead of atomics in specific cases.
-- **PlatformIO** (epoll/kqueue/poll/IOCP) translates OS events into coroutine resumes; pending I/O registrations store raw coroutine handles for atomic swaps.
+- **TaskQueue** is a multi-producer/multi-consumer queue. Both enqueue and dequeue take a single `std::mutex` — the original lock-free enqueue had a use-after-free against the mutex-protected dequeue. See `mutex-vs-atomics.md` for the broader discussion of when atomics are not enough.
+- **PlatformIO** (epoll/kqueue/poll; IOCP is currently gated off as unfinished) translates OS events into coroutine resumes. Each registration carries a per-fd generation counter packed into the user_data handed to the kernel; on event delivery the IOContext verifies the generation matches the current registration so that fd-reuse cannot resurrect a stale coroutine.
 
 ![Core execution model](svgs/core-execution-model.svg)
 
@@ -31,9 +31,10 @@ This document explains how `libspaznet` schedules work, how coroutines move betw
 
 - `IOContext::run` spins the main loop and also starts N worker threads; all share the same `IOContext`.
 - Coroutines may start on the main loop, be resumed on a worker, and bounce between workers as they `co_await` I/O or timers. Handles are portable because the continuation is stored in the promise, not the stack.
-- `register_io` places coroutine handles into `pending_io_`; when the OS reports readiness, the handles are atomically extracted and rescheduled.
+- `register_io` places coroutine handles into `pending_io_` under a short spinlock, bumps the entry's generation counter, and hands the packed `(generation, fd)` token to the platform demultiplexer. When the OS reports readiness the token comes back unchanged; `process_io_events` re-acquires the spinlock, looks up the entry, and only resumes the coroutine if the generation still matches.
 - Timers are placed in a min-heap and, when due, their coroutine handles are also rescheduled.
 - Workers and the main loop both drain queues: every resume that yields again must be resubmitted via `schedule`.
+- `wait()` retries internally on `EINTR`, and a peer half-close (`EPOLLHUP` / `EV_EOF` / `POLLHUP`) wakes the read-waiter so `recv()` returns 0 instead of hanging.
 
 ## TaskQueue Internal Structure
 
@@ -96,7 +97,7 @@ void on_external_ready(IOContext& ctx, ExternalEvent ev) {
 
 ## Failure Modes When Mixing
 
-- Coroutines resume on arbitrary threads, causing races against `pending_io_` spinlock or timer heap mutex.
+- Coroutines resume on arbitrary threads, causing races against the `pending_io_` map or timer heap mutex (the map's spinlock is taken on every register / process step; an out-of-band resume sidesteps it).
 - Continuations are dropped; `co_await` never resumes, appearing as a hang.
 - A `Task` gets destroyed while a lambda still holds its raw handle, leading to `resume` on a destroyed frame (undefined behavior).
 - Handler vtables are violated, so HTTP/WebSocket/TCP dispatch cannot call your handler at all.
