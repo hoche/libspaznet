@@ -48,6 +48,23 @@ This document explains how `libspaznet` schedules work, how coroutines move betw
 
 ![Timer management sequence](svgs/timer-management.svg)
 
+## Synchronization Primitives Inventory
+
+The whole library uses exactly **five** synchronization primitives.
+The rest of the cross-thread state lives in `std::atomic<…>`.
+
+| Location | Primitive | Scope |
+|---|---|---|
+| `TaskQueue::mutex_` (`io_context.hpp`) | `std::mutex` | Held briefly on enqueue and dequeue; the only correctness guarantee for the singly-linked task list. |
+| `IOContext::timer_mutex_` (`io_context.hpp`) | `std::mutex` | Protects the timer min-heap, the cancelled-id set, and the suspended-task map as a single transaction. |
+| `IOContext::map_lock_` (`io_context.hpp`) | `std::atomic_flag` spinlock | Brief structural guard for the `pending_io_` map (insert / find / erase). Held across the `add_fd` / `modify_fd` call into the platform layer so a rehash can't invalidate the entry mid-update. |
+| `Server::listen_fds_mutex_` (`server.hpp`) | `std::mutex` | Guards the listening-socket vector across `listen_tcp()` and `stop()`. |
+| `Server::client_fds_mutex_` (`server.hpp`) | `std::mutex` | Guards the active-client-fd set that `Server::stop()` walks to `shutdown(2)` every in-flight client and drain its coroutine. |
+
+A `std::once_flag` in the Windows-only WSAStartup helper is the only
+other locking primitive; it fires once per process and never recurs.
+`docs/mutex-vs-atomics.md` covers the rationale for each entry.
+
 ## Why Lambdas and Coroutines Must Not Be Mixed
 
 The scheduler expects **coroutine-aware callables** that return `Task` and yield via `co_await`. Mixing raw lambdas (e.g., `std::function<void()>`, thread-pool callbacks, or ad-hoc captures) with coroutines breaks this contract:

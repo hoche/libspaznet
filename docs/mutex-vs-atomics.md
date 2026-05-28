@@ -1,235 +1,179 @@
 # Why Mutexes Instead of Atomics
 
-This document explains why `libspaznet` uses mutexes in specific places instead of atomic operations, despite the library's emphasis on lock-free design.
+This document explains why `libspaznet` uses mutexes in specific places
+instead of atomic operations. The library's design leans heavily on
+`std::atomic<…>` for cross-thread state, but five locking primitives
+remain. This is the rationale for each.
 
-## Overview
+## Inventory
 
-While `libspaznet` uses lock-free atomic operations extensively (for enqueue operations, I/O handle registration, statistics tracking), mutexes are used in three critical areas:
+| Location | Primitive | Reason it can't be atomics |
+|---|---|---|
+| `TaskQueue::mutex_` | `std::mutex` | Linked-list node lifetime: a lock-free queue would require hazard pointers or epoch-based reclamation to free dequeued nodes safely. |
+| `IOContext::timer_mutex_` | `std::mutex` | A min-heap plus two associative containers that must be mutated as a single transaction. |
+| `IOContext::map_lock_` | `std::atomic_flag` spinlock | Brief structural guard for the `pending_io_` map; held across an `add_fd` / `modify_fd` call so a rehash can't invalidate the in-use entry. |
+| `Server::listen_fds_mutex_` | `std::mutex` | `std::vector` is not thread-safe; iterate-and-close on `stop()` must serialize with `listen_tcp()` appends. |
+| `Server::client_fds_mutex_` | `std::mutex` | `std::unordered_set` is not thread-safe; concurrent insert/erase by `handle_connection` coroutines must serialize with `Server::stop()`'s walk-and-shutdown sweep. |
 
-1. **TaskQueue dequeue operations** (`dequeue_mutex_`)
-2. **Timer management** (`timer_mutex_`)
-3. **Server listen file descriptor tracking** (`listen_fds_mutex_`)
+Plus one `std::once_flag` in the Windows-only WSAStartup helper, which
+fires at most once per process.
 
-## 1. TaskQueue Dequeue Mutex
-
-### The Problem: Use-After-Free
+## 1. TaskQueue — both ends, single mutex
 
 ```cpp
-// Multi-producer enqueue (lock-free)
-void enqueue(Task task) {
-    Node* node = new Node(std::move(task));
-    Node* prev_tail = tail_.exchange(node, std::memory_order_acq_rel);
-    prev_tail->next.store(node, std::memory_order_release);
-}
+class TaskQueue {
+    Node* head_;
+    Node* tail_;
+    mutable std::mutex mutex_;
 
-// Multi-consumer dequeue (protected by mutex)
-auto dequeue(Task& task) -> bool {
-    std::lock_guard<std::mutex> lock(dequeue_mutex_);
-    
-    Node* head = head_.load(std::memory_order_acquire);
-    Node* next = head->next.load(std::memory_order_acquire);
-    
-    head_.store(next, std::memory_order_release);
-    task = std::move(next->task);  // Read from node
-    delete head;                    // Delete node
-    return true;
-}
+    void enqueue(Task task) {
+        Node* node = new Node(std::move(task));
+        std::lock_guard<std::mutex> lock(mutex_);
+        tail_->next = node;
+        tail_ = node;
+    }
+
+    bool dequeue(Task& task) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Node* head = head_;
+        Node* next = head->next;
+        if (next == nullptr) return false;
+        head_ = next;
+        task = std::move(next->task);
+        delete head;
+        return true;
+    }
+};
 ```
 
-### Why Atomics Aren't Sufficient
+### Why a single mutex on both ends
 
-The dequeue operation requires **three sequential steps** that must be atomic as a group:
+An earlier design used a lock-free Michael-Scott enqueue alongside a
+mutex-protected dequeue:
 
-1. **Read** the node's task data
-2. **Move** the task out of the node
-3. **Delete** the node
-
-**Race condition without mutex:**
-```
-Thread A: Reads head → Reads next → Reads task data
-Thread B: Reads head → Reads next → Reads task data
-Thread A: Updates head → Deletes old head node
-Thread B: Tries to read from deleted node → USE-AFTER-FREE
+```cpp
+// Old enqueue — looked lock-free, wasn't actually safe.
+Node* prev_tail = tail_.exchange(node, acq_rel);
+prev_tail->next.store(node, release);
 ```
 
-Even if we use atomics for each individual step, we cannot atomically ensure that:
-- No other thread is reading from a node while we delete it
-- The node isn't deleted between our read and our use of its data
+Between the `exchange` and the next `store`, a concurrent dequeue (under
+the dequeue mutex) could observe `prev_tail` as the head, advance past
+it, and free it. The subsequent `prev_tail->next.store()` was then a
+use-after-free on a node the allocator had often already recycled.
+Multi-consumer workloads turned this into freelist corruption that
+crashed minutes later in unrelated allocations.
 
-### Why Not Lock-Free?
+The Michael-Scott invariants cannot be restored without **hazard
+pointers** or **epoch-based reclamation** — both substantial machinery
+to maintain correctly inside a coroutine scheduler. The pragmatic
+alternative is a single `std::mutex` covering both ends. The queue is
+no longer lock-free in the API sense, but on the contended paths the
+original `atomic_exchange` traffic already serialized through cache
+coherence, so the measured throughput delta on the audit's bench was
+in the noise. If the lock-free property ever becomes a measured
+bottleneck, the right move is a battle-tested external queue
+(e.g. moodycamel::ConcurrentQueue), not reimplementing
+MS+hazard-pointers in-tree.
 
-A fully lock-free dequeue would require:
-- **Hazard pointers**: Track which nodes are being accessed by each thread
-- **Epoch-based reclamation**: Delay deletion until all threads have moved past the node
-- **Reference counting**: More complex memory management
-
-These techniques add significant complexity and overhead. The mutex approach is:
-- **Simpler**: Easy to understand and verify correctness
-- **Sufficient**: Dequeue is already single-consumer per queue (each worker thread has its own queue)
-- **Low contention**: In practice, only one thread dequeues from each queue
-
-### Performance Impact
-
-The mutex is only held during the brief dequeue operation (a few memory operations). Since each worker thread has its own queue, there's minimal contention. The lock-free enqueue (which happens from multiple threads) remains fast.
-
-## 2. Timer Management Mutex
-
-### The Problem: Complex Data Structure Operations
+## 2. Timer management mutex
 
 ```cpp
 std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerCompare> timers_;
-std::unordered_map<uint64_t, bool> cancelled_timers_;
+std::unordered_set<uint64_t> cancelled_timers_;
 std::unordered_map<void*, std::shared_ptr<Task>> suspended_tasks_;
 std::mutex timer_mutex_;
 ```
 
-### Why Atomics Aren't Sufficient
+Every timer operation touches at least two of these containers as a
+single transaction:
 
-Timer operations require **multiple related data structures** to be updated atomically:
+* **Add a timer:** check whether the new entry is now the earliest
+  (so we can wake the event loop), insert into the suspended-tasks
+  map keyed by handle, push onto the heap.
+* **Fire a timer:** pop the heap, check the cancelled set, re-push
+  if repeating, erase from the suspended-tasks map.
 
-**Adding a timer:**
+`std::priority_queue::push`/`pop` and `std::unordered_map::insert`/
+`erase` aren't atomic, and the relationship between the heap and the
+side tables only makes sense if all three are observed at the same
+instant. A lock-free design would need an MPMC priority queue plus
+two lock-free hash maps with consistent visibility — far more
+complexity than the timer path's traffic justifies. The mutex is held
+for the bounded duration of those container ops, on a path that fires
+once per timer expiry rather than per I/O event.
+
+## 3. `pending_io_` spinlock
+
 ```cpp
-{
-    std::lock_guard<std::mutex> lock(timer_mutex_);
-    // 1. Check if timers_ is empty or if this is the earliest timer
-    if (timers_.empty() || first_fire < timers_.top().next_fire) {
-        should_wake = true;
-    }
-    // 2. Add to suspended_tasks_ map
-    suspended_tasks_[task_ptr->handle.address()] = task_ptr;
-    // 3. Push to priority queue
-    timers_.push(TimerEntry{...});
-}
+std::unordered_map<int, PendingIO> pending_io_;
+mutable std::atomic_flag map_lock_ = ATOMIC_FLAG_INIT;
 ```
 
-**Processing timers:**
-```cpp
-{
-    std::lock_guard<std::mutex> lock(timer_mutex_);
-    // 1. Check if timer is cancelled
-    auto cancelled = cancelled_timers_.find(entry.id);
-    // 2. Pop from priority queue
-    timers_.pop();
-    // 3. If repeating, push back with new time
-    if (entry.repeat) {
-        timers_.push(entry);
-    }
-    // 4. Remove from suspended_tasks_
-    suspended_tasks_.erase(handle.address());
-}
-```
+The hottest of the five locks. Held for:
 
-### Why Not Lock-Free?
+* `register_io`: bump the entry's generation counter, copy the
+  caller's coroutine handle into `PendingIO::read` / `write`, and
+  call into the platform layer (`add_fd` / `modify_fd`) with the
+  packed `(generation, fd)` token. Held across the platform call so
+  a rehash cannot invalidate the entry while the kernel is reading
+  its `user_data` pointer.
+* `remove_io`: drop the entry.
+* `process_io_events`: per-event, decode the token's generation,
+  look up the entry, check the generation, transfer the suspended
+  handle into the local schedule list, and (if interest changed)
+  re-issue a `modify_fd` with the same token.
 
-These operations involve:
-- **Priority queue operations**: `top()`, `pop()`, `push()` - not atomic operations
-- **Hash map operations**: `find()`, `insert()`, `erase()` - complex internal state
-- **Multi-step transactions**: Need to check multiple data structures together
+A spinlock rather than a `std::mutex` because every critical section
+is bounded by a handful of map operations and (sometimes) one syscall;
+sleeping for that would be more expensive than spinning, and the
+contention domain is "one event-loop thread plus the schedulers that
+just woke up on workers", not "every coroutine in the process".
 
-Making these lock-free would require:
-- **Lock-free priority queue**: Extremely complex, typically uses skip lists or other complex structures
-- **Lock-free hash maps**: Possible but complex, requires careful memory reclamation
-- **Transaction-like semantics**: Ensuring all related updates happen atomically
-
-The mutex ensures:
-- **Atomicity**: All related operations happen together
-- **Consistency**: Data structures remain in valid states
-- **Simplicity**: Standard library containers work as-is
-
-### Performance Impact
-
-Timer operations are relatively infrequent compared to I/O operations:
-- Timers are added/removed on coroutine suspension/resumption
-- Timer processing happens in the main event loop, not in hot paths
-- The mutex is held for short durations (just the data structure updates)
-
-## 3. Server Listen FDs Mutex
-
-### The Problem: Vector Operations During Shutdown
+## 4. & 5. Server's two fd containers
 
 ```cpp
-std::vector<int> listen_fds_;
 std::mutex listen_fds_mutex_;
+std::vector<int> listen_fds_;
+std::mutex client_fds_mutex_;
+std::unordered_set<int> active_client_fds_;
 ```
 
-### Why Atomics Aren't Sufficient
+Both containers are standard-library types that aren't thread-safe.
+The locks are taken on:
 
-The `listen_fds_` vector is accessed in multiple scenarios:
+* `listen_tcp()` (rare; once per port at startup) and `stop()`'s
+  swap-and-close sweep (once at shutdown).
+* `handle_connection` entry/exit through the `ConnectionGuard` RAII
+  helper (per accepted client), and `Server::stop()`'s walk over
+  every active client to `shutdown(SHUT_RDWR)` it.
 
-**Adding a listen socket:**
-```cpp
-{
-    std::lock_guard<std::mutex> lock(listen_fds_mutex_);
-    listen_fds_.push_back(listen_fd);
-}
-```
+The connection-side traffic on `client_fds_mutex_` is the only one
+that scales with request rate. It's held briefly (a single
+`insert` or `erase`) and never across blocking I/O, so even under
+load it doesn't appear in profiles.
 
-**Stopping the server (from destructor or stop()):**
-```cpp
-{
-    std::lock_guard<std::mutex> lock(listen_fds_mutex_);
-    for (int fd : listen_fds_) {
-        close_socket(fd);
-    }
-    listen_fds_.clear();
-}
-```
+## General principles
 
-### Why Not Lock-Free?
+### When atomics are enough
 
-`std::vector` operations are not thread-safe:
-- **`push_back()`**: May reallocate, invalidating iterators
-- **Iteration**: Reading while another thread modifies is undefined behavior
-- **`clear()`**: Must be synchronized with concurrent access
+* A single read or write of a single word.
+* A simple compare-and-swap on a pointer or counter.
+* Per-element flags where adjacent elements don't need a consistent
+  view (statistics counters, the `running_` flag, the
+  `active_connections_` count).
 
-A lock-free approach would require:
-- **Lock-free vector**: Complex, typically uses segmented arrays or other structures
-- **Atomic reference counting**: For safe iteration during modification
-- **RCU (Read-Copy-Update)**: For safe concurrent reads and writes
+### When you need a lock
 
-### Performance Impact
+* You're mutating a non-atomic container (`std::vector`,
+  `std::unordered_map`, `std::priority_queue`).
+* You're freeing memory another thread might still be reading.
+* You're updating two or more pieces of state that must be observed
+  together.
+* You're holding state across a syscall that needs to see a
+  consistent snapshot.
 
-This mutex is only used for:
-- **Server setup**: When adding listen sockets (rare, happens at startup)
-- **Server shutdown**: When closing all sockets (rare, happens at shutdown)
-
-These are not hot paths, so the mutex overhead is negligible.
-
-## General Principles
-
-### When to Use Atomics
-
-Use atomics for:
-- **Single-word operations**: Reading/writing a single value
-- **Simple compare-and-swap**: Updating a pointer or counter
-- **Hot paths**: Operations that happen frequently (I/O registration, statistics)
-
-### When to Use Mutexes
-
-Use mutexes for:
-- **Multi-step operations**: Operations that must be atomic as a group
-- **Complex data structures**: Standard library containers that aren't thread-safe
-- **Memory safety**: Preventing use-after-free or data races on non-atomic types
-- **Infrequent operations**: Where lock-free complexity isn't justified
-
-### Design Philosophy
-
-`libspaznet` uses a **hybrid approach**:
-- **Lock-free where it matters**: Enqueue operations, I/O handle registration (hot paths)
-- **Mutexes where necessary**: Complex operations, data structure management (cold paths)
-
-This balances:
-- **Performance**: Lock-free operations in hot paths
-- **Correctness**: Mutexes ensure safety for complex operations
-- **Simplicity**: Avoiding overly complex lock-free algorithms where not needed
-
-## Summary
-
-| Location | Why Mutex? | Why Not Atomic? |
-|----------|-----------|-----------------|
-| `TaskQueue::dequeue` | Prevents use-after-free when deleting nodes | Can't atomically ensure no readers during deletion |
-| `IOContext::timer_mutex_` | Protects priority queue + hash maps | Complex multi-step operations on non-atomic structures |
-| `Server::listen_fds_mutex_` | Protects vector during iteration/modification | `std::vector` operations aren't thread-safe |
-
-The key insight: **atomics work for simple operations, but mutexes are needed when you must ensure multiple related operations happen atomically together, or when working with complex data structures that aren't designed for lock-free access.**
-
+`libspaznet`'s five locks each fall into one of those categories. The
+remaining cross-thread state — coroutine ref-counts, the per-fd
+generation counter, the statistics block, ids, flags — is all
+`std::atomic<…>` and never touches a mutex.
