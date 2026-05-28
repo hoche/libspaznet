@@ -1,5 +1,9 @@
 # TODO
 
+> Status as of aeb1bc5 (2026-05-27): unit + integration suites are
+> fully green on both macOS (excluding two long-standing PlatformIO
+> failures that don't reproduce on Linux) and Linux.
+
 ## From the 2026-05-27 audit
 
 - [ ] Replace QUIC + HPACK with a real library
