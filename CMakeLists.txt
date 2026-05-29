@@ -6,6 +6,14 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Emit compile_commands.json into the build directory; clangd (and other
+# tooling) reads it to learn each translation unit's include paths,
+# language standard, and definitions. Without it, the language server
+# defaults to C++17 and misses our headers + system OpenSSL paths,
+# producing spurious "file not found" / "no template named span"
+# diagnostics that don't reflect what the real build sees.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Threads: pull pthread (or the platform equivalent) in via the modern
 # imported target so we don't rely on the compiler implicitly linking
 # libpthread.

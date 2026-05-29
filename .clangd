@@ -1,0 +1,20 @@
+# clangd configuration for libspaznet.
+#
+# The real build uses C++20; without this hint some clangd builds default
+# to C++17 and misreport std::span / std::variant / std::optional as
+# missing. CompilationDatabase pins the path so clangd finds the
+# generated compile_commands.json in the build-quic/ directory even when
+# the top-level symlink isn't present.
+
+CompileFlags:
+  Add:
+    - -std=c++20
+    - -Wno-unknown-warning-option
+
+Index:
+  Background: Build
+
+Diagnostics:
+  UnusedIncludes: None
+  Suppress:
+    - "-Wunused-private-field"

@@ -7,7 +7,7 @@
 namespace spaznet {
 namespace quic {
 
-// RFC 9000 §16 variable-length integer encoding.
+// RFC 9000 §16 variable-length integer encoding (QUIC v1).
 //
 // The two most significant bits of the first byte encode the length:
 //   00 -> 1 byte,  6-bit value
