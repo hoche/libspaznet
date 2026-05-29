@@ -54,6 +54,10 @@ set(SOURCES
     src/quic/frame.cpp
     src/quic/transport_params.cpp
     src/quic/tls.cpp
+    src/quic/pn_space.cpp
+    src/quic/stream.cpp
+    src/quic/recovery.cpp
+    src/quic/congestion.cpp
     src/utils/string_utils.cpp
     src/utils/number_utils.cpp
     src/utils/binary_utils.cpp
@@ -80,6 +84,10 @@ set(HEADERS
     include/libspaznet/quic/frame.hpp
     include/libspaznet/quic/transport_params.hpp
     include/libspaznet/quic/tls.hpp
+    include/libspaznet/quic/pn_space.hpp
+    include/libspaznet/quic/stream.hpp
+    include/libspaznet/quic/recovery.hpp
+    include/libspaznet/quic/congestion.hpp
     include/libspaznet/utils/string_utils.hpp
     include/libspaznet/utils/number_utils.hpp
     include/libspaznet/utils/binary_utils.hpp
@@ -257,6 +265,7 @@ add_executable(test_unit
     tests/unit/test_quic_phase1.cpp
     tests/unit/test_quic_frame.cpp
     tests/unit/test_quic_tls.cpp
+    tests/unit/test_quic_phase4.cpp
     tests/unit/test_rfc9112_parser.cpp
     tests/unit/test_rfc9113_parser.cpp
     tests/unit/test_logger.cpp
