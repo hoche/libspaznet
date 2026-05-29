@@ -243,21 +243,38 @@ Ordered by priority.
     to add (the encoder/decoder for each frame already exists) and
     indispensable when something breaks in the field.
 
-- [ ] Performance benchmark for the QUIC path
-  - Comparable to the existing `bench_thread_modes` for TCP. Right
-    now we have no idea what requests/sec this stack does. Useful
-    even before the spec-MUST gaps are closed.
-  - First callgrind profile (2026-05-29, see
-    `docs/quic-profile-2026-05-29.md`): under the QUIC + HTTP/3 unit
-    tests the workload is **handshake-bound** — ~50% of cycles in
-    libcrypto crypto math (X25519, P-256, SHA-2, ML-KEM), ~9% in
-    glibc malloc/free, ~5% in glibc memcpy/memset, and **only ~1%
-    in libspaznet's own code**. No path to a meaningful win from
-    micro-optimizing varint/frame parsing/huffman; the big realistic
-    wins are session resumption / 0-RTT (skips cert + KEM) and
-    reducing `std::vector` churn on the packet-build path. Need a
-    steady-state benchmark next to see what AEAD-bound code looks
-    like.
+- [x] Performance benchmark for the QUIC path
+  - Shipped as `tests/performance/bench_quic_steady_state.cpp`
+    (commit 27320da). Baseline numbers: ~117 K full-MTU
+    packets/sec, ~675 Mbps, ~8.5 µs/packet end-to-end on a single
+    thread (meep, Intel x86_64). See
+    `docs/quic-profile-2026-05-29.md`.
+  - The first profile under that bench is also captured in the same
+    doc. The in-place-AEAD optimization that the profile recommended
+    (commit fc8a185) turned out to be within benchmark noise here
+    (callgrind saw −7% on the changed sub-tree, but the bench
+    exercises both server send + client receive plus the per-call
+    EVP context churn, which dwarfs vector allocations).
+
+- [ ] QUIC perf: cache EVP_CIPHER_CTX per Space
+  - Every aead_seal/aead_seal_inplace call today does
+    EVP_CIPHER_CTX_new + EVP_EncryptInit_ex(cipher,key) +
+    EVP_CIPHER_CTX_free. The cipher and key don't change between
+    packets at the same level; only the IV does. Allocate the
+    context once when keys are installed in install_new_keys, store
+    it on the Space, and per packet call
+    EVP_EncryptInit_ex(ctx, nullptr, nullptr, nullptr, nonce) to
+    reset only the IV. Largest single wallclock win still on the
+    table based on the bench profile.
+
+- [ ] QUIC perf: hand back a span from Stream::pull_send
+  - Today pull_send does data_out.assign(...), copying bytes from
+    the stream's send buffer into a vector that lives in a
+    StreamFrame's `data` field until the packet is acked. That's
+    one allocation + one memcpy per packet emitted. The stream's
+    send buffer is the source of truth and doesn't shrink until
+    on_acked, so handing back a span<const uint8_t> into it would
+    let build_and_send reference the bytes without copying.
 
 - [ ] API documentation
   - The five new public types (`TlsContext`, `Connection`, `Listener`,

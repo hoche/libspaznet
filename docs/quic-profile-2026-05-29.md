@@ -160,6 +160,65 @@ but a steady-state benchmark — one long-lived connection pushing
 thousands of packets through a single peer — is what's needed to
 make this kind of optimization measurable.
 
+## Follow-up: steady-state throughput bench (commit 27320da)
+
+Built the bench the previous follow-up called for —
+`tests/performance/bench_quic_steady_state.cpp`. Spins up the
+in-memory loopback (server quic::Connection + hand-rolled OpenSSL
+client), completes one handshake, opens huge flow-control windows,
+then measures how long N 1-RTT packets take to flow server →
+client end-to-end. Reports a Markdown table over R reps.
+
+### Baseline numbers (RelWithDebInfo, no contending workload)
+
+| host | pkts/sec | Mbps | ns/pkt |
+|---|---|---|---|
+| meep (Intel x86_64, OpenSSL 3.5.4) | ~117 K | ~675 | ~8 500 |
+| local (Apple M-series, OpenSSL 3.6.1) | ~118 K | ~677 | ~8 500 |
+
+End-to-end QUIC v1 throughput on a single thread, no UDP socket
+involved: ~675 Mbps = ~117 K full-MTU packets/sec each direction.
+~⅔ of a gigabit through the QUIC layer alone.
+
+### Before / after the in-place-AEAD change
+
+10 reps × 100 K packets per rep on meep, back-to-back:
+
+| | pkts/sec | Mbps | ns/pkt |
+|---|---|---|---|
+| Before (461645b — vector copies, allocating AEAD) | 117,478 | 674.2 | 8,514 |
+| After  (27320da — in-place AEAD + scratch buffer) | 115,562 | 663.2 | 8,663 |
+| Delta | **−1.6%** | **−1.6%** | **+1.7%** |
+
+One rep in the "after" run was a clear outlier (105 K pkts/sec while
+the other nine clustered at 115–119 K). Stripping it shrinks the
+gap to about −0.6%. Either way the optimization is **within
+benchmark noise** on this workload.
+
+### Why the local 7% callgrind win doesn't show up here
+
+The bench exercises both server send AND client receive in a loop;
+the changes only touched server send. The bench also still pays
+for one full `EVP_CIPHER_CTX_new` / `_free` per AEAD call on both
+sides — that pair dwarfs the vector allocations the optimization
+removed. callgrind sees the −7% on the changed sub-tree; wallclock
+doesn't because the sub-tree is a minority of total per-packet
+work.
+
+### Next optimization, ranked by expected wallclock impact
+
+1. **Cache `EVP_CIPHER_CTX*` per `Space`** — allocate once at key
+   install, call `EVP_EncryptInit_ex(ctx, nullptr, nullptr, nullptr,
+   nonce)` per packet to reset only the IV. Probably the biggest
+   single win available.
+2. **Eliminate `Stream::pull_send`'s `data_out.assign(...)`** — hand
+   back a `span<const uint8_t>` into the stream's send buffer.
+   Removes one allocation + copy per packet emitted.
+3. The test harness still uses `aead_seal`/`aead_open` (allocating
+   variants). Switching it to the in-place versions would only
+   matter for bench fidelity, not real-world perf — not worth the
+   churn unless we extract the harness into a reusable header.
+
 ## Reproduce
 
 ```bash
