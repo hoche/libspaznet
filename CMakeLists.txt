@@ -331,6 +331,12 @@ add_executable(test_performance
 target_link_libraries(test_performance PRIVATE spaznet GTest::gtest GTest::gmock)
 spaznet_apply_test_warnings(test_performance)
 
+add_executable(bench_quic_steady_state
+    tests/performance/bench_quic_steady_state.cpp
+)
+target_link_libraries(bench_quic_steady_state PRIVATE spaznet OpenSSL::SSL OpenSSL::Crypto)
+spaznet_apply_test_warnings(bench_quic_steady_state)
+
 add_executable(bench_thread_modes
     tests/performance/bench_thread_modes.cpp
 )
