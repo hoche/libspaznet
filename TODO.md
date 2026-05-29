@@ -247,6 +247,17 @@ Ordered by priority.
   - Comparable to the existing `bench_thread_modes` for TCP. Right
     now we have no idea what requests/sec this stack does. Useful
     even before the spec-MUST gaps are closed.
+  - First callgrind profile (2026-05-29, see
+    `docs/quic-profile-2026-05-29.md`): under the QUIC + HTTP/3 unit
+    tests the workload is **handshake-bound** — ~50% of cycles in
+    libcrypto crypto math (X25519, P-256, SHA-2, ML-KEM), ~9% in
+    glibc malloc/free, ~5% in glibc memcpy/memset, and **only ~1%
+    in libspaznet's own code**. No path to a meaningful win from
+    micro-optimizing varint/frame parsing/huffman; the big realistic
+    wins are session resumption / 0-RTT (skips cert + KEM) and
+    reducing `std::vector` churn on the packet-build path. Need a
+    steady-state benchmark next to see what AEAD-bound code looks
+    like.
 
 - [ ] API documentation
   - The five new public types (`TlsContext`, `Connection`, `Listener`,
