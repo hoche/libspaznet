@@ -265,6 +265,65 @@ on_acked quadratic when run at large N.
 All sanitizers remain clean (227/227 under asan+ubsan and tsan on
 both macOS and meep).
 
+## Follow-up: O(N²) ACK processing fixed (commit bcac7b4)
+
+Two related fixes for the wildly-superlinear ns/pkt growth the
+bench was showing:
+
+1. **`Connection::on_ack_frame`** previously iterated every PN in
+   each acked range and did a `by_pn.find(pn)`. The hand-rolled
+   client never trims its `PnSpace::ranges_`, so every ACK frame
+   covers PNs `0..largest_acked` — almost all of which are already-
+   acked-and-released and miss in `by_pn`. Over N total acks that
+   was O(N²) total work. The fix: walk `sent_`'s map via
+   `lower_bound` instead, so per-ACK work is O(found + log K), not
+   O(range).
+
+2. **`Stream::on_acked`** previously did
+   `send_buf_.erase(begin, begin+take)` — O(N) memmove per ack
+   range. Replaced with a logical "head" offset
+   `send_buf_head_`: advancing on ack is O(1), with a single
+   `std::move` compaction when the head crosses 8 KiB or half the
+   buffer. Amortized O(1) per acked byte.
+
+Steady-state bench (RelWithDebInfo, no backpressure):
+
+**Local macOS (AppleClang + OpenSSL 3.6.1):**
+
+| N pkts | Before (549107d) | After (bcac7b4)      | ns/pkt delta |
+|---|---|---|---|
+|   5K | 4,010 ns/pkt /  1.5 Gbps | 3,599 ns/pkt /  1.6 Gbps | -10% |
+|  20K | 4,514 ns/pkt /  1.3 Gbps | 2,342 ns/pkt /  2.5 Gbps | -48% |
+|  50K | 7,802 ns/pkt /  0.7 Gbps | 2,283 ns/pkt /  2.5 Gbps | -71% |
+| 100K | 13,299 ns/pkt / 0.4 Gbps | 2,309 ns/pkt /  2.5 Gbps | -83% |
+| 200K | 24,478 ns/pkt / 0.2 Gbps | 2,304 ns/pkt /  2.5 Gbps | -91% |
+
+**meep (gcc 13.3 + OpenSSL 3.5.4, Intel x86_64):**
+
+| N pkts | After (bcac7b4) |
+|---|---|
+|   5K | 388,757 pps / 2,231 Mbps / 2,573 ns/pkt |
+|  20K | 382,411 pps / 2,195 Mbps / 2,616 ns/pkt |
+|  50K | 392,984 pps / 2,255 Mbps / 2,545 ns/pkt |
+| 100K | 388,365 pps / 2,229 Mbps / 2,575 ns/pkt |
+| 200K | 385,515 pps / 2,216 Mbps / 2,594 ns/pkt |
+| 500K | 393,083 pps / 2,261 Mbps / 2,544 ns/pkt |
+
+ns/pkt is now flat across packet count from 5K to 500K — confirms
+the quadratic is gone.
+
+### Cumulative journey on meep (vs the original baseline 461645b)
+
+|  N pkts | Original baseline | After all perf fixes (bcac7b4) | Throughput |
+|---|---|---|---|
+|  100K | 117 K pps, 674 Mbps   | **388 K pps, 2,229 Mbps** | **+231%** |
+
+Headline: a single-thread libspaznet QUIC connection now sustains
+~2.2 Gbps end-to-end on commodity hardware, with no UDP socket
+involved (in-memory loopback). The remaining cost is dominated by
+AEAD math and OpenSSL housekeeping, both of which are AES-NI-fast
+and not worth attacking further at this layer.
+
 ## Reproduce
 
 ```bash

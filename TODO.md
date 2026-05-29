@@ -267,19 +267,37 @@ Ordered by priority.
     (smaller-N runs see the bigger win because at higher N
     `Stream::on_acked`'s O(N) erase eats the wallclock).
 
-- [ ] QUIC perf: fix O(N) erase in Stream::on_acked
-  - `send_buf_.erase(begin, begin + take)` is O(N) where N is the
-    in-flight stream-send-buffer size. Combined with multiple
-    on_acked calls per ack frame (one per acked StreamFrame) and
-    `std::sort(acked_ranges_)` per call, the per-ack work grows
-    superlinearly with how much data is queued. The QUIC bench at
-    high packet counts shows ns/pkt growing nearly linearly with N
-    (~3 us at 5K pkts → ~25 us at 200K pkts) because of this.
-  - Fix options: (a) track a "consumed front offset" inside
-    send_buf_ and compact lazily; (b) switch send_buf_ to
-    std::deque<uint8_t> (loses contiguous .data() — would need
-    pull_send to gather across chunks); (c) use a ring buffer.
-    Likely (a) — minimal API change, single-pass amortized cost.
+- [x] QUIC perf: fix O(N) erase in Stream::on_acked + O(N²) ACK loop
+  - Shipped in bcac7b4. Two fixes, both required:
+    1. `Connection::on_ack_frame` now walks `sent_` via `lower_bound`
+       instead of iterating every PN in each acked range. The bench
+       client doesn't trim its PnSpace.ranges_, so each ACK frame
+       covers PNs 0..largest — most of which are already acked. The
+       old code did O(largest_pn) by_pn.find calls per ACK; the new
+       one visits only the actually-still-in-flight entries.
+    2. `Stream::on_acked` now advances a logical head offset
+       (`send_buf_head_`) on ack rather than `vector::erase(begin,
+       ...)`, compacting only when the head exceeds 8 KiB or half
+       the buffer.
+  - Result: bench ns/pkt is flat across N (was growing ~linearly
+    with N, i.e. total time was O(N²)). Headline: ~388 K pps /
+    2.23 Gbps / 2,575 ns/pkt on meep, holds steady up to 500 K
+    packets. End-to-end +231% throughput vs the pre-optimization
+    baseline (461645b).
+
+- [ ] QUIC perf: PnSpace should trim received-PN ranges over time
+  - The companion problem to the fix above. RFC 9000 §13.2
+    "Limiting Ranges by Tracking ACK Frames" describes the actual
+    fix: once the peer has acknowledged a frame that itself
+    acknowledged some PNs, the receiver no longer needs to keep
+    those PNs in its received-PN set. We currently never call
+    PnSpace::trim_below, so the ranges_ vector includes every PN
+    ever seen — bloating every emitted ACK frame.
+  - Today the workaround is on the server side (on_ack_frame
+    handles the bloated ACK efficiently). But the bloated ACKs
+    themselves are wire-inefficient (more varint bytes than
+    needed) and the test harness/client would benefit from
+    proper trimming too.
 
 - [ ] QUIC perf: hand back a span from Stream::pull_send
   - Today pull_send does data_out.assign(...), copying bytes from
