@@ -1,18 +1,40 @@
 # TODO
 
-> Status as of c5a830d (2026-05-27): unit + integration suites are
-> fully green on both macOS and Linux — **143/143 unit, 70/70 integration**.
-> The two long-standing macOS PlatformIO failures are fixed (kqueue
-> remove_fd bug, e9d66f6).
+> Status as of 9630b58 (2026-05-29): unit suite is fully green on both
+> macOS (AppleClang + OpenSSL 3.6.1) and Linux (gcc 13.3 + OpenSSL
+> 3.5.4) — **225/225 unit tests**. asan+ubsan and tsan builds also
+> clean on both platforms (tsan on meep needs `setarch -R` to dodge
+> the kernel-ASLR-vs-tsan-shadow conflict; not a code issue). The two
+> long-standing macOS PlatformIO failures fixed earlier in e9d66f6
+> remain fixed.
 
 ## From the 2026-05-27 audit
 
-- [ ] Replace QUIC + HPACK with a real library
-  - Current QUIC is non-interoperable plaintext (no Initial keys, no header
-    protection, no AEAD, inverted long-header bit, non-RFC varint).
-  - Current HPACK silently corrupts headers (no RFC 7541 varint, no Huffman,
-    no dynamic table).
-  - Candidates: ngtcp2 / quiche / msquic for QUIC; nghttp2 for HPACK.
+- [x] Replace QUIC + HPACK with a real implementation
+  - Shipped across commits 111fcd1 (Phase 1+2 — RFC 9000 §16 varints,
+    RFC 9001 §A.2 Initial-packet KAT, AES-128/256-GCM + ChaCha20-Poly1305
+    AEAD, header protection, full frame codec under std::variant),
+    3da5cbb (Phase 3 — TLS 1.3 via SSL_set_quic_tls_cbs, RFC 9000 §18
+    transport-parameter codec), aa756d6 + 982be0a (Phase 4 — PN-space
+    ACK bookkeeping, stream state machine with out-of-order reassembly,
+    RFC 9002 RTT/PTO, NewReno congestion, Connection orchestrator),
+    1adf39b (Phase 5 — Listener with CID demux, RFC 9001 §A.4 Retry
+    integrity tag KAT, Version Negotiation), 5e3a4ba + 7c90120 +
+    eb91300 (Phase 6 — RFC 7541 §B Huffman with §C.4 vectors,
+    RFC 9204 QPACK static-only, RFC 9114 HTTP/3 frames, Http3Server
+    request dispatcher), 230681b (Phase 7 — peer-addr routing,
+    Server::set_quic_http3_service, end-to-end protected-datagram GET
+    test).
+  - Server-side QUIC v1 + HTTP/3 only. TLS handshake driven by
+    OpenSSL 3.5+ via the upstream QUIC TLS callback dispatch; all
+    transport / recovery / congestion / HTTP/3 / QPACK code is
+    in-tree, no other third-party deps.
+  - End-to-end verification: an OpenSSL client SSL* and our
+    quic::Connection complete a TLS 1.3 handshake through three rounds
+    of real protected datagrams, exchange transport parameters,
+    install Application-level secrets, and the client's QPACK-encoded
+    GET on stream 0 round-trips through Http3Server to a HEADERS+DATA
+    response (`:status 200`, body "Hello, h3!").
 
 - [x] Make the WebSocket layer RFC 6455 compliant
   - Shipped in e1db51e and f87cdb8 (pre-rewrite SHAs e860986, 3fa7788)
@@ -107,21 +129,139 @@ items from the same re-audit, none critical:
     on decades-long uptime under extreme churn, but the fix is one
     line: re-roll on wrap.
 
-- [ ] Replace QUIC + HPACK with a real library (still the big one)
-  - See above section for the full description.
-
 - [ ] async_read return type → Task<ssize_t>
   - Deferred follow-up from #3 of the original audit. Requires the
     Task<T> template that doesn't exist yet.
 
+## QUIC + HTTP/3 follow-ups (2026-05-29)
+
+The seven-phase rewrite landed (see "From the 2026-05-27 audit" above),
+but a number of items were explicitly deferred or left as cleanup work.
+Ordered by priority.
+
+### Cleanup we deferred but should land before anyone uses this
+
+- [ ] Delete the toy QUIC/HTTP/3 code
+  - `src/handlers/quic_handler.cpp`, `src/handlers/quic_server.cpp`,
+    `src/handlers/http3_handler.cpp`, plus their declarations in
+    `include/libspaznet/handlers/quic_handler.hpp`,
+    `include/libspaznet/handlers/quic_server.hpp`,
+    `include/libspaznet/handlers/http3_handler.hpp`. Remove the
+    `set_quic_handler`/`set_http3_handler` setters and the old
+    `QUICServerEngine` branch in `Server::receive_udp`. Also drop
+    `tests/unit/test_quic_handler.cpp`. ~900 lines.
+  - Keep `Server::set_quic_http3_service` (the new entry point).
+
+- [ ] Wire `Listener::Config::require_retry` into the dispatch path
+  - The flag exists, the Retry packet builder + RFC 9001 §A.4 KAT
+    pass, but `Listener::on_datagram` never branches on
+    `cfg_.require_retry`. With it off (the default), the server hands
+    out connection state to anyone who can synthesize a 1200-byte
+    Initial — DDoS-amplification fodder.
+
+- [ ] Implement the 3× anti-amplification budget in `Connection`
+  - RFC 9000 §8.1.2. Until the peer's address is validated (Initial
+    ACKed or Retry token verified), the server MUST cap total bytes
+    sent at 3× total bytes received. Today the budget isn't tracked
+    at all.
+
+### Spec MUSTs we deferred
+
+- [ ] Key update (RFC 9001 §6)
+  - AEAD usage limits (RFC 9001 §6.6) require key rotation before
+    2^23 packets at AES-128-GCM. A long-lived 1-RTT connection without
+    key update is a MUST violation.
+
+- [ ] Connection migration / path validation past first datagram
+  - Today `Listener::on_datagram` updates `state.last_peer = peer`
+    on every received datagram and the response goes wherever the
+    most recent inbound came from. RFC 9000 §9 requires PATH_CHALLENGE
+    / PATH_RESPONSE on a new path before sending non-probing data.
+
+- [ ] PTO retransmission + idle timeout
+  - `Recovery` tracks the math (`pto_timeout`, `loss_time_threshold`)
+    but `Connection::on_timer()` never consults it. Packets dropped on
+    the wire never get re-sent today; the existing loopback test only
+    passes because there's no loss. Plumb PTO into `on_timer`, and
+    enforce the negotiated `max_idle_timeout`.
+
+- [ ] CONNECTION_CLOSE emission on protocol errors
+  - We parse incoming CONNECTION_CLOSE and flip to `Draining`, but on
+    our side we never emit one — on a parse error we just transition
+    to `Closing` silently. Build and ship a CONNECTION_CLOSE frame
+    with the appropriate transport / application error code.
+
+### Hardening
+
+- [ ] Fuzz the parsers
+  - `parse_frame`, `parse_long_header`, `parse_h3_frame`, `qpack_decode`,
+    `decode_transport_params` all take attacker-controlled bytes. Even
+    a 10-second libFuzzer pass per parser would find any obvious
+    crashers. Wire under `tests/fuzz/` behind `-DBUILD_FUZZERS=ON`.
+
+- [ ] UDP-socket integration test for `Server::set_quic_http3_service`
+  - We have the wiring (`server_impl.cpp` calls
+    `quic_http3_service_->handle_datagram`) but no test actually opens
+    a UDP socket. The end-to-end loopback test (`test_http3_end_to_end`)
+    goes through the `Connection` API directly. A real-socket test
+    that binds, uses our hand-rolled client over `sendto`/`recvfrom`,
+    and validates the GET round-trips would catch any plumbing bugs
+    in the receive_udp coroutine.
+
+- [ ] Real curl `--http3` interop
+  - Neither CI host has an HTTP/3-enabled curl today. Build curl with
+    `--with-quiche` or `--with-ngtcp2` on meep (or pull a pre-built
+    container) and add a test that pipes through it. Almost certainly
+    finds at least one issue the in-memory test misses (cipher-suite
+    preference ordering, exact ACK timing, GREASE frame handling).
+
+### Features that round out the implementation
+
+- [ ] Client mode for `Connection`
+  - The `Role role_{Role::Server}` field is a placeholder. Client mode
+    needs: SCID/DCID generation in reverse, Initial-secret derivation
+    with `Direction::Client`, transport-parameter encode-without-OD-CID,
+    handling of Retry on the client side, and the dispatch through TLS
+    `SSL_set_connect_state` instead of `SSL_set_accept_state`.
+
+- [ ] 0-RTT / session resumption
+  - TLS layer can already do it (OpenSSL exposes the early-data API).
+    QUIC plumbing for the EarlyData PN space, the early-data CRYPTO
+    buffer, and the 0-RTT key install path is missing.
+
+- [ ] Dynamic QPACK table
+  - Today the server advertises `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0`
+    and rejects any non-zero Required-Insert-Count in incoming field
+    sections. A dynamic-table encoder + decoder (RFC 9204 §3.2) lifts
+    compression ratios significantly for repeated headers.
+
+### Operational polish
+
+- [ ] qlog tracing
+  - RFC 9001 §A.1 / IETF draft-ietf-quic-qlog. Emit one JSON line per
+    packet/frame to a file pointed to by the `QLOGDIR` env var. Cheap
+    to add (the encoder/decoder for each frame already exists) and
+    indispensable when something breaks in the field.
+
+- [ ] Performance benchmark for the QUIC path
+  - Comparable to the existing `bench_thread_modes` for TCP. Right
+    now we have no idea what requests/sec this stack does. Useful
+    even before the spec-MUST gaps are closed.
+
+- [ ] API documentation
+  - The five new public types (`TlsContext`, `Connection`, `Listener`,
+    `QuicHttp3Service`, `Http3Server`) have header comments but no
+    consolidated docs. A `docs/quic.md` walking through how the layers
+    compose, with the loopback test as a worked example, would help
+    anyone trying to use this.
+
 ## Other
 
-- [ ] Add support for TLS
-  - Currently, TLS is not supported.
-  - Probably use OpenSSL as an optional config.
-  - Need to be able to get cert information from the connection for auth
-
-
-
-
+- [x] Add support for TLS
+  - Shipped as part of the QUIC rewrite (commit 3da5cbb). The
+    `TlsContext` / `TlsConnection` wrappers around OpenSSL 3.5+ live
+    in `include/libspaznet/quic/tls.hpp`. They're QUIC-specific
+    today — using them for vanilla TLS-over-TCP would need a thin
+    `SSL_read`/`SSL_write`-driven path that isn't there yet, but the
+    SSL_CTX construction (cert/key loading, ALPN) is reusable.
 
