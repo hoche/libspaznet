@@ -229,14 +229,28 @@ Allocated in `Connection::install_new_keys` and held on each
 `Space`. The Initial, Handshake, and Application send + receive
 paths all go through the cached contexts now.
 
-Bench (local macOS, RelWithDebInfo, in-place AEAD already present
-in baseline, this change adds the context cache on top):
+Bench results (RelWithDebInfo, in-place AEAD already present in
+baseline, this change adds the context cache on top):
 
-| N packets | Before (fc8a185) | After (this change) | Delta |
+**Local macOS (AppleClang + OpenSSL 3.6.1):**
+
+| N packets | Before (fc8a185) | After (549107d) | Delta |
 |---|---|---|---|
 | 5,000  | 276K pps / 1.59 Gbps / 3,680 ns/pkt | **340K pps / 1.95 Gbps / 2,941 ns/pkt** | **+23% / -20%** |
 | 10,000 | 262K pps / 1.50 Gbps / 3,821 ns/pkt | 285K pps / 1.63 Gbps / 3,513 ns/pkt | +9% / -8% |
 | 20,000 | 202K pps / 1.16 Gbps / 4,955 ns/pkt | 217K pps / 1.25 Gbps / 4,602 ns/pkt | +8% / -7% |
+
+**meep (gcc 13.3 + OpenSSL 3.5.4, Intel x86_64):**
+
+| N packets | Before (fc8a185) | After (549107d) | Delta |
+|---|---|---|---|
+| 5,000  | 278,596 pps / 1.60 Gbps / 3,591 ns/pkt | **344,446 pps / 1.98 Gbps / 2,905 ns/pkt** | **+24% / -19%** |
+| 10,000 | 238,254 pps / 1.37 Gbps / 4,198 ns/pkt | **324,361 pps / 1.86 Gbps / 3,083 ns/pkt** | **+36% / -27%** |
+| 20,000 | 191,984 pps / 1.10 Gbps / 5,230 ns/pkt | **275,697 pps / 1.58 Gbps / 3,628 ns/pkt** | **+44% / -31%** |
+
+The improvement is larger on Linux than on macOS, likely because
+glibc's malloc has higher per-allocation overhead than macOS's
+allocator, so removing per-packet allocations buys more there.
 
 CipherCtx caching is a real wallclock improvement. The win shrinks
 with N because a different bug — `Stream::on_acked`'s O(N)
