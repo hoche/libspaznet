@@ -74,6 +74,59 @@ TEST(QuicVarInt, DecodeTruncated) {
     EXPECT_FALSE(VarInt::decode(enc.data(), 5, off, decoded));
 }
 
+TEST(QuicCrypto, CipherCtxMatchesFreeFunction) {
+    auto secret = spaznet::quic::derive_initial_secret(hex("8394c8f03e515708"),
+                                                       Direction::Client);
+    auto keys = spaznet::quic::derive_packet_keys(Aead::Aes128Gcm, secret);
+    std::vector<uint8_t> aad = {0x11, 0x22, 0x33};
+    std::vector<uint8_t> plaintext;
+    for (int i = 0; i < 150; ++i) plaintext.push_back(static_cast<uint8_t>(i * 7));
+
+    // Reference via the free function.
+    std::vector<uint8_t> sealed_ref;
+    ASSERT_TRUE(spaznet::quic::aead_seal(
+        Aead::Aes128Gcm, {keys.key.data(), keys.key.size()},
+        {keys.iv.data(), keys.iv.size()}, {aad.data(), aad.size()},
+        {plaintext.data(), plaintext.size()}, sealed_ref));
+
+    // Cached context.
+    spaznet::quic::CipherCtx enc;
+    ASSERT_TRUE(enc.init(Aead::Aes128Gcm, {keys.key.data(), keys.key.size()},
+                         spaznet::quic::CipherCtx::Direction::Encrypt));
+    std::vector<uint8_t> body = plaintext;
+    std::array<uint8_t, 16> tag{};
+    ASSERT_TRUE(enc.seal_inplace({keys.iv.data(), keys.iv.size()},
+                                  {aad.data(), aad.size()},
+                                  {body.data(), body.size()},
+                                  {tag.data(), tag.size()}));
+    EXPECT_EQ(std::vector<uint8_t>(sealed_ref.begin(), sealed_ref.begin() + plaintext.size()),
+              body);
+    EXPECT_EQ(std::vector<uint8_t>(sealed_ref.begin() + plaintext.size(), sealed_ref.end()),
+              std::vector<uint8_t>(tag.begin(), tag.end()));
+
+    // Re-use the same context for a second packet with a different IV
+    // — that's the whole point of caching.
+    std::vector<uint8_t> iv2(keys.iv.begin(), keys.iv.end());
+    iv2.back() ^= 0xAB; // any different nonce
+    std::vector<uint8_t> body2 = plaintext;
+    std::array<uint8_t, 16> tag2{};
+    ASSERT_TRUE(enc.seal_inplace({iv2.data(), iv2.size()},
+                                  {aad.data(), aad.size()},
+                                  {body2.data(), body2.size()},
+                                  {tag2.data(), tag2.size()}));
+    EXPECT_NE(body, body2); // different IV must yield different ciphertext
+
+    // Decrypt cache works too.
+    spaznet::quic::CipherCtx dec;
+    ASSERT_TRUE(dec.init(Aead::Aes128Gcm, {keys.key.data(), keys.key.size()},
+                         spaznet::quic::CipherCtx::Direction::Decrypt));
+    ASSERT_TRUE(dec.open_inplace({iv2.data(), iv2.size()},
+                                  {aad.data(), aad.size()},
+                                  {body2.data(), body2.size()},
+                                  {tag2.data(), tag2.size()}));
+    EXPECT_EQ(body2, plaintext);
+}
+
 TEST(QuicCrypto, AeadInplaceMatchesCopyVariant) {
     auto secret = spaznet::quic::derive_initial_secret(hex("8394c8f03e515708"),
                                                        Direction::Client);

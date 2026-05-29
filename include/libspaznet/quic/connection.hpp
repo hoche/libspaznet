@@ -121,6 +121,13 @@ class Connection {
         Aead aead{Aead::Aes128Gcm};
         PacketKeys send_keys{};
         PacketKeys recv_keys{};
+        // Cached AEAD contexts. Allocated once when keys are installed
+        // and reused for every packet at this level — only the IV gets
+        // reset per call. Avoids the per-packet EVP_CIPHER_CTX_new +
+        // EVP_EncryptInit_ex(cipher, key) + free that dominated the
+        // wallclock cost of the previous in-place-AEAD attempt.
+        CipherCtx send_ctx{};
+        CipherCtx recv_ctx{};
         bool send_keys_ready{false};
         bool recv_keys_ready{false};
         // Largest PN we've decrypted (for PN reconstruction).

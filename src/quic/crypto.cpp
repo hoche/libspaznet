@@ -431,6 +431,132 @@ auto aead_open_inplace(Aead aead, std::span<const uint8_t> key, std::span<const 
     return ok;
 }
 
+// ---- CipherCtx ----------------------------------------------------------
+
+CipherCtx::~CipherCtx() {
+    reset();
+}
+
+CipherCtx::CipherCtx(CipherCtx&& other) noexcept
+    : ctx_(other.ctx_), aead_(other.aead_), dir_(other.dir_) {
+    other.ctx_ = nullptr;
+}
+
+auto CipherCtx::operator=(CipherCtx&& other) noexcept -> CipherCtx& {
+    if (this != &other) {
+        reset();
+        ctx_ = other.ctx_;
+        aead_ = other.aead_;
+        dir_ = other.dir_;
+        other.ctx_ = nullptr;
+    }
+    return *this;
+}
+
+auto CipherCtx::reset() -> void {
+    if (ctx_ != nullptr) {
+        EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX*>(ctx_));
+        ctx_ = nullptr;
+    }
+}
+
+auto CipherCtx::init(Aead aead, std::span<const uint8_t> key, Direction dir) -> bool {
+    reset();
+    const EVP_CIPHER* cipher = aead_cipher(aead);
+    if (cipher == nullptr) return false;
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (ctx == nullptr) return false;
+    bool ok = false;
+    if (dir == Direction::Encrypt) {
+        ok = EVP_EncryptInit_ex(ctx, cipher, nullptr, nullptr, nullptr) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN,
+                                 static_cast<int>(aead_iv_length(aead)), nullptr) == 1 &&
+             EVP_EncryptInit_ex(ctx, nullptr, nullptr, key.data(), nullptr) == 1;
+    } else {
+        ok = EVP_DecryptInit_ex(ctx, cipher, nullptr, nullptr, nullptr) == 1 &&
+             EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN,
+                                 static_cast<int>(aead_iv_length(aead)), nullptr) == 1 &&
+             EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), nullptr) == 1;
+    }
+    if (!ok) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+    ctx_ = ctx;
+    aead_ = aead;
+    dir_ = dir;
+    return true;
+}
+
+auto CipherCtx::seal_inplace(std::span<const uint8_t> nonce, std::span<const uint8_t> aad,
+                             std::span<uint8_t> body, std::span<uint8_t> tag_out) -> bool {
+    if (ctx_ == nullptr || dir_ != Direction::Encrypt) return false;
+    const std::size_t tag_len = aead_tag_length(aead_);
+    if (tag_out.size() != tag_len) return false;
+    auto* ctx = static_cast<EVP_CIPHER_CTX*>(ctx_);
+    // Reset only the IV; cipher + key are already bound.
+    if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, nullptr, nonce.data()) != 1) {
+        return false;
+    }
+    int outlen = 0;
+    if (!aad.empty()) {
+        if (EVP_EncryptUpdate(ctx, nullptr, &outlen, aad.data(),
+                              static_cast<int>(aad.size())) != 1) {
+            return false;
+        }
+    }
+    if (!body.empty()) {
+        if (EVP_EncryptUpdate(ctx, body.data(), &outlen, body.data(),
+                              static_cast<int>(body.size())) != 1) {
+            return false;
+        }
+    }
+    int finlen = 0;
+    std::array<uint8_t, 16> finish_pad{};
+    if (EVP_EncryptFinal_ex(ctx, finish_pad.data(), &finlen) != 1) {
+        return false;
+    }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, static_cast<int>(tag_len),
+                            tag_out.data()) != 1) {
+        return false;
+    }
+    return true;
+}
+
+auto CipherCtx::open_inplace(std::span<const uint8_t> nonce, std::span<const uint8_t> aad,
+                             std::span<uint8_t> body, std::span<const uint8_t> tag_in) -> bool {
+    if (ctx_ == nullptr || dir_ != Direction::Decrypt) return false;
+    const std::size_t tag_len = aead_tag_length(aead_);
+    if (tag_in.size() != tag_len) return false;
+    auto* ctx = static_cast<EVP_CIPHER_CTX*>(ctx_);
+    if (EVP_DecryptInit_ex(ctx, nullptr, nullptr, nullptr, nonce.data()) != 1) {
+        return false;
+    }
+    int outlen = 0;
+    if (!aad.empty()) {
+        if (EVP_DecryptUpdate(ctx, nullptr, &outlen, aad.data(),
+                              static_cast<int>(aad.size())) != 1) {
+            return false;
+        }
+    }
+    if (!body.empty()) {
+        if (EVP_DecryptUpdate(ctx, body.data(), &outlen, body.data(),
+                              static_cast<int>(body.size())) != 1) {
+            return false;
+        }
+    }
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, static_cast<int>(tag_len),
+                            const_cast<uint8_t*>(tag_in.data())) != 1) {
+        return false;
+    }
+    int finlen = 0;
+    std::array<uint8_t, 16> finish_pad{};
+    if (EVP_DecryptFinal_ex(ctx, finish_pad.data(), &finlen) != 1) {
+        return false;
+    }
+    return true;
+}
+
 auto header_protection_mask(Aead aead, std::span<const uint8_t> hp_key,
                             std::span<const uint8_t> sample) -> std::array<uint8_t, 5> {
     if (sample.size() != 16) {

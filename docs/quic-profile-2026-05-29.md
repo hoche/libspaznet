@@ -219,6 +219,38 @@ work.
    matter for bench fidelity, not real-world perf — not worth the
    churn unless we extract the harness into a reusable header.
 
+## Follow-up: cached EVP_CIPHER_CTX per Space (commit pending)
+
+Implemented `CipherCtx` — RAII wrapper around an `EVP_CIPHER_CTX*`
+that holds the cipher + key binding for the lifetime of the
+encryption level. `seal_inplace` / `open_inplace` per packet just
+reset the IV via `EVP_EncryptInit_ex(ctx, NULL, NULL, NULL, nonce)`.
+Allocated in `Connection::install_new_keys` and held on each
+`Space`. The Initial, Handshake, and Application send + receive
+paths all go through the cached contexts now.
+
+Bench (local macOS, RelWithDebInfo, in-place AEAD already present
+in baseline, this change adds the context cache on top):
+
+| N packets | Before (fc8a185) | After (this change) | Delta |
+|---|---|---|---|
+| 5,000  | 276K pps / 1.59 Gbps / 3,680 ns/pkt | **340K pps / 1.95 Gbps / 2,941 ns/pkt** | **+23% / -20%** |
+| 10,000 | 262K pps / 1.50 Gbps / 3,821 ns/pkt | 285K pps / 1.63 Gbps / 3,513 ns/pkt | +9% / -8% |
+| 20,000 | 202K pps / 1.16 Gbps / 4,955 ns/pkt | 217K pps / 1.25 Gbps / 4,602 ns/pkt | +8% / -7% |
+
+CipherCtx caching is a real wallclock improvement. The win shrinks
+with N because a different bug — `Stream::on_acked`'s O(N)
+`vector::erase(begin, ...)` — eats an increasing share of total
+time at larger queue depths. Filed as the next perf TODO.
+
+The bench also gained a backpressure check
+(`server.for_each_stream(...)` to peek the stream's send buffer
+size, only top off when below 32 KB) so it stops measuring the
+on_acked quadratic when run at large N.
+
+All sanitizers remain clean (227/227 under asan+ubsan and tsan on
+both macOS and meep).
+
 ## Reproduce
 
 ```bash

@@ -53,6 +53,10 @@ Connection::Connection(std::shared_ptr<TlsContext> tls_ctx,
     auto server_init_secret = derive_initial_secret(client_dcid, Direction::Server);
     init.recv_keys = derive_packet_keys(init.aead, client_init_secret);
     init.send_keys = derive_packet_keys(init.aead, server_init_secret);
+    (void)init.send_ctx.init(init.aead, {init.send_keys.key.data(), init.send_keys.key.size()},
+                             CipherCtx::Direction::Encrypt);
+    (void)init.recv_ctx.init(init.aead, {init.recv_keys.key.data(), init.recv_keys.key.size()},
+                             CipherCtx::Direction::Decrypt);
     init.recv_keys_ready = true;
     init.send_keys_ready = true;
 }
@@ -67,11 +71,17 @@ auto Connection::install_new_keys() -> void {
         if (!sp.recv_keys_ready && !rs.empty()) {
             sp.aead = aead;
             sp.recv_keys = derive_packet_keys(aead, rs);
+            (void)sp.recv_ctx.init(
+                aead, {sp.recv_keys.key.data(), sp.recv_keys.key.size()},
+                CipherCtx::Direction::Decrypt);
             sp.recv_keys_ready = true;
         }
         if (!sp.send_keys_ready && !ws.empty()) {
             sp.aead = aead;
             sp.send_keys = derive_packet_keys(aead, ws);
+            (void)sp.send_ctx.init(
+                aead, {sp.send_keys.key.data(), sp.send_keys.key.size()},
+                CipherCtx::Direction::Encrypt);
             sp.send_keys_ready = true;
         }
     }
@@ -177,10 +187,39 @@ auto Connection::process_long_packet(std::span<const uint8_t> datagram, std::siz
     LongHeader local_hdr = hdr;
     local_hdr.pn_offset -= packet_start;
 
-    uint64_t pn = 0;
-    std::vector<uint8_t> plaintext;
-    if (!decrypt_long_packet(sp.aead, sp.recv_keys, sp.any_recv ? sp.largest_recv_pn : 0, pkt,
-                             local_hdr, pn, plaintext)) {
+    // Inline header-protection removal + cached-context in-place
+    // AEAD open. Matches what decrypt_long_packet does but uses the
+    // per-Space CipherCtx so we skip per-packet EVP_CIPHER_CTX_new.
+    if (local_hdr.pn_offset + 4 + kSampleLen > pkt.size()) {
+        off = cursor;
+        return cursor - packet_start;
+    }
+    auto mask = header_protection_mask(sp.aead,
+                                       {sp.recv_keys.hp.data(), sp.recv_keys.hp.size()},
+                                       {pkt.data() + local_hdr.pn_offset + 4, kSampleLen});
+    pkt[0] ^= mask[0] & 0x0F;
+    const std::size_t pn_len = (pkt[0] & 0x03U) + 1;
+    for (std::size_t i = 0; i < pn_len; ++i) pkt[local_hdr.pn_offset + i] ^= mask[1 + i];
+
+    uint64_t trunc = 0;
+    for (std::size_t i = 0; i < pn_len; ++i) {
+        trunc = (trunc << 8) | pkt[local_hdr.pn_offset + i];
+    }
+    const uint64_t pn = decode_packet_number(sp.any_recv ? sp.largest_recv_pn : 0, trunc,
+                                              pn_len * 8);
+    const std::size_t header_len = local_hdr.pn_offset + pn_len;
+    const std::size_t ct_len = local_hdr.length - pn_len;
+    if (header_len + ct_len > pkt.size() || ct_len < aead_tag_length(sp.aead)) {
+        off = cursor;
+        return cursor - packet_start;
+    }
+    const std::size_t tag_len = aead_tag_length(sp.aead);
+    const std::size_t pt_len = ct_len - tag_len;
+    auto nonce = make_aead_nonce({sp.recv_keys.iv.data(), sp.recv_keys.iv.size()}, pn);
+    if (!sp.recv_ctx.open_inplace({nonce.data(), nonce.size()},
+                                  {pkt.data(), header_len},
+                                  {pkt.data() + header_len, pt_len},
+                                  {pkt.data() + header_len + pt_len, tag_len})) {
         off = cursor;
         return cursor - packet_start;
     }
@@ -189,7 +228,7 @@ auto Connection::process_long_packet(std::span<const uint8_t> datagram, std::siz
     }
     sp.any_recv = true;
 
-    deliver_frames(level, {plaintext.data(), plaintext.size()});
+    deliver_frames(level, {pkt.data() + header_len, pt_len});
     sp.acks.on_received(pn, true);
 
     off = cursor;
@@ -225,12 +264,17 @@ auto Connection::process_short_packet(std::vector<uint8_t>& dg) -> bool {
                                              pn_len * 8);
 
     const std::size_t header_len = pn_offset + pn_len;
-    std::span<const uint8_t> aad{dg.data(), header_len};
-    std::span<const uint8_t> ct{dg.data() + header_len, dg.size() - header_len};
+    const std::size_t ct_len = dg.size() - header_len;
+    const std::size_t tag_len = aead_tag_length(sp.aead);
+    if (ct_len < tag_len) {
+        return false;
+    }
+    const std::size_t pt_len = ct_len - tag_len;
     auto nonce = make_aead_nonce({sp.recv_keys.iv.data(), sp.recv_keys.iv.size()}, pn);
-    std::vector<uint8_t> plaintext;
-    if (!aead_open(sp.aead, {sp.recv_keys.key.data(), sp.recv_keys.key.size()},
-                   {nonce.data(), nonce.size()}, aad, ct, plaintext)) {
+    if (!sp.recv_ctx.open_inplace({nonce.data(), nonce.size()},
+                                  {dg.data(), header_len},
+                                  {dg.data() + header_len, pt_len},
+                                  {dg.data() + header_len + pt_len, tag_len})) {
         return false;
     }
     if (!sp.any_recv || pn > sp.largest_recv_pn) {
@@ -238,7 +282,7 @@ auto Connection::process_short_packet(std::vector<uint8_t>& dg) -> bool {
     }
     sp.any_recv = true;
 
-    deliver_frames(EncryptionLevel::Application, {plaintext.data(), plaintext.size()});
+    deliver_frames(EncryptionLevel::Application, {dg.data() + header_len, pt_len});
     sp.acks.on_received(pn, true);
     return true;
 }
@@ -533,10 +577,10 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
     buf.resize(body_end + tag_len);
 
     auto nonce = make_aead_nonce({sp.send_keys.iv.data(), sp.send_keys.iv.size()}, pn);
-    if (!aead_seal_inplace(sp.aead, {sp.send_keys.key.data(), sp.send_keys.key.size()},
-                           {nonce.data(), nonce.size()}, {buf.data(), header_end},
-                           {buf.data() + header_end, body_end - header_end},
-                           {buf.data() + body_end, tag_len})) {
+    if (!sp.send_ctx.seal_inplace({nonce.data(), nonce.size()},
+                                  {buf.data(), header_end},
+                                  {buf.data() + header_end, body_end - header_end},
+                                  {buf.data() + body_end, tag_len})) {
         return false;
     }
     auto mask = header_protection_mask(

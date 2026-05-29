@@ -256,16 +256,30 @@ Ordered by priority.
     exercises both server send + client receive plus the per-call
     EVP context churn, which dwarfs vector allocations).
 
-- [ ] QUIC perf: cache EVP_CIPHER_CTX per Space
-  - Every aead_seal/aead_seal_inplace call today does
-    EVP_CIPHER_CTX_new + EVP_EncryptInit_ex(cipher,key) +
-    EVP_CIPHER_CTX_free. The cipher and key don't change between
-    packets at the same level; only the IV does. Allocate the
-    context once when keys are installed in install_new_keys, store
-    it on the Space, and per packet call
-    EVP_EncryptInit_ex(ctx, nullptr, nullptr, nullptr, nonce) to
-    reset only the IV. Largest single wallclock win still on the
-    table based on the bench profile.
+- [x] QUIC perf: cache EVP_CIPHER_CTX per Space
+  - Shipped as `quic::CipherCtx` (commit pending). One Encrypt + one
+    Decrypt context per encryption level, allocated when keys are
+    installed via `install_new_keys` and reused for every packet —
+    only the IV gets reset per call via
+    `EVP_EncryptInit_ex(ctx, NULL, NULL, NULL, nonce)`. Eliminates
+    per-packet EVP_CIPHER_CTX_new + Init(cipher,key) + free. Bench
+    confirms +8–23% throughput on the steady-state QUIC bench
+    (smaller-N runs see the bigger win because at higher N
+    `Stream::on_acked`'s O(N) erase eats the wallclock).
+
+- [ ] QUIC perf: fix O(N) erase in Stream::on_acked
+  - `send_buf_.erase(begin, begin + take)` is O(N) where N is the
+    in-flight stream-send-buffer size. Combined with multiple
+    on_acked calls per ack frame (one per acked StreamFrame) and
+    `std::sort(acked_ranges_)` per call, the per-ack work grows
+    superlinearly with how much data is queued. The QUIC bench at
+    high packet counts shows ns/pkt growing nearly linearly with N
+    (~3 us at 5K pkts → ~25 us at 200K pkts) because of this.
+  - Fix options: (a) track a "consumed front offset" inside
+    send_buf_ and compact lazily; (b) switch send_buf_ to
+    std::deque<uint8_t> (loses contiguous .data() — would need
+    pull_send to gather across chunks); (c) use a ring buffer.
+    Likely (a) — minimal API change, single-pass amortized cost.
 
 - [ ] QUIC perf: hand back a span from Stream::pull_send
   - Today pull_send does data_out.assign(...), copying bytes from

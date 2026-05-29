@@ -100,6 +100,56 @@ auto aead_seal_inplace(Aead aead, std::span<const uint8_t> key,
                                      std::span<const uint8_t> aad, std::span<uint8_t> body,
                                      std::span<const uint8_t> tag_in) -> bool;
 
+// RAII wrapper around an EVP_CIPHER_CTX that caches the AEAD cipher
+// binding and the per-direction key. Each call to seal_inplace /
+// open_inplace then has to reset only the IV — saving an
+// EVP_CIPHER_CTX_new + EVP_EncryptInit_ex(cipher, key) + free per
+// packet, which the QUIC perf profile flagged as the dominant
+// per-packet cost above the AEAD math itself.
+class CipherCtx {
+  public:
+    enum class Direction : uint8_t { Encrypt, Decrypt };
+
+    CipherCtx() = default;
+    ~CipherCtx();
+    CipherCtx(const CipherCtx&) = delete;
+    auto operator=(const CipherCtx&) -> CipherCtx& = delete;
+    CipherCtx(CipherCtx&& other) noexcept;
+    auto operator=(CipherCtx&& other) noexcept -> CipherCtx&;
+
+    // Allocate the context and bind cipher + IV length + key. May be
+    // called more than once on the same object; each call discards the
+    // previous binding.
+    [[nodiscard]] auto init(Aead aead, std::span<const uint8_t> key, Direction dir) -> bool;
+
+    // True once init() has succeeded.
+    [[nodiscard]] auto ready() const -> bool {
+        return ctx_ != nullptr;
+    }
+    [[nodiscard]] auto aead() const -> Aead {
+        return aead_;
+    }
+
+    // Per-packet seal/open. Layout: `aad` ranges over the AAD bytes;
+    // `body` is encrypted/decrypted in place; `tag_out`/`tag_in` is
+    // the 16-byte AEAD auth tag in/out.
+    [[nodiscard]] auto seal_inplace(std::span<const uint8_t> nonce,
+                                    std::span<const uint8_t> aad, std::span<uint8_t> body,
+                                    std::span<uint8_t> tag_out) -> bool;
+    [[nodiscard]] auto open_inplace(std::span<const uint8_t> nonce,
+                                    std::span<const uint8_t> aad, std::span<uint8_t> body,
+                                    std::span<const uint8_t> tag_in) -> bool;
+
+  private:
+    auto reset() -> void;
+
+    // Held as `void*` to keep this header free of OpenSSL includes;
+    // crypto.cpp casts back to `EVP_CIPHER_CTX*` when using it.
+    void* ctx_{nullptr};
+    Aead aead_{Aead::Aes128Gcm};
+    Direction dir_{Direction::Encrypt};
+};
+
 // Header-protection mask (RFC 9001 §5.4).
 //
 //   AES-128/256: mask = AES-ECB(hp_key, sample)[0..4]
