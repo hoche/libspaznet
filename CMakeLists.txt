@@ -6,6 +6,26 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# libstdc++ only got <format> in gcc 13.1; libc++ has it from clang 17.
+# Probe explicitly so the build fails at configure time with an actionable
+# error rather than deep in compilation of (e.g.) src/handlers/http_handler.cpp.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_FLAGS "${CMAKE_CXX_FLAGS} -std=c++20")
+check_cxx_source_compiles("
+    #include <format>
+    int main() { (void)std::format(\"{}\", 1); return 0; }
+" SPAZNET_HAS_STD_FORMAT)
+unset(CMAKE_REQUIRED_FLAGS)
+if(NOT SPAZNET_HAS_STD_FORMAT)
+    message(FATAL_ERROR
+        "libspaznet requires C++20 <format> support.\n"
+        "  - gcc:   need 13.1 or newer (your toolchain: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION})\n"
+        "  - clang: need 17 or newer (libc++) or libstdc++ from gcc 13+\n"
+        "On Debian/Ubuntu: 'apt install g++-13' and re-configure with\n"
+        "  -DCMAKE_CXX_COMPILER=g++-13"
+    )
+endif()
+
 # Emit compile_commands.json into the build directory; clangd (and other
 # tooling) reads it to learn each translation unit's include paths,
 # language standard, and definitions. Without it, the language server

@@ -2,7 +2,6 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdlib>
-#include <format>
 #include <libspaznet/handlers/http_handler.hpp>
 #include <libspaznet/utils/header_utils.hpp>
 #include <libspaznet/utils/number_utils.hpp>
@@ -146,7 +145,7 @@ std::optional<std::string> HTTPResponse::get_header(const std::string& name) con
 }
 
 void HTTPResponse::set_content_length(size_t length) {
-    headers["Content-Length"] = std::format("{}", length);
+    headers["Content-Length"] = std::to_string(length);
 }
 
 void HTTPResponse::set_chunked() {

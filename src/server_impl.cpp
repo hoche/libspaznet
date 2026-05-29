@@ -3,7 +3,6 @@
 #include <cctype>
 #include <chrono>
 #include <cstring>
-#include <format>
 #include <fstream>
 #include <iostream>
 #include <libspaznet/handlers/quic_server.hpp>
@@ -526,7 +525,7 @@ void Server::listen_tcp(uint16_t port) {
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE; // For wildcard bind address
 
-    std::string port_str = std::format("{}", port);
+    std::string port_str = std::to_string(port);
     if (getaddrinfo(nullptr, port_str.c_str(), &hints, &result) != 0) {
         throw std::runtime_error("Failed to resolve address");
     }
@@ -585,7 +584,7 @@ void Server::listen_udp(uint16_t port) {
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_flags = AI_PASSIVE;
 
-    std::string port_str = std::format("{}", port);
+    std::string port_str = std::to_string(port);
     if (getaddrinfo(nullptr, port_str.c_str(), &hints, &result) != 0) {
         throw std::runtime_error("Failed to resolve address for UDP");
     }

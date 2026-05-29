@@ -254,9 +254,16 @@ For detailed information about the coroutine execution model, thread scheduling,
 
 ## Requirements
 
-- C++20 compiler (GCC 10+, Clang 10+, MSVC 2019+)
+- C++20 compiler with `<format>` support: **GCC 13.1+** or **Clang 17+**
+  (with libstdc++ from gcc 13+, or libc++). The QUIC stack also requires
+  **OpenSSL 3.5+** for the `SSL_set_quic_tls_cbs` interface.
 - CMake 3.20+
 - Make (optional, for convenience targets)
+
+If your distribution ships an older gcc, `apt install g++-13` and
+configure with `-DCMAKE_CXX_COMPILER=g++-13`. CMake checks for `<format>`
+at configure time and fails fast with an actionable message rather than
+deep in compilation.
 
 ### Optional Tools
 
