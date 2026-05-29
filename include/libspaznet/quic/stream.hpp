@@ -129,7 +129,7 @@ class Stream {
         return send_high_water_;
     }
     [[nodiscard]] auto send_buffer_size() const -> std::size_t {
-        return send_buf_.size();
+        return send_buf_.size() - send_buf_head_;
     }
 
   private:
@@ -143,10 +143,16 @@ class Stream {
     uint64_t recv_limit_{0};
     std::optional<uint64_t> recv_final_size_;
 
-    // Send-side buffer. We keep all unacked bytes contiguous starting
-    // at send_buf_base_offset_. Bytes the peer has acked at the front
-    // are erased and the base offset moved forward.
+    // Send-side buffer. Bytes from send_buf_[send_buf_head_..end()) are
+    // the live, unacked-or-unsent payload starting at absolute offset
+    // send_buf_base_offset_. Bytes before send_buf_head_ are logically
+    // erased (consumed by ack) but kept in memory until the next
+    // compaction. This makes on_acked O(1) per call rather than O(N);
+    // we compact in a single std::move when the head crosses a
+    // threshold so the amortized cost stays linear in total acked
+    // bytes.
     std::vector<uint8_t> send_buf_;
+    std::size_t send_buf_head_{0};
     uint64_t send_buf_base_offset_{0};
     // Next offset we'll hand out on the wire (incremented by pull_send).
     uint64_t send_next_offset_{0};

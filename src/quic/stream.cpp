@@ -220,7 +220,7 @@ auto Stream::pull_send(std::size_t max_bytes, uint64_t& offset_out,
         auto& r = lost_ranges_.front();
         const std::size_t take = std::min(max_bytes, r.second);
         offset_out = r.first;
-        const std::size_t buf_off =
+        const std::size_t buf_off = send_buf_head_ +
             static_cast<std::size_t>(r.first - send_buf_base_offset_);
         data_out.assign(send_buf_.begin() + static_cast<std::ptrdiff_t>(buf_off),
                         send_buf_.begin() + static_cast<std::ptrdiff_t>(buf_off + take));
@@ -271,7 +271,7 @@ auto Stream::pull_send(std::size_t max_bytes, uint64_t& offset_out,
         return 0;
     }
     offset_out = send_next_offset_;
-    const std::size_t buf_off =
+    const std::size_t buf_off = send_buf_head_ +
         static_cast<std::size_t>(send_next_offset_ - send_buf_base_offset_);
     data_out.assign(send_buf_.begin() + static_cast<std::ptrdiff_t>(buf_off),
                     send_buf_.begin() + static_cast<std::ptrdiff_t>(buf_off + take));
@@ -300,10 +300,23 @@ auto Stream::on_acked(uint64_t offset, std::size_t length) -> void {
     std::sort(acked_ranges_.begin(), acked_ranges_.end());
     while (!acked_ranges_.empty() && acked_ranges_.front().first == send_buf_base_offset_) {
         const std::size_t take = acked_ranges_.front().second;
-        send_buf_.erase(send_buf_.begin(),
-                        send_buf_.begin() + static_cast<std::ptrdiff_t>(take));
+        // O(1): advance the logical head instead of erasing physical
+        // bytes. send_buf_ keeps growing until the next compaction.
+        send_buf_head_ += take;
         send_buf_base_offset_ += take;
         acked_ranges_.erase(acked_ranges_.begin());
+    }
+    // Compaction: when the head has grown past a threshold (8 KiB
+    // here, or > half the buffer), move the live tail to the front in
+    // a single std::move. Amortized O(1) per acked byte over the
+    // lifetime of the stream, vs the previous O(N) per ack.
+    constexpr std::size_t kCompactThreshold = 8 * 1024;
+    if (send_buf_head_ > kCompactThreshold ||
+        send_buf_head_ * 2 > send_buf_.size()) {
+        std::move(send_buf_.begin() + static_cast<std::ptrdiff_t>(send_buf_head_),
+                  send_buf_.end(), send_buf_.begin());
+        send_buf_.resize(send_buf_.size() - send_buf_head_);
+        send_buf_head_ = 0;
     }
     // The ack might also include the FIN byte position.
     if (send_fin_sent_ && offset + length >= send_high_water_) {
@@ -328,7 +341,10 @@ auto Stream::set_send_limit(uint64_t new_limit) -> void {
 }
 
 auto Stream::try_advance_send_state_after_ack() -> void {
-    if (send_state_ == SendState::DataSent && send_buf_.empty() && send_fin_acked_) {
+    // "buffer empty" means all live (non-acked) bytes have drained;
+    // physically-occupied bytes before send_buf_head_ don't count.
+    const bool buf_empty = send_buf_.size() == send_buf_head_;
+    if (send_state_ == SendState::DataSent && buf_empty && send_fin_acked_) {
         send_state_ = SendState::DataRecvd;
     }
 }

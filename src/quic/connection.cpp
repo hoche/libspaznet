@@ -348,9 +348,7 @@ auto Connection::on_stream_frame(const StreamFrame& f) -> void {
 
 auto Connection::on_ack_frame(EncryptionLevel level, const AckFrame& f) -> void {
     auto& by_pn = sent_[static_cast<std::size_t>(level)];
-    auto ack_one = [&](uint64_t pn) {
-        auto it = by_pn.find(pn);
-        if (it == by_pn.end()) return;
+    auto ack_entry = [&](typename std::map<uint64_t, SentRecord>::iterator it) {
         // Notify streams of acked bytes.
         for (const auto& sf : it->second.streams) {
             if (auto* st = ensure_stream(sf.stream_id); st != nullptr) {
@@ -360,18 +358,33 @@ auto Connection::on_ack_frame(EncryptionLevel level, const AckFrame& f) -> void 
         congestion_.on_packets_acked(clock_fn_(), it->second.bytes);
         by_pn.erase(it);
     };
+    // Process each ACK range by walking sent_'s map (via lower_bound)
+    // instead of iterating every PN in the range. Wire ACK frames
+    // legitimately cover wide PN ranges that are mostly already-acked-
+    // and-released entries; iterating every PN was O(N) per ACK and
+    // dominated steady-state throughput at large queue depths.
+    auto ack_range = [&](uint64_t lo, uint64_t hi) {
+        if (lo > hi) return;
+        auto it = by_pn.lower_bound(lo);
+        while (it != by_pn.end() && it->first <= hi) {
+            // ack_entry erases; capture next first.
+            auto next = std::next(it);
+            ack_entry(it);
+            it = next;
+        }
+    };
     if (f.first_range > f.largest_acked) {
         return;
     }
     uint64_t hi = f.largest_acked;
     uint64_t lo = hi - f.first_range;
-    for (uint64_t pn = lo; pn <= hi; ++pn) ack_one(pn);
+    ack_range(lo, hi);
     for (const auto& r : f.ranges) {
         if (lo < r.gap + 2) break;
         hi = lo - r.gap - 2;
         if (r.length > hi) break;
         lo = hi - r.length;
-        for (uint64_t pn = lo; pn <= hi; ++pn) ack_one(pn);
+        ack_range(lo, hi);
     }
     recovery_.reset_pto();
 }

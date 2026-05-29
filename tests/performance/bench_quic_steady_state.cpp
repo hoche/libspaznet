@@ -520,18 +520,9 @@ auto run_bench(std::size_t target_packets, std::size_t chunk_size) -> BenchResul
     auto t0 = steady_clock::now();
 
     while (server_pkts_out < target_packets) {
-        // Backpressure: only top off the stream when its send buffer
-        // would otherwise drain. Without this the buffer grows
-        // unboundedly and the (currently O(N) per ack) drain in
-        // Stream::on_acked dominates, making the bench measure that
-        // bottleneck instead of steady-state throughput.
-        std::size_t stream0_buf = 0;
-        server.for_each_stream([&](uint64_t id, Stream& s) {
-            if (id == 0) stream0_buf = s.send_buffer_size();
-        });
-        if (stream0_buf < 32 * 1024) {
-            server.write_stream(0, {chunk.data(), chunk.size()}, /*fin=*/false);
-        }
+        // Top off the stream unconditionally — relies on the
+        // Stream::on_acked compaction to keep memory bounded.
+        server.write_stream(0, {chunk.data(), chunk.size()}, /*fin=*/false);
 
         // Drive server.
         server.on_timer();
