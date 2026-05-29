@@ -1,0 +1,210 @@
+#pragma once
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory>
+#include <optional>
+#include <span>
+#include <vector>
+
+#include <libspaznet/quic/congestion.hpp>
+#include <libspaznet/quic/crypto.hpp>
+#include <libspaznet/quic/frame.hpp>
+#include <libspaznet/quic/packet.hpp>
+#include <libspaznet/quic/pn_space.hpp>
+#include <libspaznet/quic/recovery.hpp>
+#include <libspaznet/quic/stream.hpp>
+#include <libspaznet/quic/tls.hpp>
+#include <libspaznet/quic/transport_params.hpp>
+
+namespace spaznet {
+namespace quic {
+
+// QUIC connection state machine. Drives the TLS handshake through CRYPTO
+// frames in the appropriate PN spaces, manages per-direction keys, and
+// (post-handshake) carries STREAM/MAX_*/etc. between application code and
+// the peer. Server-side: the user-facing class for a single peer.
+//
+// All wire I/O is mediated by two callables supplied at construction:
+//   - `send_datagram` is called every time we want to put bytes on the
+//     wire. The body is a protected QUIC datagram ready for UDP send.
+//   - `now` is the time source used by the recovery / congestion math.
+//     Defaults to std::chrono::steady_clock::now.
+//
+// The caller is expected to:
+//   - call on_datagram(bytes) for every UDP datagram received,
+//   - call on_timer() periodically (or at next_timer_at()),
+//   - call write_stream(...) to push data on a stream.
+class Connection {
+  public:
+    enum class Role : uint8_t { Server };
+
+    enum class State : uint8_t {
+        Handshaking,
+        Established,
+        Closing,
+        Draining,
+        Closed,
+    };
+
+    using SendFn = std::function<void(std::span<const uint8_t>)>;
+    using ClockFn = std::function<TimePoint()>;
+
+    // Server constructor. `tls_ctx` is shared across connections;
+    // `client_dcid` is the destination CID the client used in its first
+    // Initial — we use it to derive Initial-level keys. `tp` is the
+    // server's transport parameters (we'll set
+    // original_destination_connection_id automatically).
+    Connection(std::shared_ptr<TlsContext> tls_ctx, std::span<const uint8_t> client_dcid,
+               std::span<const uint8_t> server_scid, TransportParameters tp, SendFn send_fn,
+               ClockFn clock_fn = nullptr);
+
+    Connection(const Connection&) = delete;
+    auto operator=(const Connection&) -> Connection& = delete;
+    Connection(Connection&&) = delete;
+    auto operator=(Connection&&) -> Connection& = delete;
+    ~Connection() = default;
+
+    // Feed one received UDP datagram into the engine.
+    auto on_datagram(std::span<const uint8_t> datagram) -> void;
+
+    // Pump time-based machinery (loss detection, PTO, idle timeout,
+    // and any pending sends).
+    auto on_timer() -> void;
+
+    // Application write to a bidirectional stream we're tracking. If the
+    // stream doesn't yet exist on our side we create it.
+    auto write_stream(uint64_t stream_id, std::span<const uint8_t> data, bool fin) -> void;
+
+    // Application read from a stream. Returns bytes copied into `out`
+    // and sets `fin_out` to true when the stream's FIN has been read.
+    auto read_stream(uint64_t stream_id, std::vector<uint8_t>& out, bool& fin_out)
+        -> std::size_t;
+
+    // Iterate streams currently known on this connection.
+    template <typename F>
+    auto for_each_stream(F&& fn) -> void {
+        for (auto& [id, st] : streams_) {
+            fn(id, *st);
+        }
+    }
+
+    // ---- Accessors -----------------------------------------------------
+    [[nodiscard]] auto state() const -> State {
+        return state_;
+    }
+    [[nodiscard]] auto handshake_complete() const -> bool {
+        return state_ != State::Handshaking;
+    }
+    [[nodiscard]] auto tls() -> TlsConnection& {
+        return tls_;
+    }
+    [[nodiscard]] auto peer_transport_params() const -> const TransportParameters& {
+        return tls_.peer_transport_params();
+    }
+    [[nodiscard]] auto destination_connection_id() const -> const std::vector<uint8_t>& {
+        return dcid_;
+    }
+    [[nodiscard]] auto source_connection_id() const -> const std::vector<uint8_t>& {
+        return scid_;
+    }
+
+  private:
+    // Per-PN-space derived keys + ACK bookkeeping.
+    struct Space {
+        Aead aead{Aead::Aes128Gcm};
+        PacketKeys send_keys{};
+        PacketKeys recv_keys{};
+        bool send_keys_ready{false};
+        bool recv_keys_ready{false};
+        // Largest PN we've decrypted (for PN reconstruction).
+        uint64_t largest_recv_pn{0};
+        bool any_recv{false};
+        // Next outgoing PN.
+        uint64_t next_send_pn{0};
+        PnSpace acks{};
+        // CRYPTO frame reassembly buffer for this space, keyed by offset.
+        std::map<uint64_t, std::vector<uint8_t>> crypto_recv_;
+        uint64_t crypto_read_offset{0};
+        uint64_t crypto_send_offset{0};
+    };
+
+    auto space(EncryptionLevel l) -> Space& {
+        return spaces_[static_cast<std::size_t>(l)];
+    }
+
+    // Try to install Handshake / Application keys from TLS if newly
+    // available.
+    auto install_new_keys() -> void;
+
+    // Drain any TLS-produced CRYPTO bytes; queue them for sending.
+    auto pull_crypto_from_tls() -> void;
+
+    // Process a single packet from a datagram. Returns bytes consumed
+    // from `datagram` (caller advances by that amount for coalesced
+    // packets). 0 = unparseable, abandon datagram.
+    auto process_long_packet(std::span<const uint8_t> datagram, std::size_t& off) -> std::size_t;
+    auto process_short_packet(std::vector<uint8_t>& datagram_owned) -> bool;
+
+    auto deliver_frames(EncryptionLevel level, std::span<const uint8_t> payload) -> void;
+    auto on_crypto_frame(EncryptionLevel level, const CryptoFrame& f) -> void;
+    auto on_stream_frame(const StreamFrame& f) -> void;
+    auto on_ack_frame(EncryptionLevel level, const AckFrame& f) -> void;
+
+    auto build_and_send(EncryptionLevel level) -> bool;
+
+    // Reassemble in-order CRYPTO bytes for the level and feed them to TLS.
+    auto feed_tls_crypto(EncryptionLevel level) -> void;
+
+    // Get-or-create stream.
+    auto ensure_stream(uint64_t stream_id) -> Stream*;
+
+    // ---- Members --------------------------------------------------------
+    Role role_{Role::Server};
+    State state_{State::Handshaking};
+
+    std::vector<uint8_t> dcid_; // destination CID (peer's chosen SCID)
+    std::vector<uint8_t> scid_; // source CID (ours)
+    std::vector<uint8_t> original_dcid_; // for the OD-CID transport param
+
+    SendFn send_fn_;
+    ClockFn clock_fn_;
+    TimePoint last_activity_{};
+
+    std::shared_ptr<TlsContext> tls_ctx_;
+    TlsConnection tls_;
+    TransportParameters local_tp_{};
+
+    std::array<Space, 4> spaces_{};
+
+    Recovery recovery_{};
+    Congestion congestion_{};
+
+    // Streams indexed by ID.
+    std::map<uint64_t, std::unique_ptr<Stream>> streams_;
+
+    // For lightweight in-flight tracking: per outgoing PN, the frames
+    // we'd need to (selectively) replay on loss. We don't replay ACK or
+    // PADDING; CRYPTO and STREAM frames are the main retransmit targets.
+    struct SentRecord {
+        EncryptionLevel level;
+        bool ack_eliciting;
+        std::size_t bytes;
+        TimePoint sent_at;
+        std::vector<CryptoFrame> crypto;
+        std::vector<StreamFrame> streams;
+    };
+    std::array<std::map<uint64_t, SentRecord>, 4> sent_{};
+    // CRYPTO frames pulled from TLS but not yet packetized. One bucket
+    // per encryption level (Initial/0-RTT/Handshake/Application).
+    std::array<std::vector<CryptoFrame>, 4> crypto_pending_{};
+
+    // Have we sent HANDSHAKE_DONE yet?
+    bool sent_handshake_done_{false};
+};
+
+} // namespace quic
+} // namespace spaznet
