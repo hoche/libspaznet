@@ -63,6 +63,7 @@ set(SOURCES
     src/http3/huffman.cpp
     src/http3/qpack.cpp
     src/http3/h3frame.cpp
+    src/http3/server.cpp
     src/utils/string_utils.cpp
     src/utils/number_utils.cpp
     src/utils/binary_utils.cpp
@@ -98,6 +99,7 @@ set(HEADERS
     include/libspaznet/http3/huffman.hpp
     include/libspaznet/http3/qpack.hpp
     include/libspaznet/http3/h3frame.hpp
+    include/libspaznet/http3/server.hpp
     include/libspaznet/utils/string_utils.hpp
     include/libspaznet/utils/number_utils.hpp
     include/libspaznet/utils/binary_utils.hpp
