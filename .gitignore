@@ -13,6 +13,8 @@ cmake_install.cmake
 .vscode/
 .idea/
 compile_commands.json
+# clangd local index cache, populated whenever an editor opens a file.
+.cache/
 *.gcda
 *.gcno
 *.gcov
