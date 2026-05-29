@@ -116,6 +116,50 @@ encrypt/decrypt and `memcpy`) and will reveal whether the transport
 layer has any bottleneck worth fixing. Without it we have no
 information about steady-state throughput.
 
+## Follow-up: in-place AEAD + scratch buffer (commit fc8a185)
+
+Implemented the "reduce `std::vector` reallocation churn" item from
+the "What this means" section above:
+- `aead_seal_inplace` / `aead_open_inplace` operate on
+  `[aad | body | tag-space]` laid out by the caller in one buffer.
+- `Connection` gained a `scratch_packet_` member, reserved once at
+  ~1500 B, `clear()`-ed at the top of every `build_and_send`. The
+  Handshake + Application paths now build the entire datagram
+  (header + payload + tag) in place inside this single buffer.
+
+Allocations eliminated per Handshake / Application packet:
+- `datagram` vector — replaced by reused scratch
+- `aad` vector copy from datagram — replaced by a span
+- `plaintext` vector copy from datagram — replaced by a span
+- `sealed` vector inside `aead_seal` — body is encrypted in place
+- `pkt.insert(sealed.begin(), sealed.end())` reallocation — gone
+
+Re-profile under the same workload (789.8 M Ir before → 792.5 M Ir
+after, +0.3% — within noise):
+
+| call site | before | after | delta |
+|---|---|---|---|
+| `aead_seal*` from server `build_and_send` (160 calls) | 1,131,666 | 1,051,777 | **−7.1%** |
+| total program instructions | 789.8 M | 792.5 M | +0.3% (noise) |
+| malloc bucket | 4.88% | 4.90% | flat |
+
+The local win on the changed code path is real (−7% on the seal
+sub-tree). But it's invisible at the benchmark level because:
+- 440 of the ~600 total `aead_seal` calls come from the test
+  harness's hand-rolled client, which still allocates.
+- ~160 server-side `build_and_send` calls × ~4 allocations saved
+  per call ≈ 640 fewer allocations across the run. OpenSSL does
+  ~millions during the 1,200 fresh TLS handshakes this benchmark
+  triggers.
+
+Confirmation that the original analysis was right: the workload is
+handshake-bound, and micro-optimizing libspaznet code recovers
+fractions of a percent at most. The change is correct, sanitizers
+remain clean (226/226 under asan+ubsan and tsan on both platforms),
+but a steady-state benchmark — one long-lived connection pushing
+thousands of packets through a single peer — is what's needed to
+make this kind of optimization measurable.
+
 ## Reproduce
 
 ```bash
