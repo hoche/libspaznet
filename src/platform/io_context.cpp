@@ -294,6 +294,17 @@ void IOContext::remove_io(int file_descriptor) {
         // Spin
     }
     pending_io_.erase(file_descriptor);
+    // Drop the kernel-side registration too while holding the spinlock.
+    // Pre-fix this was the caller's responsibility (Socket::close +
+    // Server::stop both called platform_io().remove_fd(fd) right after
+    // remove_io); but that left a tiny window in which one worker
+    // thread's add_fd/modify_fd raced with another's remove_fd over
+    // the platform layer's side-table (PlatformIOKqueue::fd_records_,
+    // PlatformIOPoll::fd_info_). ASan reliably caught it as a UAF on
+    // macOS ARM64 CI runs of test_integration's ConcurrentConnections
+    // suite; keep the platform-layer mutation under the same lock as
+    // the pending-io map.
+    platform_io_->remove_fd(file_descriptor);
     map_lock_.clear(std::memory_order_release);
 }
 

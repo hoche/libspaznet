@@ -472,9 +472,9 @@ Task Socket::send_websocket_message(WebSocketOpcode opcode,
 
 void Socket::close() {
     if (owns_fd_ && fd_ >= 0) {
-        // Remove from both platform I/O and pending I/O map
+        // Remove from both platform I/O and pending I/O map (remove_io
+        // now handles both under its spinlock).
         io_context_->remove_io(fd_);
-        io_context_->platform_io().remove_fd(fd_);
         close_socket(fd_);
         fd_ = -1;
         owns_fd_ = false;
@@ -767,7 +767,6 @@ Task Server::accept_connections(int listen_fd) {
     }
     if (should_close) {
         io_context_->remove_io(listen_fd);
-        io_context_->platform_io().remove_fd(listen_fd);
         close_socket(listen_fd);
     }
     co_return;
@@ -1260,7 +1259,6 @@ void Server::stop() {
             continue;
         }
         io_context_->remove_io(fd);
-        io_context_->platform_io().remove_fd(fd);
         close_socket(fd);
     }
 
