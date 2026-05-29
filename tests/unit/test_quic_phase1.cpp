@@ -74,6 +74,44 @@ TEST(QuicVarInt, DecodeTruncated) {
     EXPECT_FALSE(VarInt::decode(enc.data(), 5, off, decoded));
 }
 
+TEST(QuicCrypto, AeadInplaceMatchesCopyVariant) {
+    auto secret = spaznet::quic::derive_initial_secret(hex("8394c8f03e515708"),
+                                                       Direction::Client);
+    auto keys = spaznet::quic::derive_packet_keys(Aead::Aes128Gcm, secret);
+    std::vector<uint8_t> aad = {0x01, 0x02, 0x03, 0x04, 0x05};
+    std::vector<uint8_t> plaintext;
+    for (int i = 0; i < 200; ++i) plaintext.push_back(static_cast<uint8_t>(i));
+    std::vector<uint8_t> nonce(keys.iv.begin(), keys.iv.end());
+
+    // Reference: copy variant.
+    std::vector<uint8_t> sealed_ref;
+    ASSERT_TRUE(spaznet::quic::aead_seal(
+        Aead::Aes128Gcm, {keys.key.data(), keys.key.size()},
+        {nonce.data(), nonce.size()}, {aad.data(), aad.size()},
+        {plaintext.data(), plaintext.size()}, sealed_ref));
+    ASSERT_EQ(sealed_ref.size(), plaintext.size() + 16U);
+
+    // In-place: body holds plaintext on entry, ciphertext on exit;
+    // tag goes into a 16-byte trailer.
+    std::vector<uint8_t> body = plaintext;
+    std::array<uint8_t, 16> tag{};
+    ASSERT_TRUE(spaznet::quic::aead_seal_inplace(
+        Aead::Aes128Gcm, {keys.key.data(), keys.key.size()},
+        {nonce.data(), nonce.size()}, {aad.data(), aad.size()},
+        {body.data(), body.size()}, {tag.data(), tag.size()}));
+    EXPECT_EQ(std::vector<uint8_t>(sealed_ref.begin(), sealed_ref.begin() + plaintext.size()),
+              body);
+    EXPECT_EQ(std::vector<uint8_t>(sealed_ref.begin() + plaintext.size(), sealed_ref.end()),
+              std::vector<uint8_t>(tag.begin(), tag.end()));
+
+    // And the inverse decrypts back to the plaintext.
+    ASSERT_TRUE(spaznet::quic::aead_open_inplace(
+        Aead::Aes128Gcm, {keys.key.data(), keys.key.size()},
+        {nonce.data(), nonce.size()}, {aad.data(), aad.size()},
+        {body.data(), body.size()}, {tag.data(), tag.size()}));
+    EXPECT_EQ(body, plaintext);
+}
+
 // RFC 9001 Appendix A.1: client DCID derives the Initial secrets.
 TEST(QuicCrypto, Rfc9001AppA1_InitialSecrets) {
     auto client_dcid = hex("8394c8f03e515708");

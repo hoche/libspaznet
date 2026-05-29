@@ -86,6 +86,20 @@ auto aead_seal(Aead aead, std::span<const uint8_t> key, std::span<const uint8_t>
                              std::span<const uint8_t> ciphertext, std::vector<uint8_t>& out)
     -> bool;
 
+// In-place AEAD variants. `body` is encrypted/decrypted into the same
+// bytes; `tag_out` (16 bytes) receives the auth tag on seal, and
+// `tag_in` (16 bytes) supplies it on open. Avoids the
+// allocate-and-copy that `aead_seal`/`aead_open` do internally, so
+// they're suitable for the per-packet hot path.
+auto aead_seal_inplace(Aead aead, std::span<const uint8_t> key,
+                       std::span<const uint8_t> nonce, std::span<const uint8_t> aad,
+                       std::span<uint8_t> body, std::span<uint8_t> tag_out) -> bool;
+
+[[nodiscard]] auto aead_open_inplace(Aead aead, std::span<const uint8_t> key,
+                                     std::span<const uint8_t> nonce,
+                                     std::span<const uint8_t> aad, std::span<uint8_t> body,
+                                     std::span<const uint8_t> tag_in) -> bool;
+
 // Header-protection mask (RFC 9001 §5.4).
 //
 //   AES-128/256: mask = AES-ECB(hp_key, sample)[0..4]

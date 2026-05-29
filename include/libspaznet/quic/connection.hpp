@@ -205,6 +205,13 @@ class Connection {
     // per encryption level (Initial/0-RTT/Handshake/Application).
     std::array<std::vector<CryptoFrame>, 4> crypto_pending_{};
 
+    // Scratch buffer reused across every build_and_send call to avoid
+    // per-packet std::vector reallocation churn. Reserved at
+    // construction time to a comfortable max-datagram-size headroom;
+    // each call clear()s it (which preserves capacity) and writes the
+    // outgoing datagram directly into it in place.
+    std::vector<uint8_t> scratch_packet_{};
+
     // Have we sent HANDSHAKE_DONE yet?
     bool sent_handshake_done_{false};
 };

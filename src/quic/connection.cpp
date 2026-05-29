@@ -41,6 +41,10 @@ Connection::Connection(std::shared_ptr<TlsContext> tls_ctx,
       tls_(tls_ctx_, client_dcid, finalize_tp(tp, client_dcid, server_scid)),
       local_tp_(finalize_tp(tp, client_dcid, server_scid)) {
     last_activity_ = clock_fn_();
+    // Hot-path scratch buffer; reserved once and reused across every
+    // build_and_send invocation. 1500 bytes covers any IPv4/IPv6 path
+    // MTU we'd actually send.
+    scratch_packet_.reserve(1500);
 
     // Pre-install Initial-level keys for both directions.
     auto& init = space(EncryptionLevel::Initial);
@@ -456,113 +460,110 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
                   {stream_pending.data(), stream_pending.size()}, include_ack, ack,
                   include_hs_done, false, payload);
 
-    std::vector<uint8_t> datagram;
     const uint64_t pn = sp.next_send_pn++;
+    // Initial path keeps the original `build_initial_packet` helper
+    // because it has special padding rules and is hand-shake only
+    // (one or two calls per connection). The hot path is Application
+    // / Handshake, which we build directly into the reused scratch
+    // buffer with in-place AEAD.
     if (level == EncryptionLevel::Initial) {
-        // Pad Initial to 1200 if it contains a CRYPTO frame and we are
-        // the server's first response (RFC 9000 §14.1 applies to client;
-        // server side: we just emit whatever we have).
-        datagram =
-            build_initial_packet(sp.aead, sp.send_keys, {dcid_.data(), dcid_.size()},
-                                 {scid_.data(), scid_.size()}, {}, {payload.data(), payload.size()},
-                                 pn);
-    } else {
-        // Handshake or Application long/short header. For this first
-        // pass we build a Handshake packet as a minimal long header,
-        // and Application as short header.
-        if (level == EncryptionLevel::Handshake) {
-            // Hand-build a Handshake long header.
-            const std::size_t pn_len = 4;
-            const std::size_t tag_len = aead_tag_length(sp.aead);
-            datagram.reserve(64 + payload.size() + tag_len);
-            uint8_t first = static_cast<uint8_t>(0x80 | 0x40 |
-                                                 (static_cast<uint8_t>(LongType::Handshake) << 4) |
-                                                 static_cast<uint8_t>(pn_len - 1));
-            datagram.push_back(first);
-            datagram.push_back(static_cast<uint8_t>(kQuicV1 >> 24));
-            datagram.push_back(static_cast<uint8_t>(kQuicV1 >> 16));
-            datagram.push_back(static_cast<uint8_t>(kQuicV1 >> 8));
-            datagram.push_back(static_cast<uint8_t>(kQuicV1));
-            datagram.push_back(static_cast<uint8_t>(dcid_.size()));
-            datagram.insert(datagram.end(), dcid_.begin(), dcid_.end());
-            datagram.push_back(static_cast<uint8_t>(scid_.size()));
-            datagram.insert(datagram.end(), scid_.begin(), scid_.end());
-            // Length (varint) = pn_len + payload + tag.
-            const uint64_t length = pn_len + payload.size() + tag_len;
-            VarInt::append(datagram, length);
-            const std::size_t pn_offset = datagram.size();
-            for (std::size_t i = 0; i < pn_len; ++i) {
-                datagram.push_back(static_cast<uint8_t>((pn >> (8 * (pn_len - 1 - i))) & 0xFF));
-            }
-            const std::size_t payload_off = datagram.size();
-            datagram.insert(datagram.end(), payload.begin(), payload.end());
-            std::vector<uint8_t> aad(datagram.begin(), datagram.begin() + payload_off);
-            std::vector<uint8_t> plaintext(datagram.begin() + payload_off, datagram.end());
-            auto nonce = make_aead_nonce({sp.send_keys.iv.data(), sp.send_keys.iv.size()}, pn);
-            std::vector<uint8_t> sealed;
-            aead_seal(sp.aead, {sp.send_keys.key.data(), sp.send_keys.key.size()},
-                      {nonce.data(), nonce.size()}, {aad.data(), aad.size()},
-                      {plaintext.data(), plaintext.size()}, sealed);
-            datagram.resize(payload_off);
-            datagram.insert(datagram.end(), sealed.begin(), sealed.end());
-            auto mask = header_protection_mask(
-                sp.aead, {sp.send_keys.hp.data(), sp.send_keys.hp.size()},
-                {datagram.data() + pn_offset + 4, kSampleLen});
-            datagram[0] ^= mask[0] & 0x0F;
-            for (std::size_t i = 0; i < pn_len; ++i) {
-                datagram[pn_offset + i] ^= mask[1 + i];
-            }
-        } else {
-            // Application — short header.
-            const std::size_t pn_len = 4;
-            const std::size_t tag_len = aead_tag_length(sp.aead);
-            datagram.reserve(1 + dcid_.size() + pn_len + payload.size() + tag_len);
-            // First byte: 01 (Header Form=0, Fixed Bit=1), Spin=0,
-            // reserved bits 4-3=0, Key Phase=0, PN length-1 in low 2 bits.
-            uint8_t first = static_cast<uint8_t>(0x40 | static_cast<uint8_t>(pn_len - 1));
-            datagram.push_back(first);
-            datagram.insert(datagram.end(), dcid_.begin(), dcid_.end());
-            const std::size_t pn_offset = datagram.size();
-            for (std::size_t i = 0; i < pn_len; ++i) {
-                datagram.push_back(static_cast<uint8_t>((pn >> (8 * (pn_len - 1 - i))) & 0xFF));
-            }
-            const std::size_t payload_off = datagram.size();
-            datagram.insert(datagram.end(), payload.begin(), payload.end());
-            std::vector<uint8_t> aad(datagram.begin(), datagram.begin() + payload_off);
-            std::vector<uint8_t> plaintext(datagram.begin() + payload_off, datagram.end());
-            auto nonce = make_aead_nonce({sp.send_keys.iv.data(), sp.send_keys.iv.size()}, pn);
-            std::vector<uint8_t> sealed;
-            aead_seal(sp.aead, {sp.send_keys.key.data(), sp.send_keys.key.size()},
-                      {nonce.data(), nonce.size()}, {aad.data(), aad.size()},
-                      {plaintext.data(), plaintext.size()}, sealed);
-            datagram.resize(payload_off);
-            datagram.insert(datagram.end(), sealed.begin(), sealed.end());
-            auto mask = header_protection_mask(
-                sp.aead, {sp.send_keys.hp.data(), sp.send_keys.hp.size()},
-                {datagram.data() + pn_offset + 4, kSampleLen});
-            datagram[0] ^= mask[0] & 0x1F;
-            for (std::size_t i = 0; i < pn_len; ++i) {
-                datagram[pn_offset + i] ^= mask[1 + i];
-            }
+        std::vector<uint8_t> datagram = build_initial_packet(
+            sp.aead, sp.send_keys, {dcid_.data(), dcid_.size()},
+            {scid_.data(), scid_.size()}, {}, {payload.data(), payload.size()}, pn);
+        // Track + send.
+        SentRecord rec;
+        rec.level = level;
+        rec.ack_eliciting =
+            !crypto_pending.empty() || !stream_pending.empty() || include_hs_done;
+        rec.bytes = datagram.size();
+        rec.sent_at = clock_fn_();
+        rec.crypto = std::move(crypto_pending);
+        rec.streams = std::move(stream_pending);
+        sent_[static_cast<std::size_t>(level)].emplace(pn, std::move(rec));
+        if (rec.ack_eliciting) {
+            congestion_.on_packet_sent(rec.sent_at, datagram.size());
         }
+        send_fn_({datagram.data(), datagram.size()});
+        return true;
     }
 
-    // Track for ack/loss.
+    // Application + Handshake share an "encode header into scratch,
+    // append payload, append tag space, AEAD-seal in place, apply HP"
+    // pattern; the only differences are the header layout and which
+    // bits of the first byte are HP-masked.
+    auto& buf = scratch_packet_;
+    buf.clear();
+    const std::size_t pn_len = 4;
+    const std::size_t tag_len = aead_tag_length(sp.aead);
+    std::size_t pn_offset = 0;
+    uint8_t hp_first_mask = 0;
+
+    if (level == EncryptionLevel::Handshake) {
+        const uint8_t first =
+            static_cast<uint8_t>(0x80 | 0x40 |
+                                 (static_cast<uint8_t>(LongType::Handshake) << 4) |
+                                 static_cast<uint8_t>(pn_len - 1));
+        buf.push_back(first);
+        buf.push_back(static_cast<uint8_t>(kQuicV1 >> 24));
+        buf.push_back(static_cast<uint8_t>(kQuicV1 >> 16));
+        buf.push_back(static_cast<uint8_t>(kQuicV1 >> 8));
+        buf.push_back(static_cast<uint8_t>(kQuicV1));
+        buf.push_back(static_cast<uint8_t>(dcid_.size()));
+        buf.insert(buf.end(), dcid_.begin(), dcid_.end());
+        buf.push_back(static_cast<uint8_t>(scid_.size()));
+        buf.insert(buf.end(), scid_.begin(), scid_.end());
+        const uint64_t length = pn_len + payload.size() + tag_len;
+        VarInt::append(buf, length);
+        hp_first_mask = 0x0F;
+    } else {
+        // Application — short header.
+        const uint8_t first = static_cast<uint8_t>(0x40 | static_cast<uint8_t>(pn_len - 1));
+        buf.push_back(first);
+        buf.insert(buf.end(), dcid_.begin(), dcid_.end());
+        hp_first_mask = 0x1F;
+    }
+    pn_offset = buf.size();
+    for (std::size_t i = 0; i < pn_len; ++i) {
+        buf.push_back(static_cast<uint8_t>((pn >> (8 * (pn_len - 1 - i))) & 0xFF));
+    }
+    const std::size_t header_end = buf.size();
+    buf.insert(buf.end(), payload.begin(), payload.end());
+    const std::size_t body_end = buf.size();
+    // Make room for the AEAD auth tag at the end of the scratch buffer.
+    buf.resize(body_end + tag_len);
+
+    auto nonce = make_aead_nonce({sp.send_keys.iv.data(), sp.send_keys.iv.size()}, pn);
+    if (!aead_seal_inplace(sp.aead, {sp.send_keys.key.data(), sp.send_keys.key.size()},
+                           {nonce.data(), nonce.size()}, {buf.data(), header_end},
+                           {buf.data() + header_end, body_end - header_end},
+                           {buf.data() + body_end, tag_len})) {
+        return false;
+    }
+    auto mask = header_protection_mask(
+        sp.aead, {sp.send_keys.hp.data(), sp.send_keys.hp.size()},
+        {buf.data() + pn_offset + 4, kSampleLen});
+    buf[0] ^= mask[0] & hp_first_mask;
+    for (std::size_t i = 0; i < pn_len; ++i) {
+        buf[pn_offset + i] ^= mask[1 + i];
+    }
+
+    // Track for ack/loss + emit the freshly-built Application or
+    // Handshake datagram from the scratch buffer.
     SentRecord rec;
     rec.level = level;
     rec.ack_eliciting = !crypto_pending.empty() || !stream_pending.empty() || include_hs_done;
-    rec.bytes = datagram.size();
+    rec.bytes = buf.size();
     rec.sent_at = clock_fn_();
     rec.crypto = std::move(crypto_pending);
     rec.streams = std::move(stream_pending);
     sent_[static_cast<std::size_t>(level)].emplace(pn, std::move(rec));
     if (rec.ack_eliciting) {
-        congestion_.on_packet_sent(rec.sent_at, datagram.size());
+        congestion_.on_packet_sent(rec.sent_at, buf.size());
     }
 
     if (include_hs_done) sent_handshake_done_ = true;
 
-    send_fn_({datagram.data(), datagram.size()});
+    send_fn_({buf.data(), buf.size()});
     return true;
 }
 

@@ -320,6 +320,117 @@ auto aead_open(Aead aead, std::span<const uint8_t> key, std::span<const uint8_t>
     return ok;
 }
 
+auto aead_seal_inplace(Aead aead, std::span<const uint8_t> key, std::span<const uint8_t> nonce,
+                       std::span<const uint8_t> aad, std::span<uint8_t> body,
+                       std::span<uint8_t> tag_out) -> bool {
+    const std::size_t tag_len = aead_tag_length(aead);
+    if (tag_out.size() != tag_len) {
+        return false;
+    }
+    const EVP_CIPHER* cipher = aead_cipher(aead);
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (ctx == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    do {
+        if (EVP_EncryptInit_ex(ctx, cipher, nullptr, nullptr, nullptr) != 1) {
+            break;
+        }
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, static_cast<int>(nonce.size()),
+                                nullptr) != 1) {
+            break;
+        }
+        if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce.data()) != 1) {
+            break;
+        }
+        int outlen = 0;
+        if (!aad.empty()) {
+            if (EVP_EncryptUpdate(ctx, nullptr, &outlen, aad.data(),
+                                  static_cast<int>(aad.size())) != 1) {
+                break;
+            }
+        }
+        // AES-GCM permits in-place encryption: same buffer as input
+        // and output is legal because the cipher operates in counter
+        // mode XOR-ing keystream over the plaintext byte by byte.
+        if (!body.empty()) {
+            if (EVP_EncryptUpdate(ctx, body.data(), &outlen, body.data(),
+                                  static_cast<int>(body.size())) != 1) {
+                break;
+            }
+        }
+        int finlen = 0;
+        // Tag-only ciphers (GCM) have no remaining output here; pass a
+        // throwaway 16-byte buffer so EVP_EncryptFinal_ex never writes
+        // past the end of the caller's body span. AES-GCM and
+        // ChaCha20-Poly1305 both emit zero bytes here.
+        std::array<uint8_t, 16> finish_pad{};
+        if (EVP_EncryptFinal_ex(ctx, finish_pad.data(), &finlen) != 1) {
+            break;
+        }
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, static_cast<int>(tag_len),
+                                tag_out.data()) != 1) {
+            break;
+        }
+        ok = true;
+    } while (false);
+    EVP_CIPHER_CTX_free(ctx);
+    return ok;
+}
+
+auto aead_open_inplace(Aead aead, std::span<const uint8_t> key, std::span<const uint8_t> nonce,
+                       std::span<const uint8_t> aad, std::span<uint8_t> body,
+                       std::span<const uint8_t> tag_in) -> bool {
+    const std::size_t tag_len = aead_tag_length(aead);
+    if (tag_in.size() != tag_len) {
+        return false;
+    }
+    const EVP_CIPHER* cipher = aead_cipher(aead);
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (ctx == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    do {
+        if (EVP_DecryptInit_ex(ctx, cipher, nullptr, nullptr, nullptr) != 1) {
+            break;
+        }
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, static_cast<int>(nonce.size()),
+                                nullptr) != 1) {
+            break;
+        }
+        if (EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce.data()) != 1) {
+            break;
+        }
+        int outlen = 0;
+        if (!aad.empty()) {
+            if (EVP_DecryptUpdate(ctx, nullptr, &outlen, aad.data(),
+                                  static_cast<int>(aad.size())) != 1) {
+                break;
+            }
+        }
+        if (!body.empty()) {
+            if (EVP_DecryptUpdate(ctx, body.data(), &outlen, body.data(),
+                                  static_cast<int>(body.size())) != 1) {
+                break;
+            }
+        }
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, static_cast<int>(tag_len),
+                                const_cast<uint8_t*>(tag_in.data())) != 1) {
+            break;
+        }
+        int finlen = 0;
+        std::array<uint8_t, 16> finish_pad{};
+        if (EVP_DecryptFinal_ex(ctx, finish_pad.data(), &finlen) != 1) {
+            break;
+        }
+        ok = true;
+    } while (false);
+    EVP_CIPHER_CTX_free(ctx);
+    return ok;
+}
+
 auto header_protection_mask(Aead aead, std::span<const uint8_t> hp_key,
                             std::span<const uint8_t> sample) -> std::array<uint8_t, 5> {
     if (sample.size() != 16) {
