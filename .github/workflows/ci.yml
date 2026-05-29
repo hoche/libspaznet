@@ -20,7 +20,7 @@ jobs:
       - name: Set up CMake
         uses: jwlawson/actions-setup-cmake@v1.14
         with:
-          cmake-version: '3.20'
+          cmake-version: '3.30'
 
       - name: Install dependencies
         run: |
@@ -96,7 +96,7 @@ jobs:
       - name: Set up CMake
         uses: jwlawson/actions-setup-cmake@v1.14
         with:
-          cmake-version: '3.20'
+          cmake-version: '3.30'
 
       - name: Install dependencies
         run: |
@@ -141,7 +141,7 @@ jobs:
       - name: Set up CMake
         uses: jwlawson/actions-setup-cmake@v1.14
         with:
-          cmake-version: '3.20'
+          cmake-version: '3.30'
 
       - name: Install dependencies
         run: |
@@ -186,7 +186,7 @@ jobs:
       - name: Set up CMake
         uses: jwlawson/actions-setup-cmake@v1.14
         with:
-          cmake-version: '3.20'
+          cmake-version: '3.30'
 
       - name: Install Visual Studio Build Tools
         uses: microsoft/setup-msbuild@v1.1
@@ -229,7 +229,7 @@ jobs:
       - name: Set up CMake
         uses: jwlawson/actions-setup-cmake@v1.14
         with:
-          cmake-version: '3.20'
+          cmake-version: '3.30'
 
       - name: Install Visual Studio Build Tools
         uses: microsoft/setup-msbuild@v1.1
