@@ -27,6 +27,9 @@ class HTTP2Handler;
 class WebSocketHandler;
 class QUICHandler;
 class HTTP3Handler;
+namespace http3 {
+class QuicHttp3Service;
+}
 
 // Forward-declared so Socket::send_websocket_message can name it before
 // websocket_handler.hpp (which depends on Socket) is included below.
@@ -135,6 +138,7 @@ class Server {
     std::unique_ptr<WebSocketHandler> websocket_handler_;
     std::unique_ptr<QUICHandler> quic_handler_;
     std::unique_ptr<HTTP3Handler> http3_handler_;
+    std::unique_ptr<http3::QuicHttp3Service> quic_http3_service_;
 
     std::unordered_map<int, std::coroutine_handle<>> socket_handles_;
     // Track active listening sockets so stop()/destructor can close them even if coroutines are
@@ -172,6 +176,12 @@ class Server {
     void set_websocket_handler(std::unique_ptr<WebSocketHandler> handler);
     void set_quic_handler(std::unique_ptr<QUICHandler> handler);
     void set_http3_handler(std::unique_ptr<HTTP3Handler> handler);
+
+    // New full-stack QUIC v1 + HTTP/3 wiring (replaces the toy
+    // set_quic_handler / set_http3_handler path). The service object
+    // owns the Listener + per-connection Http3Server instances; the
+    // server just routes UDP datagrams to it and drives its timer.
+    void set_quic_http3_service(std::unique_ptr<http3::QuicHttp3Service> service);
 
     // Run the server
     void run();

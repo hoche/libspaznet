@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <libspaznet/handlers/quic_server.hpp>
+#include <libspaznet/http3/service.hpp>
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/server.hpp>
 #include <map>
@@ -513,6 +514,10 @@ void Server::set_http3_handler(std::unique_ptr<HTTP3Handler> handler) {
     http3_handler_ = std::move(handler);
 }
 
+void Server::set_quic_http3_service(std::unique_ptr<http3::QuicHttp3Service> service) {
+    quic_http3_service_ = std::move(service);
+}
+
 void Server::listen_tcp(uint16_t port) {
     // Use getaddrinfo for IPv4/IPv6 compatibility
     struct addrinfo hints {
@@ -690,6 +695,13 @@ Task Server::receive_udp(int udp_fd) {
 
         if (quic_engine) {
             co_await quic_engine->handle_datagram(udp_fd, addr, addr_len, std::move(buffer));
+        } else if (quic_http3_service_) {
+            // New full stack: hand the raw datagram to the service,
+            // which drives the Listener + Http3Server pipeline.
+            spaznet::quic::PeerAddr peer{};
+            peer.length = addr_len;
+            std::memcpy(&peer.storage, &addr, addr_len);
+            quic_http3_service_->handle_datagram(peer, {buffer.data(), buffer.size()});
         }
     }
 

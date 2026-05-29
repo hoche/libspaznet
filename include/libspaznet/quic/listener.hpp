@@ -1,11 +1,15 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
 #include <span>
 #include <vector>
+
+#include <sys/socket.h>
 
 #include <libspaznet/quic/connection.hpp>
 
@@ -41,6 +45,23 @@ auto build_version_negotiation_packet(std::span<const uint8_t> client_dcid_echo,
                                       std::span<const uint8_t> supported_versions_be)
     -> std::vector<uint8_t>;
 
+// Opaque peer address — just a sockaddr_storage + length pair, copied by
+// value so the listener can stash one per connection for response
+// routing.
+struct PeerAddr {
+    sockaddr_storage storage{};
+    socklen_t length{0};
+
+    auto data() const -> const sockaddr* {
+        return reinterpret_cast<const sockaddr*>(&storage);
+    }
+};
+
+inline auto peer_addr_equal(const PeerAddr& a, const PeerAddr& b) -> bool {
+    if (a.length != b.length) return false;
+    return std::memcmp(&a.storage, &b.storage, a.length) == 0;
+}
+
 // UDP-side dispatcher. One Listener per UDP socket: it owns the set of
 // active Connections keyed by the server-chosen SCID (== peer's DCID on
 // inbound short-header packets). Long-header packets are routed by
@@ -49,7 +70,9 @@ auto build_version_negotiation_packet(std::span<const uint8_t> client_dcid_echo,
 // the path budget see a Retry.
 class Listener {
   public:
-    using SendFn = std::function<void(std::span<const uint8_t>)>;
+    // Send callback signature: send `datagram` to `peer`. The implementor
+    // is expected to call sendto() (or equivalent) to the given address.
+    using SendFn = std::function<void(const PeerAddr& peer, std::span<const uint8_t> datagram)>;
 
     struct Config {
         std::shared_ptr<TlsContext> tls_ctx;
@@ -71,7 +94,7 @@ class Listener {
     // Feed a UDP datagram with the peer address (opaque to us — used
     // only to route response packets back through `send_fn`). The
     // listener identifies the connection and dispatches.
-    auto on_datagram(std::span<const uint8_t> dg) -> void;
+    auto on_datagram(const PeerAddr& peer, std::span<const uint8_t> dg) -> void;
 
     // Periodic pump of all owned connections.
     auto on_timer() -> void;
@@ -82,6 +105,16 @@ class Listener {
 
     // Test hook: look up a connection by its server-chosen SCID.
     [[nodiscard]] auto find_connection(std::span<const uint8_t> scid) -> Connection*;
+
+    // Iterate every (scid, Connection) the listener currently owns. The
+    // callback receives the server-chosen SCID as a const ref to the
+    // exact key stored in the map.
+    template <typename F>
+    auto for_each_connection(F&& fn) -> void {
+        for (auto& [scid, state] : connections_) {
+            fn(scid, *state.conn);
+        }
+    }
 
   private:
     auto new_random_cid(std::vector<uint8_t>& out) -> void;
@@ -94,7 +127,11 @@ class Listener {
     // Connections owned by the listener, keyed by the server-chosen SCID
     // (which becomes the DCID the peer uses from its second packet
     // onward).
-    std::map<std::vector<uint8_t>, std::unique_ptr<Connection>> connections_;
+    struct ConnState {
+        std::unique_ptr<Connection> conn;
+        PeerAddr last_peer{};
+    };
+    std::map<std::vector<uint8_t>, ConnState> connections_;
     // Aliases mapping the client's initial DCID (a value the client
     // picked before learning the server's SCID) to the canonical SCID
     // key in `connections_`. Used to route retransmissions of the

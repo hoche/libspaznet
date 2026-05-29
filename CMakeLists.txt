@@ -64,6 +64,7 @@ set(SOURCES
     src/http3/qpack.cpp
     src/http3/h3frame.cpp
     src/http3/server.cpp
+    src/http3/service.cpp
     src/utils/string_utils.cpp
     src/utils/number_utils.cpp
     src/utils/binary_utils.cpp
@@ -100,6 +101,7 @@ set(HEADERS
     include/libspaznet/http3/qpack.hpp
     include/libspaznet/http3/h3frame.hpp
     include/libspaznet/http3/server.hpp
+    include/libspaznet/http3/service.hpp
     include/libspaznet/utils/string_utils.hpp
     include/libspaznet/utils/number_utils.hpp
     include/libspaznet/utils/binary_utils.hpp
@@ -283,6 +285,7 @@ add_executable(test_unit
     tests/unit/test_http3_huffman.cpp
     tests/unit/test_http3_qpack.cpp
     tests/unit/test_http3_frame.cpp
+    tests/unit/test_http3_end_to_end.cpp
     tests/unit/test_rfc9112_parser.cpp
     tests/unit/test_rfc9113_parser.cpp
     tests/unit/test_logger.cpp

@@ -55,12 +55,15 @@ class Connection {
 
     // Server constructor. `tls_ctx` is shared across connections;
     // `client_dcid` is the destination CID the client used in its first
-    // Initial — we use it to derive Initial-level keys. `tp` is the
-    // server's transport parameters (we'll set
-    // original_destination_connection_id automatically).
+    // Initial — we use it to derive Initial-level keys. `client_scid`
+    // is the client's chosen source CID (extracted from the same first
+    // Initial); per RFC 9000 §7.2 it becomes the DCID for all server
+    // packets sent back to the client. `tp` is the server's transport
+    // parameters (we'll set original_destination_connection_id and
+    // initial_source_connection_id automatically).
     Connection(std::shared_ptr<TlsContext> tls_ctx, std::span<const uint8_t> client_dcid,
-               std::span<const uint8_t> server_scid, TransportParameters tp, SendFn send_fn,
-               ClockFn clock_fn = nullptr);
+               std::span<const uint8_t> client_scid, std::span<const uint8_t> server_scid,
+               TransportParameters tp, SendFn send_fn, ClockFn clock_fn = nullptr);
 
     Connection(const Connection&) = delete;
     auto operator=(const Connection&) -> Connection& = delete;

@@ -18,6 +18,10 @@
 #include <string>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
@@ -145,9 +149,13 @@ TEST(QuicListener, UnsupportedVersionTriggersVersionNegotiation) {
     cfg.random_seed = 0xDEADBEEFULL;
 
     std::vector<std::vector<uint8_t>> outbox;
-    Listener listener(cfg, [&](std::span<const uint8_t> dg) {
-        outbox.emplace_back(dg.begin(), dg.end());
-    });
+    Listener listener(cfg,
+                      [&](const PeerAddr&, std::span<const uint8_t> dg) {
+                          outbox.emplace_back(dg.begin(), dg.end());
+                      });
+    PeerAddr peer{};
+    peer.length = sizeof(sockaddr_in);
+    reinterpret_cast<sockaddr_in*>(&peer.storage)->sin_family = AF_INET;
 
     // Hand-build an Initial-like packet with version 0xCAFEBABE.
     std::vector<uint8_t> dg;
@@ -165,7 +173,7 @@ TEST(QuicListener, UnsupportedVersionTriggersVersionNegotiation) {
     // Pad out so the listener doesn't reject as too small.
     dg.resize(64, 0);
 
-    listener.on_datagram({dg.data(), dg.size()});
+    listener.on_datagram(peer, {dg.data(), dg.size()});
     ASSERT_EQ(outbox.size(), 1U);
     // Echoed CIDs are at offsets 5 and 5+1+4 in the VN packet.
     EXPECT_EQ(outbox[0][5], dcid.size());

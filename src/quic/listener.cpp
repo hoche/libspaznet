@@ -183,7 +183,7 @@ auto peek_long(std::span<const uint8_t> dg, uint32_t& version,
 
 } // namespace
 
-auto Listener::on_datagram(std::span<const uint8_t> dg) -> void {
+auto Listener::on_datagram(const PeerAddr& peer, std::span<const uint8_t> dg) -> void {
     if (dg.empty()) return;
 
     if ((dg[0] & 0x80U) != 0) {
@@ -199,7 +199,7 @@ auto Listener::on_datagram(std::span<const uint8_t> dg) -> void {
             auto vn = build_version_negotiation_packet({dcid.data(), dcid.size()},
                                                        {scid.data(), scid.size()},
                                                        {v1_be.data(), v1_be.size()});
-            send_fn_({vn.data(), vn.size()});
+            send_fn_(peer, {vn.data(), vn.size()});
             return;
         }
 
@@ -223,22 +223,35 @@ auto Listener::on_datagram(std::span<const uint8_t> dg) -> void {
             // derivation inside Connection).
             std::vector<uint8_t> server_scid;
             new_random_cid(server_scid);
-            auto conn = std::make_unique<Connection>(
+            // Capture the SCID in the per-connection send shim so the
+            // outer send_fn can route by the most-recent peer address.
+            ConnState state;
+            state.last_peer = peer;
+            auto* scid_key_ptr = &server_scid; // for the lambda — replaced below
+            (void)scid_key_ptr;
+            auto* self = this;
+            auto scid_copy = server_scid;
+            auto send_fn_for_conn =
+                [self, scid_copy](std::span<const uint8_t> bytes) {
+                    auto it2 = self->connections_.find(scid_copy);
+                    if (it2 == self->connections_.end()) return;
+                    self->send_fn_(it2->second.last_peer, bytes);
+                };
+            state.conn = std::make_unique<Connection>(
                 cfg_.tls_ctx, std::span<const uint8_t>{dcid.data(), dcid.size()},
+                std::span<const uint8_t>{scid.data(), scid.size()},
                 std::span<const uint8_t>{server_scid.data(), server_scid.size()},
-                cfg_.server_tp, send_fn_);
-            // Key map by server_scid so subsequent short-header packets
-            // route correctly; also alias the original DCID until the
-            // peer learns server_scid (after first server packet).
-            auto* raw = conn.get();
-            connections_.emplace(server_scid, std::move(conn));
+                cfg_.server_tp, send_fn_for_conn);
+            auto* raw = state.conn.get();
             connections_aliases_[dcid] = server_scid;
+            connections_.emplace(server_scid, std::move(state));
             raw->on_datagram(dg);
             raw->on_timer();
             return;
         }
-        it->second->on_datagram(dg);
-        it->second->on_timer();
+        it->second.last_peer = peer;
+        it->second.conn->on_datagram(dg);
+        it->second.conn->on_timer();
         return;
     }
 
@@ -250,19 +263,20 @@ auto Listener::on_datagram(std::span<const uint8_t> dg) -> void {
     if (it == connections_.end()) {
         return; // unknown SCID → drop
     }
-    it->second->on_datagram(dg);
-    it->second->on_timer();
+    it->second.last_peer = peer;
+    it->second.conn->on_datagram(dg);
+    it->second.conn->on_timer();
 }
 
 auto Listener::on_timer() -> void {
-    for (auto& [scid, conn] : connections_) {
-        conn->on_timer();
+    for (auto& [scid, state] : connections_) {
+        state.conn->on_timer();
     }
 }
 
 auto Listener::find_connection(std::span<const uint8_t> scid) -> Connection* {
     auto it = connections_.find(std::vector<uint8_t>(scid.begin(), scid.end()));
-    return it == connections_.end() ? nullptr : it->second.get();
+    return it == connections_.end() ? nullptr : it->second.conn.get();
 }
 
 } // namespace quic

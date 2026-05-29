@@ -24,14 +24,20 @@ auto finalize_tp(TransportParameters tp, std::span<const uint8_t> od_cid,
 
 Connection::Connection(std::shared_ptr<TlsContext> tls_ctx,
                        std::span<const uint8_t> client_dcid,
+                       std::span<const uint8_t> client_scid,
                        std::span<const uint8_t> server_scid, TransportParameters tp,
                        SendFn send_fn, ClockFn clock_fn)
-    : dcid_(client_dcid.begin(), client_dcid.end()),
+    // dcid_ holds the value we put in the DCID field on every outgoing
+    // packet, which per RFC 9000 §7.2 is the peer's chosen SCID.
+    : dcid_(client_scid.begin(), client_scid.end()),
       scid_(server_scid.begin(), server_scid.end()),
       original_dcid_(client_dcid.begin(), client_dcid.end()),
       send_fn_(std::move(send_fn)),
       clock_fn_(clock_fn ? std::move(clock_fn) : []() { return std::chrono::steady_clock::now(); }),
       tls_ctx_(std::move(tls_ctx)),
+      // Initial-level keys are derived from the client's *original*
+      // DCID (the value it put in its first Initial), not from the
+      // peer's SCID — see RFC 9001 §5.2.
       tls_(tls_ctx_, client_dcid, finalize_tp(tp, client_dcid, server_scid)),
       local_tp_(finalize_tp(tp, client_dcid, server_scid)) {
     last_activity_ = clock_fn_();
