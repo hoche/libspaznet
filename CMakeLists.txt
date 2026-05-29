@@ -60,6 +60,9 @@ set(SOURCES
     src/quic/congestion.cpp
     src/quic/connection.cpp
     src/quic/listener.cpp
+    src/http3/huffman.cpp
+    src/http3/qpack.cpp
+    src/http3/h3frame.cpp
     src/utils/string_utils.cpp
     src/utils/number_utils.cpp
     src/utils/binary_utils.cpp
@@ -92,6 +95,9 @@ set(HEADERS
     include/libspaznet/quic/congestion.hpp
     include/libspaznet/quic/connection.hpp
     include/libspaznet/quic/listener.hpp
+    include/libspaznet/http3/huffman.hpp
+    include/libspaznet/http3/qpack.hpp
+    include/libspaznet/http3/h3frame.hpp
     include/libspaznet/utils/string_utils.hpp
     include/libspaznet/utils/number_utils.hpp
     include/libspaznet/utils/binary_utils.hpp
@@ -272,6 +278,9 @@ add_executable(test_unit
     tests/unit/test_quic_phase4.cpp
     tests/unit/test_quic_connection.cpp
     tests/unit/test_quic_listener.cpp
+    tests/unit/test_http3_huffman.cpp
+    tests/unit/test_http3_qpack.cpp
+    tests/unit/test_http3_frame.cpp
     tests/unit/test_rfc9112_parser.cpp
     tests/unit/test_rfc9113_parser.cpp
     tests/unit/test_logger.cpp
