@@ -14,6 +14,7 @@
 #include <libspaznet/quic/tls.hpp>
 #include <libspaznet/quic/transport_params.hpp>
 
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
