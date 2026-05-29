@@ -12,6 +12,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
+# OpenSSL 3.5+ provides the SSL_set_quic_tls_cbs interface that the
+# QUIC stack uses to drive the TLS 1.3 handshake (RFC 9001). Everything
+# above the TLS layer (transport, recovery, HTTP/3, QPACK) is implemented
+# in this repo with no other third-party dependencies.
+find_package(OpenSSL 3.5 REQUIRED)
+
 # CMake helpers for install(EXPORT) below.
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -42,6 +48,10 @@ set(SOURCES
     src/handlers/quic_handler.cpp
     src/handlers/quic_server.cpp
     src/handlers/http3_handler.cpp
+    src/quic/varint.cpp
+    src/quic/crypto.cpp
+    src/quic/packet.cpp
+    src/quic/frame.cpp
     src/utils/string_utils.cpp
     src/utils/number_utils.cpp
     src/utils/binary_utils.cpp
@@ -62,6 +72,10 @@ set(HEADERS
     include/libspaznet/handlers/quic_handler.hpp
     include/libspaznet/handlers/quic_server.hpp
     include/libspaznet/handlers/http3_handler.hpp
+    include/libspaznet/quic/varint.hpp
+    include/libspaznet/quic/crypto.hpp
+    include/libspaznet/quic/packet.hpp
+    include/libspaznet/quic/frame.hpp
     include/libspaznet/utils/string_utils.hpp
     include/libspaznet/utils/number_utils.hpp
     include/libspaznet/utils/binary_utils.hpp
@@ -85,7 +99,7 @@ target_include_directories(spaznet
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-target_link_libraries(spaznet PUBLIC Threads::Threads)
+target_link_libraries(spaznet PUBLIC Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
 
 # Platform-specific compile defs.
 if(USE_EPOLL)
@@ -177,6 +191,7 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/spaznetConfig.cmake.in"
 
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
+find_dependency(OpenSSL 3.5)
 
 include(\"\${CMAKE_CURRENT_LIST_DIR}/spaznetTargets.cmake\")
 
@@ -235,6 +250,8 @@ add_executable(test_unit
     tests/unit/test_websocket_handler.cpp
     tests/unit/test_http2_handler.cpp
     tests/unit/test_quic_handler.cpp
+    tests/unit/test_quic_phase1.cpp
+    tests/unit/test_quic_frame.cpp
     tests/unit/test_rfc9112_parser.cpp
     tests/unit/test_rfc9113_parser.cpp
     tests/unit/test_logger.cpp
