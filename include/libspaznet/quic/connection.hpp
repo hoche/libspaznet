@@ -95,6 +95,18 @@ class Connection {
         }
     }
 
+    // Mark the peer's address as validated.  RFC 9000 §8.1.2: this
+    // disables the 3× anti-amplification cap on outbound bytes.  Called
+    // by Listener after a Retry token round-trips successfully; the
+    // path is otherwise validated automatically the first time a
+    // Handshake-protected packet from the peer decrypts.
+    auto mark_peer_address_validated() -> void {
+        peer_address_validated_ = true;
+    }
+    [[nodiscard]] auto peer_address_validated() const -> bool {
+        return peer_address_validated_;
+    }
+
     // ---- Accessors -----------------------------------------------------
     [[nodiscard]] auto state() const -> State {
         return state_;
@@ -221,6 +233,15 @@ class Connection {
 
     // Have we sent HANDSHAKE_DONE yet?
     bool sent_handshake_done_{false};
+
+    // RFC 9000 §8.1.2 anti-amplification bookkeeping.  Until the peer's
+    // address is validated (either by a Retry token round-trip handled
+    // at Listener level, or by successfully decrypting a Handshake-
+    // protected packet from the peer), the server MUST NOT send more
+    // than 3× the bytes it has received from that address.
+    bool peer_address_validated_{false};
+    uint64_t recv_bytes_total_{0};
+    uint64_t sent_bytes_unvalidated_{0};
 };
 
 } // namespace quic

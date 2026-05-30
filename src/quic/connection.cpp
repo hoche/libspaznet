@@ -13,10 +13,18 @@ namespace {
 
 auto finalize_tp(TransportParameters tp, std::span<const uint8_t> od_cid,
                  std::span<const uint8_t> scid) -> TransportParameters {
-    tp.original_destination_connection_id =
-        std::vector<uint8_t>(od_cid.begin(), od_cid.end());
-    tp.initial_source_connection_id =
-        std::vector<uint8_t>(scid.begin(), scid.end());
+    // The Listener pre-fills original_destination_connection_id on the
+    // Retry path (where the ODCID came out of the verified token, not
+    // from the current Initial's DCID).  Honor it if set; otherwise
+    // default to the caller-provided od_cid.
+    if (!tp.original_destination_connection_id) {
+        tp.original_destination_connection_id =
+            std::vector<uint8_t>(od_cid.begin(), od_cid.end());
+    }
+    if (!tp.initial_source_connection_id) {
+        tp.initial_source_connection_id =
+            std::vector<uint8_t>(scid.begin(), scid.end());
+    }
     return tp;
 }
 
@@ -116,6 +124,11 @@ auto Connection::on_datagram(std::span<const uint8_t> datagram) -> void {
         return;
     }
     last_activity_ = clock_fn_();
+    // RFC 9000 §8.1.2: counted bytes for anti-amplification are ALL
+    // received UDP payload bytes — including bytes that ultimately fail
+    // to decrypt.  Bump before per-packet processing so the send budget
+    // expands as soon as the datagram lands.
+    recv_bytes_total_ += datagram.size();
     std::size_t off = 0;
     while (off < datagram.size()) {
         if ((datagram[off] & 0x80U) != 0) {
@@ -227,6 +240,12 @@ auto Connection::process_long_packet(std::span<const uint8_t> datagram, std::siz
         sp.largest_recv_pn = pn;
     }
     sp.any_recv = true;
+    // RFC 9000 §8.1.2: successful decryption of a Handshake-protected
+    // packet proves the peer received our Initial response and thus
+    // owns this address — disable the anti-amp cap.
+    if (level == EncryptionLevel::Handshake) {
+        peer_address_validated_ = true;
+    }
 
     deliver_frames(level, {pkt.data() + header_len, pt_len});
     sp.acks.on_received(pn, true);
@@ -468,6 +487,20 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
     auto& sp = space(level);
     if (!sp.send_keys_ready) return false;
 
+    // RFC 9000 §8.1.2 anti-amplification: until the peer's address is
+    // validated, total sent bytes MUST NOT exceed 3× total received
+    // bytes.  Estimate the worst-case datagram we'd build at ~1500
+    // bytes (full path MTU); if that estimate would push us over, bail
+    // out without consuming any pending CRYPTO/STREAM bytes.  The send
+    // will fire again on the next received datagram (which bumps the
+    // budget) or the next on_timer tick.
+    if (!peer_address_validated_) {
+        constexpr uint64_t kMaxDatagramEstimate = 1500;
+        if (sent_bytes_unvalidated_ + kMaxDatagramEstimate > 3 * recv_bytes_total_) {
+            return false;
+        }
+    }
+
     // 1. Collect pending CRYPTO frames for this level.
     std::vector<CryptoFrame> crypto_pending;
     crypto_pending.swap(crypto_pending_[static_cast<std::size_t>(level)]);
@@ -539,6 +572,9 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
         sent_[static_cast<std::size_t>(level)].emplace(pn, std::move(rec));
         if (rec.ack_eliciting) {
             congestion_.on_packet_sent(rec.sent_at, datagram.size());
+        }
+        if (!peer_address_validated_) {
+            sent_bytes_unvalidated_ += datagram.size();
         }
         send_fn_({datagram.data(), datagram.size()});
         return true;
@@ -620,6 +656,9 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
 
     if (include_hs_done) sent_handshake_done_ = true;
 
+    if (!peer_address_validated_) {
+        sent_bytes_unvalidated_ += buf.size();
+    }
     send_fn_({buf.data(), buf.size()});
     return true;
 }

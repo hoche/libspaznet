@@ -118,9 +118,19 @@ class Listener {
 
   private:
     auto new_random_cid(std::vector<uint8_t>& out) -> void;
-    auto make_retry_token(std::span<const uint8_t> odcid,
-                          std::span<const uint8_t> peer_token_nonce)
+    // Build a Retry token binding the peer's source address to the
+    // pre-Retry DCID.  The peer must echo this token on the next
+    // Initial; we then re-verify the HMAC and that the address still
+    // matches.  Token layout:
+    //   nonce (16) || peer_addr_len (1) || peer_addr (peer_addr_len) ||
+    //   odcid_len (1) || odcid (odcid_len) || mac (16)
+    auto make_retry_token(std::span<const uint8_t> odcid, const PeerAddr& peer)
         -> std::vector<uint8_t>;
+    // Verify a Retry token presented in an Initial.  Returns true and
+    // fills `odcid_out` on success.  Mismatching addr, bad MAC, or
+    // truncated token all return false.
+    auto validate_retry_token(std::span<const uint8_t> token, const PeerAddr& peer,
+                              std::vector<uint8_t>& odcid_out) -> bool;
 
     Config cfg_;
     SendFn send_fn_;

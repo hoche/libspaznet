@@ -141,29 +141,41 @@ Ordered by priority.
 
 ### Cleanup we deferred but should land before anyone uses this
 
-- [ ] Delete the toy QUIC/HTTP/3 code
-  - `src/handlers/quic_handler.cpp`, `src/handlers/quic_server.cpp`,
-    `src/handlers/http3_handler.cpp`, plus their declarations in
-    `include/libspaznet/handlers/quic_handler.hpp`,
-    `include/libspaznet/handlers/quic_server.hpp`,
-    `include/libspaznet/handlers/http3_handler.hpp`. Remove the
-    `set_quic_handler`/`set_http3_handler` setters and the old
-    `QUICServerEngine` branch in `Server::receive_udp`. Also drop
-    `tests/unit/test_quic_handler.cpp`. ~900 lines.
-  - Keep `Server::set_quic_http3_service` (the new entry point).
+- [x] Delete the toy QUIC/HTTP/3 code
+  - Deleted `src/handlers/quic_handler.cpp`,
+    `src/handlers/quic_server.cpp`, `src/handlers/http3_handler.cpp`,
+    their public headers, and the obsolete tests
+    (`tests/unit/test_quic_handler.cpp`,
+    `tests/integration/test_quic_server.cpp`,
+    `tests/integration/test_http3_server.cpp`,
+    `tests/performance/test_quic_performance.cpp`).  Removed
+    `set_quic_handler` / `set_http3_handler` from `Server` and the
+    `QUICServerEngine` branch in `Server::receive_udp`.
+    `Server::set_quic_http3_service` is the only QUIC/HTTP/3 entry
+    point now.
 
-- [ ] Wire `Listener::Config::require_retry` into the dispatch path
-  - The flag exists, the Retry packet builder + RFC 9001 §A.4 KAT
-    pass, but `Listener::on_datagram` never branches on
-    `cfg_.require_retry`. With it off (the default), the server hands
-    out connection state to anyone who can synthesize a 1200-byte
-    Initial — DDoS-amplification fodder.
+- [x] Wire `Listener::Config::require_retry` into the dispatch path
+  - When `require_retry` is on, the listener now full-parses each
+    Initial; without a token it emits a Retry (containing a fresh
+    SCID and a peer-address-bound token) and creates no state.
+    Initials carrying a valid token are accepted, the OD-CID is
+    decoded out of the token, the connection is constructed with
+    `original_destination_connection_id` and
+    `retry_source_connection_id` pre-filled, and
+    `Connection::mark_peer_address_validated()` skips the anti-amp
+    cap.  Tokens are bound to the peer's IP+port via HMAC-SHA256
+    truncated to 128 bits over `nonce||addr_len||addr||odcid_len||
+    odcid`, so a replay from a different source fails validation.
 
-- [ ] Implement the 3× anti-amplification budget in `Connection`
-  - RFC 9000 §8.1.2. Until the peer's address is validated (Initial
-    ACKed or Retry token verified), the server MUST cap total bytes
-    sent at 3× total bytes received. Today the budget isn't tracked
-    at all.
+- [x] Implement the 3× anti-amplification budget in `Connection`
+  - RFC 9000 §8.1.2.  `Connection` now tracks `recv_bytes_total_`
+    (bumped on every received datagram regardless of decrypt
+    success) and `sent_bytes_unvalidated_`.  `build_and_send` bails
+    early when `sent + 1500 > 3 × recv` while still unvalidated.
+    The cap is released either by `mark_peer_address_validated()`
+    (called by Listener after Retry token verification) or
+    automatically when a Handshake-protected packet decrypts (proof
+    the peer received our Initial response).
 
 ### Spec MUSTs we deferred
 

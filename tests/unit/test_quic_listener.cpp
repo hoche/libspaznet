@@ -182,3 +182,194 @@ TEST(QuicListener, UnsupportedVersionTriggersVersionNegotiation) {
     EXPECT_TRUE(std::equal(scid.begin(), scid.end(), outbox[0].begin() + 11));
     EXPECT_EQ(listener.connection_count(), 0U); // no Connection created
 }
+
+namespace {
+
+// Build a syntactically-valid v1 Initial we can hand to the listener
+// for require_retry path testing.  The payload bytes won't decrypt, but
+// the listener inspects the Token field before decryption.
+auto build_initial_with_token(std::span<const uint8_t> dcid,
+                              std::span<const uint8_t> scid,
+                              std::span<const uint8_t> token) -> std::vector<uint8_t> {
+    std::vector<uint8_t> dg;
+    dg.push_back(0xC0); // long + fixed + Initial(0) + pn_len-1 = 0
+    dg.push_back(0x00); dg.push_back(0x00); dg.push_back(0x00); dg.push_back(0x01);
+    dg.push_back(static_cast<uint8_t>(dcid.size()));
+    dg.insert(dg.end(), dcid.begin(), dcid.end());
+    dg.push_back(static_cast<uint8_t>(scid.size()));
+    dg.insert(dg.end(), scid.begin(), scid.end());
+    // Token length (varint) + token bytes.
+    VarInt::append(dg, token.size());
+    dg.insert(dg.end(), token.begin(), token.end());
+    // Length (varint, 2-byte form) covering PN(1) + payload + AEAD tag(16).
+    // Pad payload so the total datagram is >=1200 bytes (RFC 9000 §14.1
+    // — clients MUST pad to 1200; we exercise the realistic shape).
+    const std::size_t header_through_token = dg.size();
+    const std::size_t pn_len = 1;
+    const std::size_t tag_len = 16;
+    const std::size_t min_total = 1200;
+    // After length(2) + PN + payload + tag must reach min_total.
+    const std::size_t after_length = min_total - header_through_token - 2;
+    const std::size_t payload_plus_tag = after_length - pn_len;
+    const std::size_t length_field = pn_len + payload_plus_tag;
+    // 2-byte varint header: high two bits = 01.
+    dg.push_back(static_cast<uint8_t>(0x40 | ((length_field >> 8) & 0x3FU)));
+    dg.push_back(static_cast<uint8_t>(length_field & 0xFFU));
+    dg.push_back(0x00); // PN
+    dg.resize(min_total, 0x00); // payload + space for tag
+    return dg;
+}
+
+auto make_v4_peer(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint16_t port) -> PeerAddr {
+    PeerAddr p{};
+    p.length = sizeof(sockaddr_in);
+    auto* sin = reinterpret_cast<sockaddr_in*>(&p.storage);
+    sin->sin_family = AF_INET;
+    sin->sin_port = htons(port);
+    uint8_t bytes[4] = {a, b, c, d};
+    std::memcpy(&sin->sin_addr, bytes, 4);
+    return p;
+}
+
+} // namespace
+
+TEST(QuicRequireRetry, InitialWithoutTokenEmitsRetryAndCreatesNoConnection) {
+    auto [cert, key] = make_self_signed();
+    TlsServerConfig tcfg{cert, key, {"h3"}};
+    auto tls_ctx = TlsContext::make_server(tcfg);
+    ASSERT_NE(tls_ctx, nullptr);
+
+    Listener::Config cfg;
+    cfg.tls_ctx = tls_ctx;
+    cfg.server_tp.initial_max_data = 1 << 20;
+    cfg.server_tp.initial_max_streams_bidi = 4;
+    cfg.random_seed = 0xABCD1234ULL;
+    cfg.require_retry = true;
+
+    std::vector<std::vector<uint8_t>> outbox;
+    Listener listener(cfg,
+                      [&](const PeerAddr&, std::span<const uint8_t> dg) {
+                          outbox.emplace_back(dg.begin(), dg.end());
+                      });
+
+    auto peer = make_v4_peer(127, 0, 0, 1, 12345);
+    std::vector<uint8_t> dcid = {0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08};
+    std::vector<uint8_t> scid = {0x11, 0x22, 0x33, 0x44};
+    auto dg = build_initial_with_token({dcid.data(), dcid.size()},
+                                       {scid.data(), scid.size()}, {});
+    listener.on_datagram(peer, {dg.data(), dg.size()});
+
+    ASSERT_EQ(outbox.size(), 1U);
+    // Retry packet: long+fixed+type=Retry → top nibble bits set, type==3
+    // (lives in bits 4-5).  Our build_retry_packet emits 0xFF.
+    EXPECT_EQ((outbox[0][0] & 0xF0U), 0xF0U);
+    EXPECT_EQ(listener.connection_count(), 0U);
+}
+
+TEST(QuicRequireRetry, ValidTokenCreatesValidatedConnection) {
+    auto [cert, key] = make_self_signed();
+    TlsServerConfig tcfg{cert, key, {"h3"}};
+    auto tls_ctx = TlsContext::make_server(tcfg);
+    ASSERT_NE(tls_ctx, nullptr);
+
+    Listener::Config cfg;
+    cfg.tls_ctx = tls_ctx;
+    cfg.server_tp.initial_max_data = 1 << 20;
+    cfg.server_tp.initial_max_streams_bidi = 4;
+    cfg.random_seed = 0xABCD1234ULL;
+    cfg.require_retry = true;
+
+    std::vector<std::vector<uint8_t>> outbox;
+    Listener listener(cfg,
+                      [&](const PeerAddr&, std::span<const uint8_t> dg) {
+                          outbox.emplace_back(dg.begin(), dg.end());
+                      });
+
+    auto peer = make_v4_peer(10, 1, 2, 3, 4444);
+    std::vector<uint8_t> original_dcid = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02};
+    std::vector<uint8_t> client_scid = {0x11, 0x22, 0x33, 0x44};
+
+    // Step 1: first Initial — no token — listener emits Retry.
+    auto dg1 = build_initial_with_token({original_dcid.data(), original_dcid.size()},
+                                        {client_scid.data(), client_scid.size()}, {});
+    listener.on_datagram(peer, {dg1.data(), dg1.size()});
+    ASSERT_EQ(outbox.size(), 1U);
+    auto retry = outbox.front();
+    outbox.clear();
+    ASSERT_EQ(listener.connection_count(), 0U);
+
+    // Step 2: extract the Retry's SCID (becomes new DCID) + token.
+    // Layout: 1 byte | 4 bytes version | dcid_len | dcid | scid_len | scid | token | 16-byte tag
+    ASSERT_GE(retry.size(), 1U + 4U + 1U + 1U + 16U);
+    std::size_t off = 5;
+    const std::size_t r_dcid_len = retry[off++];
+    off += r_dcid_len;
+    const std::size_t r_scid_len = retry[off++];
+    std::vector<uint8_t> retry_scid(retry.begin() + static_cast<std::ptrdiff_t>(off),
+                                    retry.begin() + static_cast<std::ptrdiff_t>(off + r_scid_len));
+    off += r_scid_len;
+    std::vector<uint8_t> token(retry.begin() + static_cast<std::ptrdiff_t>(off),
+                               retry.end() - 16); // last 16 bytes are integrity tag
+
+    // Step 3: client sends new Initial with DCID = retry_scid and the token.
+    auto dg2 = build_initial_with_token({retry_scid.data(), retry_scid.size()},
+                                        {client_scid.data(), client_scid.size()},
+                                        {token.data(), token.size()});
+    listener.on_datagram(peer, {dg2.data(), dg2.size()});
+    EXPECT_EQ(listener.connection_count(), 1U);
+    auto* conn = listener.find_connection({retry_scid.data(), retry_scid.size()});
+    ASSERT_NE(conn, nullptr);
+    EXPECT_TRUE(conn->peer_address_validated());
+}
+
+TEST(QuicRequireRetry, TokenFromDifferentPeerIsRejected) {
+    auto [cert, key] = make_self_signed();
+    TlsServerConfig tcfg{cert, key, {"h3"}};
+    auto tls_ctx = TlsContext::make_server(tcfg);
+    ASSERT_NE(tls_ctx, nullptr);
+
+    Listener::Config cfg;
+    cfg.tls_ctx = tls_ctx;
+    cfg.server_tp.initial_max_data = 1 << 20;
+    cfg.server_tp.initial_max_streams_bidi = 4;
+    cfg.random_seed = 0xFEEDFACEULL;
+    cfg.require_retry = true;
+
+    std::vector<std::vector<uint8_t>> outbox;
+    Listener listener(cfg,
+                      [&](const PeerAddr&, std::span<const uint8_t> dg) {
+                          outbox.emplace_back(dg.begin(), dg.end());
+                      });
+
+    auto peer_legit = make_v4_peer(10, 1, 2, 3, 4444);
+    auto peer_attacker = make_v4_peer(10, 1, 2, 4, 4444);
+    std::vector<uint8_t> dcid = {0xaa, 0xbb, 0xcc, 0xdd};
+    std::vector<uint8_t> scid = {0x11, 0x22, 0x33, 0x44};
+
+    // Issue Retry to legitimate peer.
+    auto dg1 = build_initial_with_token({dcid.data(), dcid.size()},
+                                        {scid.data(), scid.size()}, {});
+    listener.on_datagram(peer_legit, {dg1.data(), dg1.size()});
+    ASSERT_EQ(outbox.size(), 1U);
+    auto retry = std::move(outbox.front());
+    outbox.clear();
+
+    // Extract the SCID + token from the Retry packet.
+    std::size_t off = 5;
+    const std::size_t r_dcid_len = retry[off++];
+    off += r_dcid_len;
+    const std::size_t r_scid_len = retry[off++];
+    std::vector<uint8_t> retry_scid(retry.begin() + static_cast<std::ptrdiff_t>(off),
+                                    retry.begin() + static_cast<std::ptrdiff_t>(off + r_scid_len));
+    off += r_scid_len;
+    std::vector<uint8_t> token(retry.begin() + static_cast<std::ptrdiff_t>(off),
+                               retry.end() - 16);
+
+    // Attacker replays the token from a DIFFERENT peer address.
+    auto dg2 = build_initial_with_token({retry_scid.data(), retry_scid.size()},
+                                        {scid.data(), scid.size()},
+                                        {token.data(), token.size()});
+    listener.on_datagram(peer_attacker, {dg2.data(), dg2.size()});
+    EXPECT_EQ(listener.connection_count(), 0U);
+    EXPECT_TRUE(outbox.empty());
+}

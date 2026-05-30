@@ -25,8 +25,6 @@ class UDPHandler;
 class HTTPHandler;
 class HTTP2Handler;
 class WebSocketHandler;
-class QUICHandler;
-class HTTP3Handler;
 #ifdef SPAZNET_HAS_QUIC
 namespace http3 {
 class QuicHttp3Service;
@@ -122,9 +120,7 @@ class Socket {
 
 // Include handlers after Socket is defined
 #include <libspaznet/handlers/http2_handler.hpp>
-#include <libspaznet/handlers/http3_handler.hpp>
 #include <libspaznet/handlers/http_handler.hpp>
-#include <libspaznet/handlers/quic_handler.hpp>
 #include <libspaznet/handlers/udp_handler.hpp>
 #include <libspaznet/handlers/websocket_handler.hpp>
 
@@ -138,8 +134,6 @@ class Server {
     std::unique_ptr<HTTPHandler> http_handler_;
     std::unique_ptr<HTTP2Handler> http2_handler_;
     std::unique_ptr<WebSocketHandler> websocket_handler_;
-    std::unique_ptr<QUICHandler> quic_handler_;
-    std::unique_ptr<HTTP3Handler> http3_handler_;
 #ifdef SPAZNET_HAS_QUIC
     std::unique_ptr<http3::QuicHttp3Service> quic_http3_service_;
 #endif
@@ -178,16 +172,12 @@ class Server {
     void set_http_handler(std::unique_ptr<HTTPHandler> handler);
     void set_http2_handler(std::unique_ptr<HTTP2Handler> handler);
     void set_websocket_handler(std::unique_ptr<WebSocketHandler> handler);
-    void set_quic_handler(std::unique_ptr<QUICHandler> handler);
-    void set_http3_handler(std::unique_ptr<HTTP3Handler> handler);
-
 #ifdef SPAZNET_HAS_QUIC
-    // New full-stack QUIC v1 + HTTP/3 wiring (replaces the toy
-    // set_quic_handler / set_http3_handler path). The service object
-    // owns the Listener + per-connection Http3Server instances; the
-    // server just routes UDP datagrams to it and drives its timer.
-    // Only available when libspaznet was built with -DSPAZNET_BUILD_QUIC=ON
-    // (the default; requires OpenSSL 3.5+).
+    // QUIC v1 + HTTP/3 entry point. The service object owns the
+    // Listener + per-connection Http3Server instances; the Server just
+    // routes UDP datagrams to it and drives its timer.  Only available
+    // when libspaznet was built with -DSPAZNET_BUILD_QUIC=ON (default;
+    // requires OpenSSL 3.5+).
     void set_quic_http3_service(std::unique_ptr<http3::QuicHttp3Service> service);
 #endif
 

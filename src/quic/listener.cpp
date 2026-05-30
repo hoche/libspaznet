@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <cstring>
+#include <netinet/in.h>
 #include <random>
 #include <stdexcept>
 
 #include <libspaznet/quic/crypto.hpp>
+#include <libspaznet/quic/packet.hpp>
 #include <libspaznet/quic/varint.hpp>
 
 namespace spaznet {
@@ -140,20 +142,98 @@ auto Listener::new_random_cid(std::vector<uint8_t>& out) -> void {
     prng_state_ = s;
 }
 
-auto Listener::make_retry_token(std::span<const uint8_t> odcid,
-                                std::span<const uint8_t> peer_token_nonce)
+namespace {
+
+// Serialize the peer's network-level address (IP + port) into a compact
+// byte string.  IPv4: 4 bytes addr + 2 bytes port = 6.  IPv6: 16 bytes
+// addr + 2 bytes port = 18.  Anything else returns empty (token
+// minting / verification will fail).
+auto encode_peer_addr(const PeerAddr& peer, std::vector<uint8_t>& out) -> bool {
+    out.clear();
+    if (peer.length >= sizeof(sockaddr_in) && peer.storage.ss_family == AF_INET) {
+        const auto* a = reinterpret_cast<const sockaddr_in*>(&peer.storage);
+        const auto* ip = reinterpret_cast<const uint8_t*>(&a->sin_addr);
+        out.insert(out.end(), ip, ip + 4);
+        const uint16_t port = a->sin_port; // network order — opaque to us
+        out.push_back(static_cast<uint8_t>(port & 0xFFU));
+        out.push_back(static_cast<uint8_t>((port >> 8) & 0xFFU));
+        return true;
+    }
+    if (peer.length >= sizeof(sockaddr_in6) && peer.storage.ss_family == AF_INET6) {
+        const auto* a6 = reinterpret_cast<const sockaddr_in6*>(&peer.storage);
+        const auto* ip = reinterpret_cast<const uint8_t*>(&a6->sin6_addr);
+        out.insert(out.end(), ip, ip + 16);
+        const uint16_t port = a6->sin6_port;
+        out.push_back(static_cast<uint8_t>(port & 0xFFU));
+        out.push_back(static_cast<uint8_t>((port >> 8) & 0xFFU));
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
+auto Listener::make_retry_token(std::span<const uint8_t> odcid, const PeerAddr& peer)
     -> std::vector<uint8_t> {
-    // Token format: peer_nonce (16) || odcid_len (1) || odcid || HMAC-trunc
-    // The HMAC is computed with token_key_; we use a tiny ad-hoc MAC
-    // (HKDF-Extract repurposed as HMAC-SHA256 via the existing helper).
     std::vector<uint8_t> token;
-    token.insert(token.end(), peer_token_nonce.begin(), peer_token_nonce.end());
+    // 16-byte nonce so repeated tokens for the same peer differ.
+    std::array<uint8_t, 16> nonce{};
+    for (auto& b : nonce) {
+        prng_state_ ^= prng_state_ << 13;
+        prng_state_ ^= prng_state_ >> 7;
+        prng_state_ ^= prng_state_ << 17;
+        b = static_cast<uint8_t>(prng_state_ & 0xFFU);
+    }
+    token.insert(token.end(), nonce.begin(), nonce.end());
+    // Peer address.
+    std::vector<uint8_t> addr_bytes;
+    if (!encode_peer_addr(peer, addr_bytes)) {
+        return {};
+    }
+    token.push_back(static_cast<uint8_t>(addr_bytes.size()));
+    token.insert(token.end(), addr_bytes.begin(), addr_bytes.end());
+    // ODCID.
     token.push_back(static_cast<uint8_t>(odcid.size()));
     token.insert(token.end(), odcid.begin(), odcid.end());
+    // MAC over everything so far.
     auto mac = hkdf_extract(Hash::Sha256, {token_key_.data(), token_key_.size()},
                             {token.data(), token.size()});
     token.insert(token.end(), mac.begin(), mac.begin() + 16);
     return token;
+}
+
+auto Listener::validate_retry_token(std::span<const uint8_t> token, const PeerAddr& peer,
+                                    std::vector<uint8_t>& odcid_out) -> bool {
+    odcid_out.clear();
+    constexpr std::size_t kNonceLen = 16;
+    constexpr std::size_t kMacLen = 16;
+    if (token.size() < kNonceLen + 1 + kMacLen) return false;
+    std::size_t off = kNonceLen;
+    const std::size_t addr_len = token[off++];
+    if (off + addr_len + 1 > token.size()) return false;
+    std::span<const uint8_t> token_addr{token.data() + off, addr_len};
+    off += addr_len;
+    const std::size_t odcid_len = token[off++];
+    if (odcid_len > kMaxConnectionIdLen) return false;
+    if (off + odcid_len + kMacLen != token.size()) return false;
+    std::span<const uint8_t> token_odcid{token.data() + off, odcid_len};
+    off += odcid_len;
+    std::span<const uint8_t> token_mac{token.data() + off, kMacLen};
+    // Recompute MAC and constant-time compare.
+    auto mac = hkdf_extract(Hash::Sha256, {token_key_.data(), token_key_.size()},
+                            {token.data(), kNonceLen + 1 + addr_len + 1 + odcid_len});
+    uint8_t diff = 0;
+    for (std::size_t i = 0; i < kMacLen; ++i) {
+        diff |= static_cast<uint8_t>(mac[i] ^ token_mac[i]);
+    }
+    if (diff != 0) return false;
+    // Compare embedded address against current peer.
+    std::vector<uint8_t> current_addr;
+    if (!encode_peer_addr(peer, current_addr)) return false;
+    if (current_addr.size() != addr_len) return false;
+    if (std::memcmp(current_addr.data(), token_addr.data(), addr_len) != 0) return false;
+    odcid_out.assign(token_odcid.begin(), token_odcid.end());
+    return true;
 }
 
 namespace {
@@ -218,17 +298,82 @@ auto Listener::on_datagram(const PeerAddr& peer, std::span<const uint8_t> dg) ->
             if (type != static_cast<uint8_t>(LongType::Initial)) {
                 return; // stateless drop
             }
-            // Pick a server SCID and create a Connection. The client's
-            // chosen DCID becomes our OD-CID (we use it for Initial-key
-            // derivation inside Connection).
+
+            // For both Retry validation and OD-CID transport param
+            // pre-fill we need the Initial's full parse (peek_long only
+            // returns version/dcid/scid).  Run it now.
+            LongHeader full{};
+            std::size_t cur = 0;
+            if (!parse_long_header(dg, cur, full) || full.type != LongType::Initial) {
+                return;
+            }
+
+            // Validated-via-Retry status + the OD-CID we should report
+            // in our transport parameters.  Without Retry, OD-CID is
+            // just the DCID in the current Initial.  With Retry, it
+            // comes out of the token we previously minted.
+            bool validated_by_token = false;
+            std::vector<uint8_t> od_cid_for_tp(dcid);
+            std::vector<uint8_t> retry_scid_for_tp; // empty unless Retry
+
+            if (cfg_.require_retry) {
+                if (full.token.empty()) {
+                    // No token — send a fresh Retry and drop.  Pick a
+                    // new SCID; encode the client's original DCID in
+                    // the token bound to its source address.
+                    std::vector<uint8_t> retry_scid;
+                    new_random_cid(retry_scid);
+                    auto token = make_retry_token(
+                        {dcid.data(), dcid.size()}, peer);
+                    if (token.empty()) return;
+                    auto retry = build_retry_packet(
+                        {scid.data(), scid.size()},
+                        {retry_scid.data(), retry_scid.size()},
+                        {token.data(), token.size()},
+                        {dcid.data(), dcid.size()});
+                    send_fn_(peer, {retry.data(), retry.size()});
+                    return;
+                }
+                // Token present — validate.  Reject on any failure
+                // (mismatched MAC or peer address).  We could re-send
+                // Retry, but dropping is RFC-conformant and avoids an
+                // infinite Retry loop against a confused or malicious
+                // client.
+                std::vector<uint8_t> decoded_odcid;
+                if (!validate_retry_token({full.token.data(), full.token.size()},
+                                          peer, decoded_odcid)) {
+                    return;
+                }
+                validated_by_token = true;
+                od_cid_for_tp = std::move(decoded_odcid);
+                // The DCID in this post-Retry Initial is the Retry SCID
+                // we issued earlier; we'll reuse it as our SCID for
+                // this Connection (so the peer's view of our CID stays
+                // stable) and report it in retry_source_connection_id.
+                retry_scid_for_tp = dcid;
+            }
+
+            // Pick a server SCID.  Under Retry we reuse the DCID from
+            // the post-Retry Initial (= the Retry-SCID the client
+            // already knows).  Without Retry we generate a fresh one.
             std::vector<uint8_t> server_scid;
-            new_random_cid(server_scid);
-            // Capture the SCID in the per-connection send shim so the
-            // outer send_fn can route by the most-recent peer address.
+            if (validated_by_token) {
+                server_scid = dcid;
+            } else {
+                new_random_cid(server_scid);
+            }
+
+            // Pre-fill transport parameters so finalize_tp in the
+            // Connection ctor doesn't overwrite our OD-CID (Retry case)
+            // and so retry_source_connection_id is emitted when needed.
+            TransportParameters tp = cfg_.server_tp;
+            tp.original_destination_connection_id = od_cid_for_tp;
+            if (!retry_scid_for_tp.empty()) {
+                tp.retry_source_connection_id = std::move(retry_scid_for_tp);
+            }
+
             ConnState state;
             state.last_peer = peer;
-            auto* scid_key_ptr = &server_scid; // for the lambda — replaced below
-            (void)scid_key_ptr;
             auto* self = this;
             auto scid_copy = server_scid;
             auto send_fn_for_conn =
@@ -241,8 +386,15 @@ auto Listener::on_datagram(const PeerAddr& peer, std::span<const uint8_t> dg) ->
                 cfg_.tls_ctx, std::span<const uint8_t>{dcid.data(), dcid.size()},
                 std::span<const uint8_t>{scid.data(), scid.size()},
                 std::span<const uint8_t>{server_scid.data(), server_scid.size()},
-                cfg_.server_tp, send_fn_for_conn);
+                std::move(tp), send_fn_for_conn);
             auto* raw = state.conn.get();
+            if (validated_by_token) {
+                raw->mark_peer_address_validated();
+            } else {
+                // Without Retry, the Connection's anti-amp budget gates
+                // outbound bytes until the first Handshake packet
+                // decrypts — see Connection::build_and_send.
+            }
             connections_aliases_[dcid] = server_scid;
             connections_.emplace(server_scid, std::move(state));
             raw->on_datagram(dg);

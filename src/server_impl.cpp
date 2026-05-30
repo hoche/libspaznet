@@ -5,7 +5,6 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
-#include <libspaznet/handlers/quic_server.hpp>
 #ifdef SPAZNET_HAS_QUIC
 #include <libspaznet/http3/service.hpp>
 #endif
@@ -507,14 +506,6 @@ void Server::set_websocket_handler(std::unique_ptr<WebSocketHandler> handler) {
     websocket_handler_ = std::move(handler);
 }
 
-void Server::set_quic_handler(std::unique_ptr<QUICHandler> handler) {
-    quic_handler_ = std::move(handler);
-}
-
-void Server::set_http3_handler(std::unique_ptr<HTTP3Handler> handler) {
-    http3_handler_ = std::move(handler);
-}
-
 #ifdef SPAZNET_HAS_QUIC
 void Server::set_quic_http3_service(std::unique_ptr<http3::QuicHttp3Service> service) {
     quic_http3_service_ = std::move(service);
@@ -652,10 +643,6 @@ Task Server::receive_udp(int udp_fd) {
     };
 
     Socket udp_socket(udp_fd, io_context_.get(), /*owns_fd=*/false);
-    std::optional<QUICServerEngine> quic_engine;
-    if (quic_handler_ || http3_handler_) {
-        quic_engine.emplace(quic_handler_.get(), http3_handler_.get());
-    }
 
     while (running_.load(std::memory_order_acquire)) {
         std::vector<uint8_t> buffer(64 * 1024);
@@ -702,13 +689,8 @@ Task Server::receive_udp(int udp_fd) {
             co_await udp_handler_->handle_packet(pkt, udp_socket);
         }
 
-        if (quic_engine) {
-            co_await quic_engine->handle_datagram(udp_fd, addr, addr_len, std::move(buffer));
-        }
 #ifdef SPAZNET_HAS_QUIC
-        else if (quic_http3_service_) {
-            // New full stack: hand the raw datagram to the service,
-            // which drives the Listener + Http3Server pipeline.
+        if (quic_http3_service_) {
             spaznet::quic::PeerAddr peer{};
             peer.length = addr_len;
             std::memcpy(&peer.storage, &addr, addr_len);
