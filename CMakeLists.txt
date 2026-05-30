@@ -40,11 +40,24 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
-# OpenSSL 3.5+ provides the SSL_set_quic_tls_cbs interface that the
-# QUIC stack uses to drive the TLS 1.3 handshake (RFC 9001). Everything
-# above the TLS layer (transport, recovery, HTTP/3, QPACK) is implemented
-# in this repo with no other third-party dependencies.
-find_package(OpenSSL 3.5 REQUIRED)
+# The QUIC v1 + HTTP/3 stack needs OpenSSL 3.5+ for the
+# SSL_set_quic_tls_cbs interface (RFC 9001). Linux distros / CI
+# runners commonly ship 3.0.x, which is too old; this option lets
+# those environments build the rest of the library (UDP / HTTP/1.1 /
+# HTTP/2 / WebSocket) without OpenSSL at all. Default ON because
+# the QUIC stack is the headline feature; turn OFF (or accept the
+# auto-disable below) when OpenSSL 3.5+ isn't available.
+option(SPAZNET_BUILD_QUIC "Build the QUIC v1 + HTTP/3 stack (requires OpenSSL 3.5+)" ON)
+if(SPAZNET_BUILD_QUIC)
+    find_package(OpenSSL 3.5 QUIET)
+    if(NOT OpenSSL_FOUND)
+        message(WARNING
+            "OpenSSL 3.5+ not found; disabling QUIC + HTTP/3 build. "
+            "Pass -DSPAZNET_BUILD_QUIC=OFF to silence this warning, "
+            "or install OpenSSL 3.5+ and set OPENSSL_ROOT_DIR.")
+        set(SPAZNET_BUILD_QUIC OFF CACHE BOOL "" FORCE)
+    endif()
+endif()
 
 # CMake helpers for install(EXPORT) below.
 include(GNUInstallDirs)
@@ -66,6 +79,7 @@ else()
 endif()
 
 # ---- Source / header lists ----------------------------------------------
+# Core sources — always built; no OpenSSL dependency.
 set(SOURCES
     src/platform/io_context.cpp
     src/platform/platform_io.cpp
@@ -76,29 +90,35 @@ set(SOURCES
     src/handlers/quic_handler.cpp
     src/handlers/quic_server.cpp
     src/handlers/http3_handler.cpp
-    src/quic/varint.cpp
-    src/quic/crypto.cpp
-    src/quic/packet.cpp
-    src/quic/frame.cpp
-    src/quic/transport_params.cpp
-    src/quic/tls.cpp
-    src/quic/pn_space.cpp
-    src/quic/stream.cpp
-    src/quic/recovery.cpp
-    src/quic/congestion.cpp
-    src/quic/connection.cpp
-    src/quic/listener.cpp
-    src/http3/huffman.cpp
-    src/http3/qpack.cpp
-    src/http3/h3frame.cpp
-    src/http3/server.cpp
-    src/http3/service.cpp
     src/utils/string_utils.cpp
     src/utils/number_utils.cpp
     src/utils/binary_utils.cpp
     src/utils/header_utils.cpp
     src/server_impl.cpp
 )
+
+# QUIC v1 + HTTP/3 sources — conditionally built; require OpenSSL 3.5+.
+if(SPAZNET_BUILD_QUIC)
+    list(APPEND SOURCES
+        src/quic/varint.cpp
+        src/quic/crypto.cpp
+        src/quic/packet.cpp
+        src/quic/frame.cpp
+        src/quic/transport_params.cpp
+        src/quic/tls.cpp
+        src/quic/pn_space.cpp
+        src/quic/stream.cpp
+        src/quic/recovery.cpp
+        src/quic/congestion.cpp
+        src/quic/connection.cpp
+        src/quic/listener.cpp
+        src/http3/huffman.cpp
+        src/http3/qpack.cpp
+        src/http3/h3frame.cpp
+        src/http3/server.cpp
+        src/http3/service.cpp
+    )
+endif()
 
 set(HEADERS
     include/libspaznet/io_context.hpp
@@ -153,7 +173,11 @@ target_include_directories(spaznet
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-target_link_libraries(spaznet PUBLIC Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(spaznet PUBLIC Threads::Threads)
+if(SPAZNET_BUILD_QUIC)
+    target_link_libraries(spaznet PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(spaznet PUBLIC SPAZNET_HAS_QUIC)
+endif()
 
 # Platform-specific compile defs.
 if(USE_EPOLL)
@@ -239,13 +263,19 @@ install(EXPORT spaznetTargets
 )
 
 # Generate a config file that pulls in spaznetTargets.cmake and re-runs
-# find_package(Threads) (so downstream sees the same pthread linkage).
+# find_package(Threads) (so downstream sees the same pthread linkage),
+# plus OpenSSL when QUIC was built in.
+if(SPAZNET_BUILD_QUIC)
+    set(SPAZNET_FIND_DEPENDENCY_OPENSSL "find_dependency(OpenSSL 3.5)")
+else()
+    set(SPAZNET_FIND_DEPENDENCY_OPENSSL "")
+endif()
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/spaznetConfig.cmake.in"
 "@PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
-find_dependency(OpenSSL 3.5)
+@SPAZNET_FIND_DEPENDENCY_OPENSSL@
 
 include(\"\${CMAKE_CURRENT_LIST_DIR}/spaznetTargets.cmake\")
 
@@ -294,7 +324,7 @@ foreach(gtest_target gtest gtest_main gmock gmock_main)
     endif()
 endforeach()
 
-add_executable(test_unit
+set(SPAZNET_UNIT_TEST_SOURCES
     tests/test_main.cpp
     tests/unit/test_task_queue.cpp
     tests/unit/test_platform_io.cpp
@@ -304,20 +334,25 @@ add_executable(test_unit
     tests/unit/test_websocket_handler.cpp
     tests/unit/test_http2_handler.cpp
     tests/unit/test_quic_handler.cpp
-    tests/unit/test_quic_phase1.cpp
-    tests/unit/test_quic_frame.cpp
-    tests/unit/test_quic_tls.cpp
-    tests/unit/test_quic_phase4.cpp
-    tests/unit/test_quic_connection.cpp
-    tests/unit/test_quic_listener.cpp
-    tests/unit/test_http3_huffman.cpp
-    tests/unit/test_http3_qpack.cpp
-    tests/unit/test_http3_frame.cpp
-    tests/unit/test_http3_end_to_end.cpp
     tests/unit/test_rfc9112_parser.cpp
     tests/unit/test_rfc9113_parser.cpp
     tests/unit/test_logger.cpp
 )
+if(SPAZNET_BUILD_QUIC)
+    list(APPEND SPAZNET_UNIT_TEST_SOURCES
+        tests/unit/test_quic_phase1.cpp
+        tests/unit/test_quic_frame.cpp
+        tests/unit/test_quic_tls.cpp
+        tests/unit/test_quic_phase4.cpp
+        tests/unit/test_quic_connection.cpp
+        tests/unit/test_quic_listener.cpp
+        tests/unit/test_http3_huffman.cpp
+        tests/unit/test_http3_qpack.cpp
+        tests/unit/test_http3_frame.cpp
+        tests/unit/test_http3_end_to_end.cpp
+    )
+endif()
+add_executable(test_unit ${SPAZNET_UNIT_TEST_SOURCES})
 target_link_libraries(test_unit PRIVATE spaznet GTest::gtest GTest::gmock)
 spaznet_apply_test_warnings(test_unit)
 
@@ -351,11 +386,13 @@ add_executable(test_performance
 target_link_libraries(test_performance PRIVATE spaznet GTest::gtest GTest::gmock)
 spaznet_apply_test_warnings(test_performance)
 
-add_executable(bench_quic_steady_state
-    tests/performance/bench_quic_steady_state.cpp
-)
-target_link_libraries(bench_quic_steady_state PRIVATE spaznet OpenSSL::SSL OpenSSL::Crypto)
-spaznet_apply_test_warnings(bench_quic_steady_state)
+if(SPAZNET_BUILD_QUIC)
+    add_executable(bench_quic_steady_state
+        tests/performance/bench_quic_steady_state.cpp
+    )
+    target_link_libraries(bench_quic_steady_state PRIVATE spaznet OpenSSL::SSL OpenSSL::Crypto)
+    spaznet_apply_test_warnings(bench_quic_steady_state)
+endif()
 
 add_executable(bench_thread_modes
     tests/performance/bench_thread_modes.cpp

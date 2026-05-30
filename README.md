@@ -255,10 +255,18 @@ For detailed information about the coroutine execution model, thread scheduling,
 ## Requirements
 
 - C++20 compiler with `<format>` support: **GCC 13.1+** or **Clang 17+**
-  (with libstdc++ from gcc 13+, or libc++). The QUIC stack also requires
-  **OpenSSL 3.5+** for the `SSL_set_quic_tls_cbs` interface.
+  (with libstdc++ from gcc 13+, or libc++).
 - CMake 3.20+
 - Make (optional, for convenience targets)
+- **OpenSSL 3.5+** — only required when building the QUIC v1 + HTTP/3
+  stack. The CMake option `SPAZNET_BUILD_QUIC` (default `ON`) gates this:
+  if OpenSSL 3.5+ isn't available, CMake prints a warning and disables
+  the QUIC build automatically; the rest of the library (UDP, HTTP/1.1,
+  HTTP/2, WebSocket) still builds with no OpenSSL dependency. To turn
+  it off explicitly:
+  ```
+  cmake -B build -DSPAZNET_BUILD_QUIC=OFF
+  ```
 
 If your distribution ships an older gcc, `apt install g++-13` and
 configure with `-DCMAKE_CXX_COMPILER=g++-13`. CMake checks for `<format>`
