@@ -168,6 +168,7 @@ void IOContext::run() {
                 if (!task.done()) {
                     task.resume();
                 }
+                drain_pending_resumes();
             }
         }
     }
@@ -198,6 +199,7 @@ void IOContext::schedule(Task task) {
     if (num_threads_ == 0) {
         if (task.handle && !task.done()) {
             task.resume();
+            drain_pending_resumes();
         }
         return;
     }
@@ -227,6 +229,10 @@ void IOContext::worker_thread(std::size_t queue_index) {
             if (!task.done()) {
                 task.resume();
             }
+            // Drain any continuations deferred by resume_with_depth_bound
+            // so a deep synchronous chain that exceeded the threshold
+            // makes forward progress before the next dequeue.
+            drain_pending_resumes();
         } else {
             // No work, yield
             std::this_thread::yield();

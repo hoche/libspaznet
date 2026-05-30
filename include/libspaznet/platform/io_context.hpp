@@ -28,6 +28,71 @@ struct CoroutineControlBlock;
 void add_ref_coroutine_control_block(CoroutineControlBlock* cb) noexcept;
 void release_coroutine_control_block(CoroutineControlBlock* cb) noexcept;
 
+// Recursion-bounding for synchronous coroutine resume chains. A long
+// keep-alive HTTP connection with buffered data exercises a pattern
+// where every co_await completes synchronously (recv returned data,
+// http handler ran in-place, send fit the kernel buffer), so every
+// FinalAwaiter/Task-Awaiter does cont.resume() inline. With no
+// suspend points the stack grows by one frame per await — 1000
+// iterations easily overflows the default macOS pthread stack
+// (~512 KiB). ASan catches it as a stack-overflow in
+// test_performance's ThroughputTest.
+//
+// The fix: when the synchronous chain reaches a depth threshold, the
+// next inline-resume gets deferred onto a thread-local queue instead.
+// When the outermost resume returns to the worker, the queue is
+// drained — each entry runs at fresh depth=1, so the chain bounces
+// through the queue and the stack stays bounded.
+//
+// Lifetime: each queued entry optionally carries a CB pointer to
+// release_coroutine_control_block AFTER the handle has been resumed,
+// preserving the OLD semantics of FinalAwaiter::await_suspend
+// (release-after-resume keeps the awaiter's frame alive across the
+// resume).
+namespace detail {
+struct PendingResume {
+    std::coroutine_handle<> handle;
+    CoroutineControlBlock* cb_to_release; // nullptr if no ref to drop
+};
+inline thread_local int g_resume_depth = 0;
+inline thread_local std::vector<PendingResume> g_pending_resumes;
+constexpr int kResumeDepthThreshold = 32;
+} // namespace detail
+
+inline void resume_with_depth_bound(std::coroutine_handle<> handle,
+                                    CoroutineControlBlock* cb_to_release_after) noexcept {
+    if (!handle) {
+        if (cb_to_release_after != nullptr) {
+            release_coroutine_control_block(cb_to_release_after);
+        }
+        return;
+    }
+    if (detail::g_resume_depth >= detail::kResumeDepthThreshold) {
+        detail::g_pending_resumes.push_back({handle, cb_to_release_after});
+        return;
+    }
+    ++detail::g_resume_depth;
+    handle.resume();
+    --detail::g_resume_depth;
+    if (cb_to_release_after != nullptr) {
+        release_coroutine_control_block(cb_to_release_after);
+    }
+}
+
+inline void drain_pending_resumes() noexcept {
+    while (!detail::g_pending_resumes.empty()) {
+        auto pending = std::move(detail::g_pending_resumes);
+        for (auto& entry : pending) {
+            ++detail::g_resume_depth;
+            entry.handle.resume();
+            --detail::g_resume_depth;
+            if (entry.cb_to_release != nullptr) {
+                release_coroutine_control_block(entry.cb_to_release);
+            }
+        }
+    }
+}
+
 // Statistics structure for lock-free tracking
 // Internal structure uses atomics, snapshot uses plain values for copying
 struct Statistics {
@@ -91,20 +156,19 @@ struct TaskPromise {
                 if (promise.continuation_cb != nullptr) {
                     CoroutineControlBlock* cb = promise.continuation_cb;
                     promise.continuation_cb = nullptr;
-
-                    auto cont = cb->handle;
-                    if (cont) {
-                        cont.resume();
-                    }
-                    release_coroutine_control_block(cb);
+                    // Helper handles the resume + release_cb-after-resume
+                    // sequence, bouncing through the thread-local queue
+                    // if the synchronous chain depth would otherwise
+                    // overflow the stack. cb's ref is consumed by the
+                    // helper (released after resume() returns, or in
+                    // the drain loop for deferred entries).
+                    resume_with_depth_bound(cb->handle, cb);
                     return;
                 }
 
                 auto cont = promise.continuation_raw;
                 promise.continuation_raw = std::noop_coroutine();
-                if (cont) {
-                    cont.resume();
-                }
+                resume_with_depth_bound(cont, nullptr);
             }
             void await_resume() noexcept {}
         };
@@ -323,7 +387,7 @@ struct Task {
             void await_suspend(std::coroutine_handle<TaskPromise> cont) const noexcept {
                 auto task_handle = handle.get();
                 if (!task_handle) {
-                    cont.resume();
+                    resume_with_depth_bound(cont, nullptr);
                     return;
                 }
 
@@ -341,9 +405,9 @@ struct Task {
                 add_ref_coroutine_control_block(awaiter_cb);
 
                 if (!handle.done()) {
-                    handle.resume();
+                    resume_with_depth_bound(task_handle, nullptr);
                 } else {
-                    cont.resume();
+                    resume_with_depth_bound(cont, nullptr);
                 }
             }
 
@@ -351,7 +415,7 @@ struct Task {
             void await_suspend(std::coroutine_handle<> cont) const noexcept {
                 auto task_handle = handle.get();
                 if (!task_handle) {
-                    cont.resume();
+                    resume_with_depth_bound(cont, nullptr);
                     return;
                 }
 
@@ -363,9 +427,9 @@ struct Task {
                 p.continuation_raw = cont;
 
                 if (!handle.done()) {
-                    handle.resume();
+                    resume_with_depth_bound(task_handle, nullptr);
                 } else {
-                    cont.resume();
+                    resume_with_depth_bound(cont, nullptr);
                 }
             }
             void await_resume() const noexcept {}
