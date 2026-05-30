@@ -992,6 +992,33 @@ Task Server::handle_connection(Socket socket) {
             // grow to the first frame on the connection.
             std::vector<uint8_t> read_chunk;
 
+            // Stash for over-read bytes.  A small WS frame is at most 14
+            // bytes of header+mask plus payload; under load the kernel
+            // typically has multiple frames pending in the receive
+            // queue.  The pre-existing version asked recv() for the
+            // EXACT number of bytes it needed at each step (2 header,
+            // 4 mask, N payload) — three syscalls per frame, even
+            // though one recv with a generous size would have grabbed
+            // them all at once.  Buffering an over-read here collapses
+            // a frame's worth of syscalls into typically one.
+            std::vector<uint8_t> ws_recv_stash;
+            std::size_t ws_stash_off = 0;
+            constexpr std::size_t kWsRecvHint = 4096;
+
+            auto consume_from_stash =
+                [&](std::size_t n, std::vector<uint8_t>& out) -> std::size_t {
+                const std::size_t avail = ws_recv_stash.size() - ws_stash_off;
+                const std::size_t take = std::min(n, avail);
+                out.insert(out.end(), ws_recv_stash.begin() + ws_stash_off,
+                           ws_recv_stash.begin() + ws_stash_off + take);
+                ws_stash_off += take;
+                if (ws_stash_off == ws_recv_stash.size()) {
+                    ws_recv_stash.clear();
+                    ws_stash_off = 0;
+                }
+                return take;
+            };
+
             auto read_exact = [&](std::size_t n, std::vector<uint8_t>& out) -> Task {
                 // async_read returns an empty buffer only on orderly EOF
                 // or a hard error — in either case we stop and let the
@@ -1000,13 +1027,40 @@ Task Server::handle_connection(Socket socket) {
                 // own re-await loop, so no sleep_for is needed here.
                 out.clear();
                 out.reserve(n);
+                // First, drain whatever is already stashed from a
+                // previous over-read.  This is the fast path for the
+                // header/mask reads when the kernel had a full frame
+                // ready.
+                std::size_t taken = consume_from_stash(n, out);
                 while (out.size() < n) {
-                    co_await socket.async_read(read_chunk, n - out.size());
+                    // Ask for at least the remainder, but request more
+                    // when the caller's `n` is small so we soak up
+                    // header + mask + small payload in one syscall.
+                    const std::size_t need = n - out.size();
+                    const std::size_t want = std::max(need, kWsRecvHint);
+                    co_await socket.async_read(read_chunk, want);
                     if (read_chunk.empty()) {
                         co_return;
                     }
-                    out.insert(out.end(), read_chunk.begin(), read_chunk.end());
+                    // Take only `need` bytes for this call; the rest
+                    // (if any) goes into the stash for the next
+                    // read_exact.
+                    const std::size_t take = std::min(need, read_chunk.size());
+                    out.insert(out.end(), read_chunk.begin(),
+                               read_chunk.begin() + static_cast<std::ptrdiff_t>(take));
+                    if (read_chunk.size() > take) {
+                        // Stash the overflow.  We expect ws_recv_stash
+                        // to be empty here (the prior pass drained it),
+                        // so this is a single append + offset reset.
+                        ws_recv_stash.clear();
+                        ws_stash_off = 0;
+                        ws_recv_stash.insert(
+                            ws_recv_stash.end(),
+                            read_chunk.begin() + static_cast<std::ptrdiff_t>(take),
+                            read_chunk.end());
+                    }
                 }
+                (void)taken;
             };
 
             auto send_frame = [&](WebSocketOpcode opcode, std::span<const std::uint8_t> payload,
