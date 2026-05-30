@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 360" font-family="-apple-system,system-ui,sans-serif" font-size="13">
+  <defs>
+    <marker id="arr-m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#333"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="620" height="360" fill="#fafafa"/>
+  <text x="310" y="22" text-anchor="middle" font-weight="600" font-size="15">Server(N) — N worker threads</text>
+
+  <!-- IOContext at top -->
+  <rect x="180" y="50" width="260" height="80" fill="#e8f1fc" stroke="#5586c0" rx="4"/>
+  <text x="310" y="70" text-anchor="middle" font-weight="600">IOContext (one shared)</text>
+  <text x="310" y="92" text-anchor="middle" fill="#555">epoll/kqueue + task queue</text>
+  <text x="310" y="110" text-anchor="middle" fill="#555">fans ready coroutines out to workers</text>
+
+  <!-- Worker columns -->
+  <rect x="40" y="170" width="120" height="160" fill="#fff" stroke="#666" rx="4"/>
+  <text x="100" y="190" text-anchor="middle" font-weight="600">worker 0</text>
+  <text x="100" y="216" text-anchor="middle" fill="#555">resume task</text>
+  <text x="100" y="236" text-anchor="middle" fill="#555">run coroutine</text>
+  <text x="100" y="256" text-anchor="middle" fill="#555">until next</text>
+  <text x="100" y="276" text-anchor="middle" fill="#555">co_await</text>
+
+  <rect x="180" y="170" width="120" height="160" fill="#fff" stroke="#666" rx="4"/>
+  <text x="240" y="190" text-anchor="middle" font-weight="600">worker 1</text>
+  <text x="240" y="216" text-anchor="middle" fill="#555">resume task</text>
+  <text x="240" y="236" text-anchor="middle" fill="#555">run coroutine</text>
+  <text x="240" y="256" text-anchor="middle" fill="#555">until next</text>
+  <text x="240" y="276" text-anchor="middle" fill="#555">co_await</text>
+
+  <rect x="320" y="170" width="120" height="160" fill="#fff" stroke="#666" rx="4"/>
+  <text x="380" y="190" text-anchor="middle" font-weight="600">worker 2</text>
+  <text x="380" y="216" text-anchor="middle" fill="#555">resume task</text>
+  <text x="380" y="236" text-anchor="middle" fill="#555">run coroutine</text>
+  <text x="380" y="256" text-anchor="middle" fill="#555">until next</text>
+  <text x="380" y="276" text-anchor="middle" fill="#555">co_await</text>
+
+  <rect x="460" y="170" width="120" height="160" fill="#fff" stroke="#666" rx="4"/>
+  <text x="520" y="190" text-anchor="middle" font-weight="600">worker N-1</text>
+  <text x="520" y="216" text-anchor="middle" fill="#555">resume task</text>
+  <text x="520" y="236" text-anchor="middle" fill="#555">run coroutine</text>
+  <text x="520" y="256" text-anchor="middle" fill="#555">until next</text>
+  <text x="520" y="276" text-anchor="middle" fill="#555">co_await</text>
+
+  <!-- Arrows from IOContext to each worker -->
+  <line x1="240" y1="130" x2="100" y2="170" stroke="#333" stroke-width="1.5" marker-end="url(#arr-m)"/>
+  <line x1="290" y1="130" x2="240" y2="170" stroke="#333" stroke-width="1.5" marker-end="url(#arr-m)"/>
+  <line x1="330" y1="130" x2="380" y2="170" stroke="#333" stroke-width="1.5" marker-end="url(#arr-m)"/>
+  <line x1="380" y1="130" x2="520" y2="170" stroke="#333" stroke-width="1.5" marker-end="url(#arr-m)"/>
+
+  <text x="310" y="346" text-anchor="middle" fill="#777" font-size="11">A single coroutine can migrate between workers across co_await points.</text>
+</svg>

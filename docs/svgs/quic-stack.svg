@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 580 480" font-family="-apple-system,system-ui,sans-serif" font-size="13">
+  <defs>
+    <marker id="arr-q" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#333"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="580" height="480" fill="#fafafa"/>
+  <text x="290" y="24" text-anchor="middle" font-weight="600" font-size="15">libspaznet QUIC + HTTP/3 stack</text>
+
+  <!-- Application -->
+  <rect x="60" y="50" width="460" height="50" fill="#e8fcef" stroke="#4ca766" rx="4"/>
+  <text x="290" y="72" text-anchor="middle" font-weight="600">your code (HTTP3Handler)</text>
+  <text x="290" y="90" text-anchor="middle" fill="#555" font-size="11">handle_request(req, resp, socket)</text>
+
+  <!-- HTTP/3 service -->
+  <rect x="60" y="115" width="460" height="60" fill="#e8f1fc" stroke="#5586c0" rx="4"/>
+  <text x="290" y="135" text-anchor="middle" font-weight="600">http3::QuicHttp3Service</text>
+  <text x="290" y="153" text-anchor="middle" fill="#555" font-size="11">owns Listener + per-conn Http3Server; routes datagrams</text>
+  <text x="290" y="167" text-anchor="middle" fill="#555" font-size="11">set on Server via Server::set_quic_http3_service(...)</text>
+
+  <!-- Http3Server -->
+  <rect x="60" y="190" width="220" height="60" fill="#fffaeb" stroke="#c4994a" rx="4"/>
+  <text x="170" y="210" text-anchor="middle" font-weight="600">http3::Http3Server</text>
+  <text x="170" y="228" text-anchor="middle" fill="#555" font-size="11">one per QUIC connection</text>
+  <text x="170" y="242" text-anchor="middle" fill="#555" font-size="11">QPACK ➜ HTTP3Handler dispatch</text>
+
+  <!-- Listener -->
+  <rect x="300" y="190" width="220" height="60" fill="#fffaeb" stroke="#c4994a" rx="4"/>
+  <text x="410" y="210" text-anchor="middle" font-weight="600">quic::Listener</text>
+  <text x="410" y="228" text-anchor="middle" fill="#555" font-size="11">CID demux, Version Negotiation,</text>
+  <text x="410" y="242" text-anchor="middle" fill="#555" font-size="11">Retry, anti-amp, new-conn factory</text>
+
+  <!-- quic::Connection -->
+  <rect x="60" y="265" width="460" height="70" fill="#fff" stroke="#666" rx="4"/>
+  <text x="290" y="285" text-anchor="middle" font-weight="600">quic::Connection</text>
+  <text x="290" y="303" text-anchor="middle" fill="#555" font-size="11">3 PN spaces (Initial/Handshake/App) • streams • flow control</text>
+  <text x="290" y="320" text-anchor="middle" fill="#555" font-size="11">recovery (PTO math) • NewReno congestion • anti-amp budget</text>
+
+  <!-- TLS -->
+  <rect x="60" y="350" width="220" height="60" fill="#fde8ef" stroke="#b8527f" rx="4"/>
+  <text x="170" y="370" text-anchor="middle" font-weight="600">quic::TlsConnection</text>
+  <text x="170" y="388" text-anchor="middle" fill="#555" font-size="11">OpenSSL 3.5+ SSL*</text>
+  <text x="170" y="402" text-anchor="middle" fill="#555" font-size="11">SSL_set_quic_tls_cbs callbacks</text>
+
+  <!-- Frame + packet codec -->
+  <rect x="300" y="350" width="220" height="60" fill="#fde8ef" stroke="#b8527f" rx="4"/>
+  <text x="410" y="370" text-anchor="middle" font-weight="600">frame / packet / crypto</text>
+  <text x="410" y="388" text-anchor="middle" fill="#555" font-size="11">varint, AEAD, header protection,</text>
+  <text x="410" y="402" text-anchor="middle" fill="#555" font-size="11">long/short headers, frame codecs</text>
+
+  <!-- UDP socket -->
+  <rect x="60" y="425" width="460" height="40" fill="#eee" stroke="#666" rx="4"/>
+  <text x="290" y="450" text-anchor="middle" font-weight="600">UDP socket (Server::listen_udp)</text>
+
+  <!-- arrows -->
+  <line x1="290" y1="100" x2="290" y2="115" stroke="#333" marker-end="url(#arr-q)"/>
+  <line x1="290" y1="175" x2="290" y2="190" stroke="#333" marker-end="url(#arr-q)"/>
+  <line x1="290" y1="250" x2="290" y2="265" stroke="#333" marker-end="url(#arr-q)"/>
+  <line x1="290" y1="335" x2="290" y2="350" stroke="#333" marker-end="url(#arr-q)"/>
+  <line x1="290" y1="410" x2="290" y2="425" stroke="#333" marker-end="url(#arr-q)"/>
+</svg>

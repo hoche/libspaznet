@@ -252,6 +252,26 @@ Statistics are updated atomically and can be read from any thread without blocki
 
 For detailed information about the coroutine execution model, thread scheduling, and I/O handling, see `docs/concurrency-and-coroutines.md`.
 
+## Documentation
+
+| Topic | File |
+|---|---|
+| **What's stable, what's not** | [`docs/api-status.md`](docs/api-status.md) |
+| HTTP/1.1 handler API | [`docs/http.md`](docs/http.md) |
+| WebSocket handler API | [`docs/websocket.md`](docs/websocket.md) |
+| QUIC + HTTP/3 walkthrough | [`docs/quic-http3.md`](docs/quic-http3.md) |
+| QUIC security model | [`docs/quic-security.md`](docs/quic-security.md) |
+| Threading & tuning | [`docs/threading.md`](docs/threading.md) |
+| Coroutine model | [`docs/concurrency-and-coroutines.md`](docs/concurrency-and-coroutines.md) |
+| Coroutine pitfalls (don't do these) | [`docs/coroutine-pitfalls.md`](docs/coroutine-pitfalls.md) |
+| Mutex vs. atomic posture | [`docs/mutex-vs-atomics.md`](docs/mutex-vs-atomics.md) |
+| Performance numbers | [`docs/performance.md`](docs/performance.md) |
+| Integrating libspaznet into your project | [`docs/integration.md`](docs/integration.md) |
+| Migration / breaking changes | [`docs/migration.md`](docs/migration.md) |
+| API reference (Doxygen) | [`docs/doxygen.md`](docs/doxygen.md) |
+| Contributing | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
+| Changelog | [`CHANGELOG.md`](CHANGELOG.md) |
+
 ## Requirements
 
 - C++20 compiler with `<format>` support: **GCC 13.1+** or **Clang 17+**

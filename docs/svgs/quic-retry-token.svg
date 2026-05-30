@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 220" font-family="-apple-system,system-ui,monospace" font-size="12">
+  <rect x="0" y="0" width="720" height="220" fill="#fafafa"/>
+  <text x="360" y="22" text-anchor="middle" font-weight="600" font-size="15" font-family="-apple-system,system-ui,sans-serif">Retry token layout</text>
+
+  <!-- Byte ruler -->
+  <g font-size="10" fill="#666">
+    <text x="60" y="56" text-anchor="middle">0</text>
+    <text x="180" y="56" text-anchor="middle">16</text>
+    <text x="225" y="56" text-anchor="middle">17</text>
+    <text x="285" y="56" text-anchor="middle">17+L</text>
+    <text x="330" y="56" text-anchor="middle">18+L</text>
+    <text x="450" y="56" text-anchor="middle">18+L+D</text>
+    <text x="560" y="56" text-anchor="middle">34+L+D</text>
+  </g>
+
+  <!-- Boxes -->
+  <g stroke="#666">
+    <rect x="60" y="60" width="120" height="60" fill="#fde8ef"/>
+    <text x="120" y="84" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-weight="600">nonce</text>
+    <text x="120" y="102" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-size="11">16 bytes</text>
+
+    <rect x="180" y="60" width="45" height="60" fill="#fff8e1"/>
+    <text x="202" y="88" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-weight="600">L</text>
+    <text x="202" y="103" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-size="10">1 B</text>
+
+    <rect x="225" y="60" width="60" height="60" fill="#e8f1fc"/>
+    <text x="255" y="84" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-weight="600">addr</text>
+    <text x="255" y="102" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-size="10">L bytes</text>
+
+    <rect x="285" y="60" width="45" height="60" fill="#fff8e1"/>
+    <text x="307" y="88" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-weight="600">D</text>
+    <text x="307" y="103" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-size="10">1 B</text>
+
+    <rect x="330" y="60" width="120" height="60" fill="#e8fcef"/>
+    <text x="390" y="84" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-weight="600">odcid</text>
+    <text x="390" y="102" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-size="10">D bytes (≤20)</text>
+
+    <rect x="450" y="60" width="110" height="60" fill="#eee"/>
+    <text x="505" y="84" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-weight="600">HMAC</text>
+    <text x="505" y="102" text-anchor="middle" font-family="-apple-system,system-ui,sans-serif" font-size="11">16 bytes</text>
+  </g>
+
+  <!-- Annotations -->
+  <g font-family="-apple-system,system-ui,sans-serif" font-size="11" fill="#444">
+    <text x="60"  y="148">nonce        — random per token, prevents collision across reissues</text>
+    <text x="60"  y="166">L | addr     — peer address bytes (6 for v4 = 4 addr + 2 port, 18 for v6 = 16 addr + 2 port)</text>
+    <text x="60"  y="184">D | odcid    — pre-Retry Destination Connection ID from the client's first Initial</text>
+    <text x="60"  y="202">HMAC         — SHA-256 truncated to 128 bits, keyed with token_key_, over [nonce ‖ L ‖ addr ‖ D ‖ odcid]</text>
+  </g>
+</svg>
