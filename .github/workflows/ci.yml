@@ -258,3 +258,68 @@ jobs:
           cd build
           ctest -C Release --output-on-failure
 
+
+  # FreeBSD x86_64 — boots a FreeBSD VM under QEMU on the Linux runner
+  # via vmactions/freebsd-vm. FreeBSD 14.x ships clang in base and has
+  # cmake / gcc available via pkg. Native x86_64 KVM acceleration when
+  # the runner supports it; otherwise software TCG (slower but still
+  # works).
+  build-test-freebsd-x64:
+    name: Build and Test - FreeBSD x86_64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build and test on FreeBSD x86_64
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.2'
+          arch: amd64
+          usesh: true
+          prepare: |
+            pkg install -y cmake git
+          run: |
+            # OpenSSL in FreeBSD 14 base is 3.0.x, which is too old for
+            # the SSL_set_quic_tls_cbs interface the QUIC stack uses.
+            # CMake will auto-disable SPAZNET_BUILD_QUIC with a warning
+            # (see CMakeLists.txt) and the rest of the library still
+            # builds. Install `openssl` from pkg if a full QUIC test
+            # run is needed in this job — left out by default to keep
+            # the matrix fast.
+            mkdir -p build
+            cd build
+            cmake ..
+            cmake --build . --config Release -j$(sysctl -n hw.ncpu)
+            ./test_unit || ctest -R UnitTests --output-on-failure
+            ./test_integration || ctest -R IntegrationTests --output-on-failure
+            ctest --output-on-failure
+
+  # FreeBSD aarch64 — same shape, ARM64 via QEMU TCG. No KVM, so
+  # noticeably slower; allow the action's default timeout (the build +
+  # tests for the non-QUIC subset take roughly 5-10 minutes).
+  build-test-freebsd-arm64:
+    name: Build and Test - FreeBSD aarch64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build and test on FreeBSD aarch64
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14.2'
+          arch: aarch64
+          usesh: true
+          prepare: |
+            pkg install -y cmake git
+          run: |
+            mkdir -p build
+            cd build
+            cmake ..
+            cmake --build . --config Release -j$(sysctl -n hw.ncpu)
+            ./test_unit || ctest -R UnitTests --output-on-failure
+            ./test_integration || ctest -R IntegrationTests --output-on-failure
+            ctest --output-on-failure
