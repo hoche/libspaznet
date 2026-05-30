@@ -13,6 +13,10 @@ jobs:
     name: Build and Test - Linux x64
     runs-on: ubuntu-latest
 
+    env:
+      OPENSSL_VERSION: 3.5.4
+      OPENSSL_PREFIX: ${{ github.workspace }}/.openssl
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -25,13 +29,35 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential g++-12 || sudo apt-get install -y build-essential g++-11 || sudo apt-get install -y build-essential g++-10
+          # Need gcc 13.1+ for <format>; noble (24.04) has g++-13 available.
+          sudo apt-get install -y build-essential g++-13
+          echo "CC=gcc-13"  >> "$GITHUB_ENV"
+          echo "CXX=g++-13" >> "$GITHUB_ENV"
+
+      - name: Cache OpenSSL ${{ env.OPENSSL_VERSION }}
+        id: openssl-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OPENSSL_PREFIX }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-linux-x64
+
+      - name: Build OpenSSL ${{ env.OPENSSL_VERSION }}
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          cd /tmp
+          curl -sSL -O "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          tar xzf "openssl-${OPENSSL_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL_VERSION}"
+          ./Configure --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}" no-tests shared
+          make -j$(nproc)
+          make install_sw
 
       - name: Configure CMake
         run: |
           mkdir -p build
           cd build
-          cmake ..
+          cmake .. -DOPENSSL_ROOT_DIR="${OPENSSL_PREFIX}"
 
       - name: Build
         run: |
@@ -41,14 +67,18 @@ jobs:
       - name: Run Unit Tests
         run: |
           cd build
-          ./test_unit || ctest -R UnitTests --output-on-failure
+          LD_LIBRARY_PATH="${OPENSSL_PREFIX}/lib64:${OPENSSL_PREFIX}/lib" \
+            ./test_unit || ctest -R UnitTests --output-on-failure
 
       - name: Run Integration Tests
         run: |
           cd build
-          ./test_integration || ctest -R IntegrationTests --output-on-failure
+          LD_LIBRARY_PATH="${OPENSSL_PREFIX}/lib64:${OPENSSL_PREFIX}/lib" \
+            ./test_integration || ctest -R IntegrationTests --output-on-failure
 
       - name: Run All Tests with CTest
+        env:
+          LD_LIBRARY_PATH: ${{ env.OPENSSL_PREFIX }}/lib64:${{ env.OPENSSL_PREFIX }}/lib
         run: |
           cd build
           ctest --output-on-failure
@@ -72,17 +102,34 @@ jobs:
 
       - name: Build and test in ARM64 container
         run: |
-          docker run --rm --platform linux/arm64 -v ${{ github.workspace }}:/workspace -w /workspace \
-            ubuntu:22.04 bash -c "
-            apt-get update && apt-get install -y build-essential g++-12 cmake git curl \
-            && mkdir -p build \
-            && cd build \
-            && cmake .. \
-            && cmake --build . --config Release -j\$(nproc) \
-            && ./test_unit || ctest -R UnitTests --output-on-failure \
-            && ./test_integration || ctest -R IntegrationTests --output-on-failure \
-            && ctest --output-on-failure
-          "
+          # ubuntu:24.04 ships g++-13 in apt; we still build OpenSSL 3.5
+          # from source because no Ubuntu release through 25.10 has it
+          # packaged. Building under QEMU is slow (~10 min); the rest of
+          # the test suite runs in another few minutes.
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/workspace -w /workspace \
+            ubuntu:24.04 bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y build-essential g++-13 cmake git curl ca-certificates
+            export CC=gcc-13 CXX=g++-13
+            cd /tmp
+            curl -sSL -O https://github.com/openssl/openssl/releases/download/openssl-3.5.4/openssl-3.5.4.tar.gz
+            tar xzf openssl-3.5.4.tar.gz
+            cd openssl-3.5.4
+            ./Configure --prefix=/opt/openssl-3.5 --openssldir=/opt/openssl-3.5 no-tests shared
+            make -j$(nproc)
+            make install_sw
+            cd /workspace
+            mkdir -p build && cd build
+            cmake .. -DOPENSSL_ROOT_DIR=/opt/openssl-3.5
+            cmake --build . --config Release -j$(nproc)
+            export LD_LIBRARY_PATH=/opt/openssl-3.5/lib64:/opt/openssl-3.5/lib
+            ./test_unit         || ctest -R UnitTests        --output-on-failure
+            ./test_integration  || ctest -R IntegrationTests --output-on-failure
+            ctest --output-on-failure
+          '
 
   # macOS ARM64 (Apple Silicon)
   build-test-macos-arm64:
@@ -100,13 +147,14 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install cmake || true
+          brew install cmake openssl@3.5 || true
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3.5)" >> "$GITHUB_ENV"
 
       - name: Configure CMake
         run: |
           mkdir -p build
           cd build
-          cmake ..
+          cmake .. -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"
 
       - name: Build
         run: |
@@ -150,7 +198,8 @@ jobs:
           mkdir -p build
           cd build
           # Force x64 architecture
-          arch -x86_64 cmake .. || cmake ..
+          arch -x86_64 cmake .. -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" \
+            || cmake .. -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"
 
       - name: Build (x64)
         run: |
@@ -189,11 +238,22 @@ jobs:
       - name: Install Visual Studio Build Tools
         uses: microsoft/setup-msbuild@v1.1
 
+      - name: Install OpenSSL 3.5+
+        shell: pwsh
+        run: |
+          # Shining Light's OpenSSL 3.5 binaries via chocolatey. The
+          # Windows runners ship choco pre-installed. CMake finds the
+          # install at C:\Program Files\OpenSSL-Win64 by default; we
+          # set OPENSSL_ROOT_DIR explicitly to be sure.
+          choco install openssl --version=3.5.4 --no-progress -y
+          $env:OPENSSL_ROOT_DIR = "C:\Program Files\OpenSSL-Win64"
+          "OPENSSL_ROOT_DIR=$env:OPENSSL_ROOT_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Configure CMake
         run: |
           mkdir build
           cd build
-          cmake .. -G "Visual Studio 17 2022" -A x64
+          cmake .. -G "Visual Studio 17 2022" -A x64 -DOPENSSL_ROOT_DIR="$env:OPENSSL_ROOT_DIR"
 
       - name: Build
         run: |
@@ -232,11 +292,22 @@ jobs:
       - name: Install Visual Studio Build Tools
         uses: microsoft/setup-msbuild@v1.1
 
+      - name: Install OpenSSL 3.5+
+        shell: pwsh
+        run: |
+          # Shining Light's OpenSSL 3.5 binaries via chocolatey. The
+          # Windows runners ship choco pre-installed. CMake finds the
+          # install at C:\Program Files\OpenSSL-Win64 by default; we
+          # set OPENSSL_ROOT_DIR explicitly to be sure.
+          choco install openssl --version=3.5.4 --no-progress -y
+          $env:OPENSSL_ROOT_DIR = "C:\Program Files\OpenSSL-Win64"
+          "OPENSSL_ROOT_DIR=$env:OPENSSL_ROOT_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Configure CMake
         run: |
           mkdir build
           cd build
-          cmake .. -G "Visual Studio 17 2022" -A x64
+          cmake .. -G "Visual Studio 17 2022" -A x64 -DOPENSSL_ROOT_DIR="$env:OPENSSL_ROOT_DIR"
 
       - name: Build
         run: |
@@ -279,18 +350,14 @@ jobs:
           arch: amd64
           usesh: true
           prepare: |
-            pkg install -y cmake git
+            # security/openssl35 ships the 3.5 series. Installs to
+            # /usr/local/openssl35 with a versioned suffix so it
+            # doesn't shadow the OpenSSL 3.0 in base.
+            pkg install -y cmake git openssl35
           run: |
-            # OpenSSL in FreeBSD 14 base is 3.0.x, which is too old for
-            # the SSL_set_quic_tls_cbs interface the QUIC stack uses.
-            # CMake will auto-disable SPAZNET_BUILD_QUIC with a warning
-            # (see CMakeLists.txt) and the rest of the library still
-            # builds. Install `openssl` from pkg if a full QUIC test
-            # run is needed in this job — left out by default to keep
-            # the matrix fast.
             mkdir -p build
             cd build
-            cmake ..
+            cmake .. -DOPENSSL_ROOT_DIR=/usr/local/openssl35
             cmake --build . --config Release -j$(sysctl -n hw.ncpu)
             ./test_unit || ctest -R UnitTests --output-on-failure
             ./test_integration || ctest -R IntegrationTests --output-on-failure
