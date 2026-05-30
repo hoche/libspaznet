@@ -61,6 +61,11 @@ class LatencyTest : public ::testing::Test {
         if (sock < 0)
             return -1;
 
+        // SO_LINGER {1, 0}: RST on close, skip TIME_WAIT — without this
+        // a long latency run exhausts the client ephemeral port range.
+        struct linger lin {1, 0};
+        setsockopt(sock, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+
         struct sockaddr_in addr {};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = inet_addr("127.0.0.1");
@@ -184,6 +189,10 @@ TEST_F(LatencyTest, ConnectionEstablishmentLatency) {
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0)
             continue;
+
+        // RST on close to skip TIME_WAIT — see measure_request_latency().
+        struct linger lin {1, 0};
+        setsockopt(sock, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
 
         struct sockaddr_in addr {};
         addr.sin_family = AF_INET;

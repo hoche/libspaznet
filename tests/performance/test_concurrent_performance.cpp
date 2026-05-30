@@ -69,21 +69,35 @@ class ConcurrentPerformanceTest : public ::testing::Test {
     }
 
     int create_connection() {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0)
-            return -1;
-
+        // CI runners with few cores can saturate the server's SYN queue when
+        // hundreds of threads call connect() simultaneously; retry transient
+        // ECONNREFUSED with a short exponential backoff before giving up.
         struct sockaddr_in addr {};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = inet_addr("127.0.0.1");
         addr.sin_port = htons(9002);
 
-        if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        int delay_us = 200;
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock < 0)
+                return -1;
+            // SO_LINGER {1, 0} forces close() to send RST instead of FIN
+            // so the client-side ephemeral port skips TIME_WAIT.  This
+            // matters when prior tests in the run have already churned
+            // through many ports: macOS's ephemeral range is only
+            // ~16K, and otherwise connect() starts failing with
+            // EADDRNOTAVAIL.
+            struct linger lin {1, 0};
+            setsockopt(sock, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+            if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0) {
+                return sock;
+            }
             close_socket(sock);
-            return -1;
+            std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+            delay_us *= 2;
         }
-
-        return sock;
+        return -1;
     }
 
     std::unique_ptr<Server> server;

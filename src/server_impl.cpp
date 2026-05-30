@@ -565,8 +565,14 @@ void Server::listen_tcp(uint16_t port) {
 
     freeaddrinfo(result);
 
-    // Listen
-    if (listen(listen_fd, SOMAXCONN) < 0) {
+    // Listen.  SOMAXCONN is 128 on macOS and that's enough to let
+    // hundreds of concurrent connect()s collide and overflow the SYN
+    // queue.  Pass a larger value; the kernel clamps to its own ceiling
+    // (sysctl kern.ipc.somaxconn on BSD/macOS, net.core.somaxconn on
+    // Linux), which is typically much higher on Linux and lets bursty
+    // tests succeed without retries.
+    constexpr int kListenBacklog = 4096;
+    if (listen(listen_fd, kListenBacklog) < 0) {
         close_socket(listen_fd);
         throw std::runtime_error("Failed to listen on socket");
     }
