@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <atomic>
 #include <chrono>
-#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/http/dispatcher.hpp>
 #include <libspaznet/server.hpp>
 #include <string>
 #include <thread>
@@ -23,12 +23,12 @@
 using namespace spaznet;
 
 // RFC 9112 Compliant Test Handler
-class RFC9112TestHandler : public HTTPHandler {
+class RFC9112TestHandler : public spaznet::http::HTTPHandler {
   public:
     std::atomic<int> request_count{0};
-    HTTPRequest last_request;
+    spaznet::http::HTTPRequest last_request;
 
-    Task handle_request(const HTTPRequest& request, HTTPResponse& response,
+    Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response,
                         Socket& socket) override {
         request_count.fetch_add(1);
         last_request = request;
@@ -67,7 +67,7 @@ class RFC9112IntegrationTest : public ::testing::Test {
 
         server = std::make_unique<Server>(2);
         // Transfer ownership to server
-        server->set_http_handler(std::move(handler_unique));
+        server->set_connection_handler(spaznet::http::make_dispatcher(std::move(handler_unique)));
 
         server->listen_tcp(9996);
 

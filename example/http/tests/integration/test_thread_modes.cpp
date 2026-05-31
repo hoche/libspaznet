@@ -9,7 +9,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/http/dispatcher.hpp>
 #include <libspaznet/server.hpp>
 #include <random>
 #include <sstream>
@@ -87,11 +87,11 @@ static std::string send_http_request(uint16_t port, const std::string& path = "/
     return response;
 }
 
-class SimpleOKHandler : public HTTPHandler {
+class SimpleOKHandler : public spaznet::http::HTTPHandler {
   public:
     std::atomic<int> requests{0};
 
-    Task handle_request(const HTTPRequest&, HTTPResponse& response, Socket&) override {
+    Task handle_request(const spaznet::http::HTTPRequest&, spaznet::http::HTTPResponse& response, Socket&) override {
         requests.fetch_add(1, std::memory_order_relaxed);
         response.status_code = 200;
         response.reason_phrase = "OK";
@@ -111,7 +111,7 @@ TEST_P(ServerThreadModeTest, HandlesRequestsInBothModes) {
     auto* handler_ptr = handler.get();
 
     Server server(worker_threads);
-    server.set_http_handler(std::move(handler));
+    server.set_connection_handler(spaznet::http::make_dispatcher(std::move(handler)));
     uint16_t port = listen_on_random_port(server);
     ASSERT_NE(port, 0) << "Failed to bind any test port";
 
@@ -149,7 +149,7 @@ INSTANTIATE_TEST_SUITE_P(ThreadModes, ServerThreadModeTest,
 
 TEST(ServerDefaultModeTest, DefaultIsNonThreadedAndWorks) {
     Server server; // default should be non-threaded
-    server.set_http_handler(std::make_unique<SimpleOKHandler>());
+    server.set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<SimpleOKHandler>()));
     uint16_t port = listen_on_random_port(server);
     ASSERT_NE(port, 0) << "Failed to bind any test port";
 

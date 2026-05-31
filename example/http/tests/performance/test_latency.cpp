@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
-#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/http/dispatcher.hpp>
 #include <libspaznet/server.hpp>
 #include <numeric>
 #include <thread>
@@ -26,9 +26,9 @@
 
 using namespace spaznet;
 
-class LatencyHTTPHandler : public HTTPHandler {
+class LatencyHTTPHandler : public spaznet::http::HTTPHandler {
   public:
-    Task handle_request(const HTTPRequest& request, HTTPResponse& response,
+    Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response,
                         Socket& socket) override {
         response.status_code = 200;
         response.reason_phrase = "OK";
@@ -42,7 +42,7 @@ class LatencyTest : public ::testing::Test {
   protected:
     void SetUp() override {
         server = std::make_unique<Server>(4);
-        server->set_http_handler(std::make_unique<LatencyHTTPHandler>());
+        server->set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<LatencyHTTPHandler>()));
         server->listen_tcp(9001);
 
         server_thread = std::thread([this]() { server->run(); });

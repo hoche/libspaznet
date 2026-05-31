@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <chrono>
 #include <iostream>
-#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/http/dispatcher.hpp>
 #include <random>
 #include <string>
 #include <vector>
@@ -85,10 +85,10 @@ class RFC9112PerformanceTest : public ::testing::Test {
     std::string large_request;
     std::string chunked_request;
 
-    HTTPResponse small_response;
-    HTTPResponse medium_response;
-    HTTPResponse large_response;
-    HTTPResponse chunked_response;
+    spaznet::http::HTTPResponse small_response;
+    spaznet::http::HTTPResponse medium_response;
+    spaznet::http::HTTPResponse large_response;
+    spaznet::http::HTTPResponse chunked_response;
 };
 
 // Benchmark request parsing performance
@@ -99,9 +99,9 @@ TEST_F(RFC9112PerformanceTest, ParseRequestSmall) {
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        HTTPRequest request;
+        spaznet::http::HTTPRequest request;
         size_t bytes_consumed = 0;
-        HTTPParser::parse_request(buffer, request, bytes_consumed);
+        spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -122,9 +122,9 @@ TEST_F(RFC9112PerformanceTest, ParseRequestMedium) {
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        HTTPRequest request;
+        spaznet::http::HTTPRequest request;
         size_t bytes_consumed = 0;
-        HTTPParser::parse_request(buffer, request, bytes_consumed);
+        spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -144,9 +144,9 @@ TEST_F(RFC9112PerformanceTest, ParseRequestLarge) {
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        HTTPRequest request;
+        spaznet::http::HTTPRequest request;
         size_t bytes_consumed = 0;
-        HTTPParser::parse_request(buffer, request, bytes_consumed);
+        spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -166,9 +166,9 @@ TEST_F(RFC9112PerformanceTest, ParseRequestChunked) {
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        HTTPRequest request;
+        spaznet::http::HTTPRequest request;
         size_t bytes_consumed = 0;
-        HTTPParser::parse_request(buffer, request, bytes_consumed);
+        spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -268,7 +268,7 @@ TEST_F(RFC9112PerformanceTest, SerializeResponseChunked) {
 
 // Benchmark header field lookup (case-insensitive)
 TEST_F(RFC9112PerformanceTest, HeaderLookupPerformance) {
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     request.headers["Content-Type"] = "application/json";
     request.headers["Content-Length"] = "1024";
     request.headers["User-Agent"] = "test-agent";
@@ -319,7 +319,7 @@ TEST_F(RFC9112PerformanceTest, ParseChunkedBodyPerformance) {
     for (int i = 0; i < iterations; ++i) {
         std::vector<uint8_t> body;
         size_t bytes_consumed = 0;
-        HTTPParser::parse_chunked_body(buffer, body, bytes_consumed);
+        spaznet::http::HTTPParser::parse_chunked_body(buffer, body, bytes_consumed);
     }
 
     auto end = std::chrono::high_resolution_clock::now();

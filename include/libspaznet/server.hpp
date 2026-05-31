@@ -23,7 +23,6 @@ namespace spaznet {
 
 // Forward declarations
 class UDPHandler;
-class HTTPHandler;
 class HTTP2Handler;
 class WebSocketHandler;
 #ifdef SPAZNET_HAS_QUIC
@@ -121,7 +120,6 @@ class Socket {
 
 // Include handlers after Socket is defined
 #include <libspaznet/handlers/http2_handler.hpp>
-#include <libspaznet/handlers/http_handler.hpp>
 #include <libspaznet/handlers/udp_handler.hpp>
 #include <libspaznet/handlers/websocket_handler.hpp>
 
@@ -156,7 +154,6 @@ class Server {
     ConnectionHandler connection_handler_;
     DatagramHandler datagram_handler_;
     std::unique_ptr<UDPHandler> udp_handler_;
-    std::unique_ptr<HTTPHandler> http_handler_;
     std::unique_ptr<HTTP2Handler> http2_handler_;
     std::unique_ptr<WebSocketHandler> websocket_handler_;
 #ifdef SPAZNET_HAS_QUIC
@@ -208,7 +205,6 @@ class Server {
     // New code should depend on the example/<protocol> libraries
     // and use the low-level setters above instead.
     void set_udp_handler(std::unique_ptr<UDPHandler> handler);
-    void set_http_handler(std::unique_ptr<HTTPHandler> handler);
     void set_http2_handler(std::unique_ptr<HTTP2Handler> handler);
     void set_websocket_handler(std::unique_ptr<WebSocketHandler> handler);
 #ifdef SPAZNET_HAS_QUIC

@@ -9,9 +9,13 @@
 #include <vector>
 
 namespace spaznet {
-
-// Forward declaration
 class Socket;
+}
+
+namespace spaznet::http {
+
+using ::spaznet::Socket;
+using ::spaznet::Task;
 
 // HTTP/1.1 Request structure per RFC 9112
 struct HTTPRequest {
@@ -129,4 +133,4 @@ class HTTPHandler {
                                 Socket& socket) -> Task = 0;
 };
 
-} // namespace spaznet
+} // namespace spaznet::http

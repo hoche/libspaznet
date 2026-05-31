@@ -6,7 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <iomanip>
-#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/http/dispatcher.hpp>
 #include <libspaznet/server.hpp>
 #include <thread>
 #include <vector>
@@ -25,11 +25,11 @@
 
 using namespace spaznet;
 
-class ConcurrentPerformanceHandler : public HTTPHandler {
+class ConcurrentPerformanceHandler : public spaznet::http::HTTPHandler {
   public:
     std::atomic<uint64_t> request_count{0};
 
-    Task handle_request(const HTTPRequest& request, HTTPResponse& response,
+    Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response,
                         Socket& socket) override {
         request_count.fetch_add(1);
 
@@ -46,7 +46,7 @@ class ConcurrentPerformanceTest : public ::testing::Test {
   protected:
     void SetUp() override {
         server = std::make_unique<Server>(8); // More threads for concurrency
-        server->set_http_handler(std::make_unique<ConcurrentPerformanceHandler>());
+        server->set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<ConcurrentPerformanceHandler>()));
         server->listen_tcp(9002);
 
         server_thread = std::thread([this]() { server->run(); });

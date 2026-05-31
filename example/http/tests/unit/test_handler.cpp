@@ -1,12 +1,12 @@
 #include <gtest/gtest.h>
-#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/http/dispatcher.hpp>
 #include <sstream>
 #include <string>
 
 using namespace spaznet;
 
 TEST(HTTPResponseTest, SerializeBasic) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.status_code = 200;
     response.reason_phrase = "OK";
     response.set_header("Content-Type", "text/plain");
@@ -22,7 +22,7 @@ TEST(HTTPResponseTest, SerializeBasic) {
 }
 
 TEST(HTTPResponseTest, SerializeWithCustomHeaders) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.status_code = 404;
     response.reason_phrase = "Not Found";
     response.set_header("Content-Type", "text/html");
@@ -38,7 +38,7 @@ TEST(HTTPResponseTest, SerializeWithCustomHeaders) {
 }
 
 TEST(HTTPResponseTest, SerializeEmptyBody) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.status_code = 204;
     response.reason_phrase = "No Content";
 
@@ -56,7 +56,7 @@ TEST(HTTPResponseTest, SerializeEmptyBody200EmitsContentLengthZero) {
     // response ends at the header terminator and the next pipelined
     // response begins where it does. Omitting the header was an RFC
     // 9112 §6.1 violation that broke keep-alive clients.
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.status_code = 200;
     response.reason_phrase = "OK";
 
@@ -69,7 +69,7 @@ TEST(HTTPResponseTest, SerializeEmptyBody200EmitsContentLengthZero) {
 
 TEST(HTTPResponseTest, SerializeEmptyBody304NoContentLength) {
     // 304 Not Modified forbids a body (RFC 9110 §15.4.5).
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.status_code = 304;
     response.reason_phrase = "Not Modified";
 
@@ -80,7 +80,7 @@ TEST(HTTPResponseTest, SerializeEmptyBody304NoContentLength) {
 }
 
 TEST(HTTPResponseTest, SerializeLargeBody) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.status_code = 200;
     response.reason_phrase = "OK";
     response.set_header("Content-Type", "application/octet-stream");
@@ -96,7 +96,7 @@ TEST(HTTPResponseTest, SerializeLargeBody) {
 }
 
 TEST(HTTPResponseTest, SetHeader) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.set_header("Content-Type", "application/json");
     response.set_header("Cache-Control", "no-cache");
 
@@ -105,7 +105,7 @@ TEST(HTTPResponseTest, SetHeader) {
 }
 
 TEST(HTTPResponseTest, OverwriteHeader) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.set_header("Content-Type", "text/plain");
     response.set_header("Content-Type", "text/html");
 
@@ -114,7 +114,7 @@ TEST(HTTPResponseTest, OverwriteHeader) {
 }
 
 TEST(HTTPRequestTest, RequestStructure) {
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     request.method = "GET";
     request.request_target = "/test";
     request.version = "1.1"; // Version is just "1.1", not "HTTP/1.1"
@@ -135,7 +135,7 @@ TEST(HTTPRequestTest, RequestStructure) {
 // A header value containing CR/LF must not appear in the serialized output;
 // otherwise the peer would see a smuggled second response.
 TEST(HTTPResponseTest, DropsHeaderValueWithCRLF) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.status_code = 200;
     response.reason_phrase = "OK";
     response.set_header("Content-Type", "text/plain");
@@ -152,7 +152,7 @@ TEST(HTTPResponseTest, DropsHeaderValueWithCRLF) {
 
 // Bare LF should be rejected just as firmly as CRLF.
 TEST(HTTPResponseTest, DropsHeaderValueWithBareLF) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.set_header("X-Inject", "evil\nSet-Cookie: pwn=1");
     auto out = response.serialize();
     std::string s(out.begin(), out.end());
@@ -162,7 +162,7 @@ TEST(HTTPResponseTest, DropsHeaderValueWithBareLF) {
 
 // NUL is a common terminator-handling bug; reject it.
 TEST(HTTPResponseTest, DropsHeaderValueWithNUL) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.headers["X-Inject"] = std::string("a\0b", 3);
     auto out = response.serialize();
     std::string s(out.begin(), out.end());
@@ -172,7 +172,7 @@ TEST(HTTPResponseTest, DropsHeaderValueWithNUL) {
 // A header NAME with whitespace or CR/LF is also rejected (and can be more
 // dangerous than a bad value if any proxy strips the value's CR/LF).
 TEST(HTTPResponseTest, DropsHeaderNameWithIllegalChars) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.headers["Bad Name"] = "ok";
     response.headers["Bad\r\nName"] = "ok";
     response.set_header("Content-Type", "text/plain");
@@ -185,7 +185,7 @@ TEST(HTTPResponseTest, DropsHeaderNameWithIllegalChars) {
 
 // The same sanitization must apply on the chunked path.
 TEST(HTTPResponseTest, ChunkedSerializeAlsoDropsInjected) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.set_header("X-Inject", "x\r\nX-Pwn: 1");
     response.body = {'a', 'b', 'c'};
     auto out = response.serialize_chunked();

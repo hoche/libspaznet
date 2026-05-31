@@ -27,7 +27,7 @@
 #include <utility>
 #include <vector>
 
-#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/http/dispatcher.hpp>
 #include <libspaznet/server.hpp>
 
 using namespace spaznet;
@@ -280,9 +280,9 @@ static auto percentile_ms(std::vector<double>& samples, double p) -> double {
     return samples[lo] * (1.0 - frac) + samples[hi] * frac;
 }
 
-class BenchHandler : public HTTPHandler {
+class BenchHandler : public spaznet::http::HTTPHandler {
   public:
-    Task handle_request(const HTTPRequest& request, HTTPResponse& response, Socket&) override {
+    Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response, Socket&) override {
         std::size_t resp_size = 0;
         if (auto hdr = request.get_header("X-Resp-Size")) {
             if (auto v = parse_uint(*hdr)) {
@@ -783,7 +783,7 @@ int main(int argc, char** argv) {
     // HTTP benchmarks per thread count.
     for (std::size_t threads : thread_counts) {
         Server server(threads);
-        server.set_http_handler(std::make_unique<BenchHandler>());
+        server.set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<BenchHandler>()));
         uint16_t port = listen_on_random_port(server);
         if (port == 0) {
             std::cerr << "Failed to bind server for threads=" << threads << "\n";

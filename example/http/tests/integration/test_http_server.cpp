@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include <chrono>
-#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/http/dispatcher.hpp>
 #include <libspaznet/server.hpp>
 #include <sstream>
 #include <string>
@@ -26,13 +26,13 @@ using namespace spaznet;
 // TestHTTPHandler. The previous shared name caused the linker to pick the
 // definition from another test file, so this test received the wrong body
 // payload ("OK" instead of "Hello").
-class HTTPServerTestHandler : public HTTPHandler {
+class HTTPServerTestHandler : public spaznet::http::HTTPHandler {
   public:
     std::atomic<int> request_count{0};
     std::string last_method;
     std::string last_path;
 
-    Task handle_request(const HTTPRequest& request, HTTPResponse& response,
+    Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response,
                         Socket& socket) override {
         request_count.fetch_add(1);
         last_method = request.method;
@@ -59,7 +59,7 @@ class HTTPServerTest : public ::testing::Test {
         auto handler_unique = std::make_unique<HTTPServerTestHandler>();
         handler = handler_unique.get();
         server = std::make_unique<Server>(2);
-        server->set_http_handler(std::move(handler_unique));
+        server->set_connection_handler(spaznet::http::make_dispatcher(std::move(handler_unique)));
         server->listen_tcp(8888);
 
         server_thread = std::thread([this]() { server->run(); });

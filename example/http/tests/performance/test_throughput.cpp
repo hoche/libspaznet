@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
-#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/http/dispatcher.hpp>
 #include <libspaznet/server.hpp>
 #include <sstream>
 #include <string>
@@ -31,12 +31,12 @@
 
 using namespace spaznet;
 
-class ThroughputHTTPHandler : public HTTPHandler {
+class ThroughputHTTPHandler : public spaznet::http::HTTPHandler {
   public:
     std::atomic<uint64_t> request_count{0};
     std::atomic<uint64_t> total_bytes_sent{0};
 
-    Task handle_request(const HTTPRequest& request, HTTPResponse& response,
+    Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response,
                         Socket& socket) override {
         request_count.fetch_add(1);
 
@@ -59,7 +59,7 @@ class ThroughputTest : public ::testing::Test {
 
         handler = std::make_unique<ThroughputHTTPHandler>();
         server = std::make_unique<Server>(4);
-        server->set_http_handler(std::make_unique<ThroughputHTTPHandler>());
+        server->set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<ThroughputHTTPHandler>()));
         server->listen_tcp(9000);
 
         server_thread = std::thread([this]() { server->run(); });
@@ -237,9 +237,9 @@ TEST_F(ThroughputTest, SustainedLoadThroughput) {
 }
 
 TEST_F(ThroughputTest, LargeResponseThroughput) {
-    class LargeResponseHandler : public HTTPHandler {
+    class LargeResponseHandler : public spaznet::http::HTTPHandler {
       public:
-        Task handle_request(const HTTPRequest& request, HTTPResponse& response,
+        Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response,
                             Socket& socket) override {
             response.status_code = 200;
             response.set_header("Content-Type", "application/octet-stream");
@@ -248,7 +248,7 @@ TEST_F(ThroughputTest, LargeResponseThroughput) {
         }
     };
 
-    server->set_http_handler(std::make_unique<LargeResponseHandler>());
+    server->set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<LargeResponseHandler>()));
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     const int num_requests = 100;

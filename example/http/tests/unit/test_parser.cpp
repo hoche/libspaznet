@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/http/dispatcher.hpp>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -14,47 +14,47 @@ class RFC9112ParserTest : public ::testing::Test {
 
 // Test request line parsing per RFC 9112 Section 3.1.1
 TEST_F(RFC9112ParserTest, ParseRequestLine) {
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     std::string line = "GET /index.html HTTP/1.1";
 
-    EXPECT_TRUE(HTTPParser::parse_request_line(line, request));
+    EXPECT_TRUE(spaznet::http::HTTPParser::parse_request_line(line, request));
     EXPECT_EQ(request.method, "GET");
     EXPECT_EQ(request.request_target, "/index.html");
     EXPECT_EQ(request.version, "1.1"); // Parser extracts version after "HTTP/"
 }
 
 TEST_F(RFC9112ParserTest, ParseRequestLineWithAbsoluteForm) {
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     std::string line = "GET http://example.com/path HTTP/1.1";
 
-    EXPECT_TRUE(HTTPParser::parse_request_line(line, request));
+    EXPECT_TRUE(spaznet::http::HTTPParser::parse_request_line(line, request));
     EXPECT_EQ(request.method, "GET");
     EXPECT_EQ(request.request_target, "http://example.com/path");
     EXPECT_EQ(request.version, "1.1");
 }
 
 TEST_F(RFC9112ParserTest, ParseRequestLineInvalidMethod) {
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     std::string line = "GET@ /path HTTP/1.1"; // Invalid token character
 
-    EXPECT_FALSE(HTTPParser::parse_request_line(line, request));
+    EXPECT_FALSE(spaznet::http::HTTPParser::parse_request_line(line, request));
 }
 
 TEST_F(RFC9112ParserTest, ParseStatusLine) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     std::string line = "HTTP/1.1 200 OK";
 
-    EXPECT_TRUE(HTTPParser::parse_status_line(line, response));
+    EXPECT_TRUE(spaznet::http::HTTPParser::parse_status_line(line, response));
     EXPECT_EQ(response.version, "1.1");
     EXPECT_EQ(response.status_code, 200);
     EXPECT_EQ(response.reason_phrase, "OK");
 }
 
 TEST_F(RFC9112ParserTest, ParseStatusLineWithoutReasonPhrase) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     std::string line = "HTTP/1.1 204";
 
-    EXPECT_TRUE(HTTPParser::parse_status_line(line, response));
+    EXPECT_TRUE(spaznet::http::HTTPParser::parse_status_line(line, response));
     EXPECT_EQ(response.version, "1.1");
     EXPECT_EQ(response.status_code, 204);
     EXPECT_EQ(response.reason_phrase, "");
@@ -65,7 +65,7 @@ TEST_F(RFC9112ParserTest, ParseHeaderField) {
     std::unordered_map<std::string, std::string> headers;
     std::string line = "Content-Type: text/html";
 
-    EXPECT_TRUE(HTTPParser::parse_header_field(line, headers));
+    EXPECT_TRUE(spaznet::http::HTTPParser::parse_header_field(line, headers));
     EXPECT_EQ(headers["Content-Type"], "text/html");
 }
 
@@ -73,7 +73,7 @@ TEST_F(RFC9112ParserTest, ParseHeaderFieldWithOWS) {
     std::unordered_map<std::string, std::string> headers;
     std::string line = "Content-Type:   text/html   ";
 
-    EXPECT_TRUE(HTTPParser::parse_header_field(line, headers));
+    EXPECT_TRUE(spaznet::http::HTTPParser::parse_header_field(line, headers));
     EXPECT_EQ(headers["Content-Type"], "text/html");
 }
 
@@ -81,7 +81,7 @@ TEST_F(RFC9112ParserTest, ParseHeaderFieldInvalid) {
     std::unordered_map<std::string, std::string> headers;
     std::string line = "Invalid-Header@: value"; // Invalid token character
 
-    EXPECT_FALSE(HTTPParser::parse_header_field(line, headers));
+    EXPECT_FALSE(spaznet::http::HTTPParser::parse_header_field(line, headers));
 }
 
 // Test full request parsing
@@ -94,12 +94,12 @@ TEST_F(RFC9112ParserTest, ParseCompleteRequest) {
                               "data";
 
     std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     size_t bytes_consumed = 0;
 
-    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+    auto result = spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
 
-    EXPECT_EQ(result, HTTPParser::ParseResult::Success);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Success);
     EXPECT_EQ(request.method, "GET");
     EXPECT_EQ(request.request_target, "/test");
     EXPECT_EQ(request.version, "1.1");
@@ -120,12 +120,12 @@ TEST_F(RFC9112ParserTest, ParseRequestWithChunkedEncoding) {
                               "\r\n";
 
     std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     size_t bytes_consumed = 0;
 
-    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+    auto result = spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
 
-    EXPECT_EQ(result, HTTPParser::ParseResult::Success);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Success);
     EXPECT_TRUE(request.is_chunked());
     EXPECT_EQ(std::string(request.body.begin(), request.body.end()), "data");
 }
@@ -136,12 +136,12 @@ TEST_F(RFC9112ParserTest, ParseIncompleteRequest) {
     // Missing final CRLF and body
 
     std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     size_t bytes_consumed = 0;
 
-    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
+    auto result = spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
 
-    EXPECT_EQ(result, HTTPParser::ParseResult::Incomplete);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Incomplete);
 }
 
 TEST_F(RFC9112ParserTest, ParseChunkedBody) {
@@ -156,9 +156,9 @@ TEST_F(RFC9112ParserTest, ParseChunkedBody) {
     std::vector<uint8_t> body;
     size_t bytes_consumed = 0;
 
-    auto result = HTTPParser::parse_chunked_body(buffer, body, bytes_consumed);
+    auto result = spaznet::http::HTTPParser::parse_chunked_body(buffer, body, bytes_consumed);
 
-    EXPECT_EQ(result, HTTPParser::ParseResult::Success);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Success);
     EXPECT_EQ(std::string(body.begin(), body.end()), "testchunk1");
 }
 
@@ -171,14 +171,14 @@ TEST_F(RFC9112ParserTest, ParseChunkedBodyIncomplete) {
     std::vector<uint8_t> body;
     size_t bytes_consumed = 0;
 
-    auto result = HTTPParser::parse_chunked_body(buffer, body, bytes_consumed);
+    auto result = spaznet::http::HTTPParser::parse_chunked_body(buffer, body, bytes_consumed);
 
-    EXPECT_EQ(result, HTTPParser::ParseResult::Incomplete);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Incomplete);
 }
 
-// Test HTTPRequest helper methods
+// Test spaznet::http::HTTPRequest helper methods
 TEST_F(RFC9112ParserTest, RequestGetHeaderCaseInsensitive) {
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     request.headers["Content-Type"] = "text/html";
 
     auto header1 = request.get_header("Content-Type");
@@ -194,27 +194,27 @@ TEST_F(RFC9112ParserTest, RequestGetHeaderCaseInsensitive) {
 }
 
 TEST_F(RFC9112ParserTest, RequestShouldKeepAlive) {
-    HTTPRequest request1;
+    spaznet::http::HTTPRequest request1;
     request1.version = "1.1";
     EXPECT_TRUE(request1.should_keep_alive());
 
-    HTTPRequest request2;
+    spaznet::http::HTTPRequest request2;
     request2.version = "1.1";
     request2.headers["Connection"] = "close";
     EXPECT_FALSE(request2.should_keep_alive());
 
-    HTTPRequest request3;
+    spaznet::http::HTTPRequest request3;
     request3.version = "1.0";
     request3.headers["Connection"] = "keep-alive";
     EXPECT_TRUE(request3.should_keep_alive());
 
-    HTTPRequest request4;
+    spaznet::http::HTTPRequest request4;
     request4.version = "1.0";
     EXPECT_FALSE(request4.should_keep_alive());
 }
 
 TEST_F(RFC9112ParserTest, RequestGetContentLength) {
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     request.headers["Content-Length"] = "1024";
 
     auto cl = request.get_content_length();
@@ -223,22 +223,22 @@ TEST_F(RFC9112ParserTest, RequestGetContentLength) {
 }
 
 TEST_F(RFC9112ParserTest, RequestIsChunked) {
-    HTTPRequest request1;
+    spaznet::http::HTTPRequest request1;
     request1.headers["Transfer-Encoding"] = "chunked";
     EXPECT_TRUE(request1.is_chunked());
 
-    HTTPRequest request2;
+    spaznet::http::HTTPRequest request2;
     request2.headers["Transfer-Encoding"] = "gzip, chunked";
     EXPECT_TRUE(request2.is_chunked());
 
-    HTTPRequest request3;
+    spaznet::http::HTTPRequest request3;
     request3.headers["Transfer-Encoding"] = "gzip";
     EXPECT_FALSE(request3.is_chunked());
 }
 
-// Test HTTPResponse serialization
+// Test spaznet::http::HTTPResponse serialization
 TEST_F(RFC9112ParserTest, ResponseSerializeChunked) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.version = "1.1";
     response.status_code = 200;
     response.reason_phrase = "OK";
@@ -255,7 +255,7 @@ TEST_F(RFC9112ParserTest, ResponseSerializeChunked) {
 }
 
 TEST_F(RFC9112ParserTest, ResponseGetHeaderCaseInsensitive) {
-    HTTPResponse response;
+    spaznet::http::HTTPResponse response;
     response.headers["Content-Type"] = "application/json";
 
     auto header1 = response.get_header("Content-Type");
@@ -273,8 +273,8 @@ TEST_F(RFC9112ParserTest, ParseVariousMethods) {
 
     for (const char* method : methods) {
         std::string line = std::string(method) + " /path HTTP/1.1";
-        HTTPRequest request;
-        EXPECT_TRUE(HTTPParser::parse_request_line(line, request))
+        spaznet::http::HTTPRequest request;
+        EXPECT_TRUE(spaznet::http::HTTPParser::parse_request_line(line, request))
             << "Failed to parse method: " << method;
         EXPECT_EQ(request.method, method);
     }
@@ -283,18 +283,18 @@ TEST_F(RFC9112ParserTest, ParseVariousMethods) {
 // Test request target forms per RFC 9112 Section 3.2
 TEST_F(RFC9112ParserTest, ParseRequestTargetForms) {
     // Origin form
-    HTTPRequest req1;
-    EXPECT_TRUE(HTTPParser::parse_request_line("GET /path HTTP/1.1", req1));
+    spaznet::http::HTTPRequest req1;
+    EXPECT_TRUE(spaznet::http::HTTPParser::parse_request_line("GET /path HTTP/1.1", req1));
     EXPECT_EQ(req1.request_target, "/path");
 
     // Absolute form
-    HTTPRequest req2;
-    EXPECT_TRUE(HTTPParser::parse_request_line("GET http://example.com/path HTTP/1.1", req2));
+    spaznet::http::HTTPRequest req2;
+    EXPECT_TRUE(spaznet::http::HTTPParser::parse_request_line("GET http://example.com/path HTTP/1.1", req2));
     EXPECT_EQ(req2.request_target, "http://example.com/path");
 
     // Authority form (for CONNECT)
-    HTTPRequest req3;
-    EXPECT_TRUE(HTTPParser::parse_request_line("CONNECT example.com:443 HTTP/1.1", req3));
+    spaznet::http::HTTPRequest req3;
+    EXPECT_TRUE(spaznet::http::HTTPParser::parse_request_line("CONNECT example.com:443 HTTP/1.1", req3));
     EXPECT_EQ(req3.request_target, "example.com:443");
 }
 
@@ -309,10 +309,10 @@ TEST_F(RFC9112ParserTest, RejectContentLengthAndTransferEncoding) {
                               "\r\n"
                               "hello";
     std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     size_t bytes_consumed = 0;
-    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
-    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+    auto result = spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Error);
 }
 
 // Two Content-Length headers with different values must be rejected.
@@ -324,10 +324,10 @@ TEST_F(RFC9112ParserTest, RejectDuplicateContentLengthDifferentValues) {
                               "\r\n"
                               "hello";
     std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     size_t bytes_consumed = 0;
-    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
-    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+    auto result = spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Error);
 }
 
 // Repeated Content-Length headers with the same value are tolerated.
@@ -339,10 +339,10 @@ TEST_F(RFC9112ParserTest, AllowDuplicateContentLengthSameValue) {
                               "\r\n"
                               "hello";
     std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     size_t bytes_consumed = 0;
-    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
-    EXPECT_EQ(result, HTTPParser::ParseResult::Success);
+    auto result = spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Success);
     EXPECT_EQ(std::string(request.body.begin(), request.body.end()), "hello");
 }
 
@@ -355,10 +355,10 @@ TEST_F(RFC9112ParserTest, AllowContentLengthListWithIdenticalValues) {
                               "\r\n"
                               "hello";
     std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     size_t bytes_consumed = 0;
-    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
-    EXPECT_EQ(result, HTTPParser::ParseResult::Success);
+    auto result = spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Success);
     EXPECT_EQ(std::string(request.body.begin(), request.body.end()), "hello");
     // Validation should normalize the merged list back to a single
     // value so downstream parsing doesn't depend on stoull's quirks.
@@ -373,10 +373,10 @@ TEST_F(RFC9112ParserTest, RejectContentLengthListWithDifferentValues) {
                               "\r\n"
                               "hello";
     std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     size_t bytes_consumed = 0;
-    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
-    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+    auto result = spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Error);
 }
 
 // And two same-cased Content-Length headers with identical values, which
@@ -390,10 +390,10 @@ TEST_F(RFC9112ParserTest, AllowTwoIdenticalContentLengthHeaders) {
                               "\r\n"
                               "hello";
     std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     size_t bytes_consumed = 0;
-    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
-    EXPECT_EQ(result, HTTPParser::ParseResult::Success);
+    auto result = spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Success);
     EXPECT_EQ(std::string(request.body.begin(), request.body.end()), "hello");
     EXPECT_EQ(request.headers["Content-Length"], "5");
 }
@@ -401,8 +401,8 @@ TEST_F(RFC9112ParserTest, AllowTwoIdenticalContentLengthHeaders) {
 // RFC 9112 §5.1: OWS between field name and colon must be rejected.
 TEST_F(RFC9112ParserTest, RejectWhitespaceBeforeColon) {
     std::unordered_map<std::string, std::string> headers;
-    EXPECT_FALSE(HTTPParser::parse_header_field("Host : example.com", headers));
-    EXPECT_FALSE(HTTPParser::parse_header_field("Host\t: example.com", headers));
+    EXPECT_FALSE(spaznet::http::HTTPParser::parse_header_field("Host : example.com", headers));
+    EXPECT_FALSE(spaznet::http::HTTPParser::parse_header_field("Host\t: example.com", headers));
 }
 
 // Transfer-Encoding whose final coding is not chunked is unsupported framing.
@@ -412,10 +412,10 @@ TEST_F(RFC9112ParserTest, RejectTransferEncodingNotEndingInChunked) {
                               "Transfer-Encoding: chunked, gzip\r\n"
                               "\r\n";
     std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     size_t bytes_consumed = 0;
-    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
-    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+    auto result = spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Error);
 }
 
 // Malformed chunk-size must be a hard parse error, not silently treated as
@@ -425,46 +425,46 @@ TEST_F(RFC9112ParserTest, MalformedChunkSizeIsError) {
     std::vector<uint8_t> buffer(chunked_data.begin(), chunked_data.end());
     std::vector<uint8_t> body;
     size_t bytes_consumed = 0;
-    auto result = HTTPParser::parse_chunked_body(buffer, body, bytes_consumed);
-    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+    auto result = spaznet::http::HTTPParser::parse_chunked_body(buffer, body, bytes_consumed);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Error);
 }
 
 // parse_chunk_size returns nullopt on parse failure but Some(0) on legitimate
 // last-chunk.
 TEST_F(RFC9112ParserTest, ChunkSizeOptionalDistinguishesErrorFromZero) {
-    EXPECT_EQ(HTTPParser::parse_chunk_size("0"), std::optional<size_t>{0});
-    EXPECT_EQ(HTTPParser::parse_chunk_size("ff"), std::optional<size_t>{255});
-    EXPECT_EQ(HTTPParser::parse_chunk_size("FF;ext=1"), std::optional<size_t>{255});
-    EXPECT_FALSE(HTTPParser::parse_chunk_size("").has_value());
-    EXPECT_FALSE(HTTPParser::parse_chunk_size("-1").has_value());
-    EXPECT_FALSE(HTTPParser::parse_chunk_size("garbage").has_value());
-    EXPECT_FALSE(HTTPParser::parse_chunk_size(" 1").has_value());
+    EXPECT_EQ(spaznet::http::HTTPParser::parse_chunk_size("0"), std::optional<size_t>{0});
+    EXPECT_EQ(spaznet::http::HTTPParser::parse_chunk_size("ff"), std::optional<size_t>{255});
+    EXPECT_EQ(spaznet::http::HTTPParser::parse_chunk_size("FF;ext=1"), std::optional<size_t>{255});
+    EXPECT_FALSE(spaznet::http::HTTPParser::parse_chunk_size("").has_value());
+    EXPECT_FALSE(spaznet::http::HTTPParser::parse_chunk_size("-1").has_value());
+    EXPECT_FALSE(spaznet::http::HTTPParser::parse_chunk_size("garbage").has_value());
+    EXPECT_FALSE(spaznet::http::HTTPParser::parse_chunk_size(" 1").has_value());
 }
 
 // An oversize header block is rejected before unbounded memory growth.
 TEST_F(RFC9112ParserTest, OversizeHeaderBlockIsError) {
     std::string request_str = "GET / HTTP/1.1\r\nX-Huge: ";
-    request_str.append(HTTPParser::kMaxHeaderBytes, 'a');
+    request_str.append(spaznet::http::HTTPParser::kMaxHeaderBytes, 'a');
     request_str.append("\r\n\r\n");
     std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     size_t bytes_consumed = 0;
-    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
-    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+    auto result = spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Error);
 }
 
 // A request declaring too many headers is rejected.
 TEST_F(RFC9112ParserTest, TooManyHeadersIsError) {
     std::string request_str = "GET / HTTP/1.1\r\n";
-    for (size_t i = 0; i < HTTPParser::kMaxHeaders + 5; ++i) {
+    for (size_t i = 0; i < spaznet::http::HTTPParser::kMaxHeaders + 5; ++i) {
         request_str += "X-H" + std::to_string(i) + ": v\r\n";
     }
     request_str += "\r\n";
     std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     size_t bytes_consumed = 0;
-    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
-    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+    auto result = spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Error);
 }
 
 // parse_request must be idempotent across calls that share the same
@@ -483,16 +483,16 @@ TEST_F(RFC9112ParserTest, ParseRequestIsIdempotentOnReparse) {
                           "\r\n";
     std::string full = headers + "hello";
 
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     size_t bytes_consumed = 0;
 
     std::vector<uint8_t> partial(headers.begin(), headers.end());
-    auto r1 = HTTPParser::parse_request(partial, request, bytes_consumed);
-    EXPECT_EQ(r1, HTTPParser::ParseResult::Incomplete);
+    auto r1 = spaznet::http::HTTPParser::parse_request(partial, request, bytes_consumed);
+    EXPECT_EQ(r1, spaznet::http::HTTPParser::ParseResult::Incomplete);
 
     std::vector<uint8_t> complete(full.begin(), full.end());
-    auto r2 = HTTPParser::parse_request(complete, request, bytes_consumed);
-    EXPECT_EQ(r2, HTTPParser::ParseResult::Success);
+    auto r2 = spaznet::http::HTTPParser::parse_request(complete, request, bytes_consumed);
+    EXPECT_EQ(r2, spaznet::http::HTTPParser::ParseResult::Success);
     EXPECT_EQ(request.method, "POST");
     EXPECT_EQ(request.headers["Content-Length"], "5");
     EXPECT_EQ(std::string(request.body.begin(), request.body.end()), "hello");
@@ -504,12 +504,12 @@ TEST_F(RFC9112ParserTest, OversizeContentLengthIsError) {
     std::string request_str = "POST / HTTP/1.1\r\n"
                               "Host: example.com\r\n"
                               "Content-Length: " +
-                              std::to_string(HTTPParser::kMaxBodySize + 1) +
+                              std::to_string(spaznet::http::HTTPParser::kMaxBodySize + 1) +
                               "\r\n"
                               "\r\n";
     std::vector<uint8_t> buffer(request_str.begin(), request_str.end());
-    HTTPRequest request;
+    spaznet::http::HTTPRequest request;
     size_t bytes_consumed = 0;
-    auto result = HTTPParser::parse_request(buffer, request, bytes_consumed);
-    EXPECT_EQ(result, HTTPParser::ParseResult::Error);
+    auto result = spaznet::http::HTTPParser::parse_request(buffer, request, bytes_consumed);
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Error);
 }

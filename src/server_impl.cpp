@@ -502,10 +502,6 @@ void Server::set_udp_handler(std::unique_ptr<UDPHandler> handler) {
     udp_handler_ = std::move(handler);
 }
 
-void Server::set_http_handler(std::unique_ptr<HTTPHandler> handler) {
-    http_handler_ = std::move(handler);
-}
-
 void Server::set_http2_handler(std::unique_ptr<HTTP2Handler> handler) {
     http2_handler_ = std::move(handler);
 }
@@ -829,7 +825,7 @@ Task Server::handle_connection(Socket socket) {
         co_return;
     }
 
-    if (!http_handler_ && !http2_handler_ && !websocket_handler_) {
+    if (!http2_handler_ && !websocket_handler_) {
         socket.close();
         co_return;
     }
@@ -932,100 +928,13 @@ Task Server::handle_connection(Socket socket) {
             }
         }
 
-        if (!websocket_upgrade && http_handler_) {
-            constexpr std::size_t kReadChunk = 8192;
-            constexpr std::size_t kMaxRequestBytes = 1024 * 1024; // 1 MiB safety cap
-
-            // HTTP/1.1 keep-alive: serve multiple requests per TCP connection.
-            while (true) {
-                HTTPRequest request;
-                size_t bytes_consumed = 0;
-                HTTPParser::ParseResult parse_result =
-                    HTTPParser::parse_request(buffer, request, bytes_consumed);
-
-                // Read until we have a full request (headers + body) or hit a safety limit.
-                while (parse_result == HTTPParser::ParseResult::Incomplete &&
-                       buffer.size() < kMaxRequestBytes) {
-                    std::vector<uint8_t> more_data;
-                    co_await socket.async_read(more_data, kReadChunk);
-                    if (more_data.empty()) {
-                        // Client closed connection (or read error).
-                        guard.release();
-                        socket.close();
-                        co_return;
-                    }
-                    buffer.insert(buffer.end(), more_data.begin(), more_data.end());
-                    parse_result = HTTPParser::parse_request(buffer, request, bytes_consumed);
-                }
-
-                if (parse_result != HTTPParser::ParseResult::Success) {
-                    HTTPResponse error_response;
-                    error_response.version = "1.1";
-                    error_response.status_code = 400;
-                    error_response.reason_phrase = "Bad Request";
-                    error_response.set_header("Connection", "close");
-                    error_response.set_header("Content-Length", "0");
-
-                    auto error_data = error_response.serialize();
-                    co_await socket.async_write(std::move(error_data));
-                    guard.release();
-                    socket.close();
-                    co_return;
-                }
-
-                if (bytes_consumed > buffer.size()) {
-                    guard.release();
-                    socket.close();
-                    co_return;
-                }
-
-                // Consume request bytes so we can parse the next request (pipelined or later).
-                buffer.erase(buffer.begin(), buffer.begin() + bytes_consumed);
-
-                // Track request start (lock-free)
-                socket.context()->increment_active_requests();
-
-                try {
-                    HTTPResponse response;
-                    response.version = "1.1";
-
-                    co_await http_handler_->handle_request(request, response, socket);
-
-                    const bool keep_alive = request.should_keep_alive();
-                    response.set_header("Connection", keep_alive ? "keep-alive" : "close");
-
-                    std::vector<uint8_t> response_data;
-                    auto te = response.get_header("Transfer-Encoding");
-                    if (te) {
-                        std::string te_lower = *te;
-                        std::transform(te_lower.begin(), te_lower.end(), te_lower.begin(),
-                                       [](unsigned char c) { return std::tolower(c); });
-                        if (te_lower.find("chunked") != std::string::npos) {
-                            response_data = response.serialize_chunked();
-                        } else {
-                            response_data = response.serialize();
-                        }
-                    } else {
-                        response_data = response.serialize();
-                    }
-
-                    co_await socket.async_write(std::move(response_data));
-
-                    // Track request finish (lock-free) - after response is sent successfully
-                    socket.context()->decrement_active_requests();
-
-                    if (!keep_alive) {
-                        guard.release();
-                        socket.close();
-                        co_return;
-                    }
-                } catch (...) {
-                    // Ensure request counter is decremented even on exception
-                    socket.context()->decrement_active_requests();
-                    throw;
-                }
-            }
-        } else if (websocket_upgrade && websocket_handler_) {
+        // [HTTP/1.1 keep-alive loop removed — moved to
+        // example/http/src/dispatcher.cpp.  Users get plain HTTP via
+        // Server::set_connection_handler(
+        //     spaznet::http::make_dispatcher(...)).  The WebSocket
+        // branch below stays in core until Phase 2b extracts it to
+        // example/http-websocket.]
+        if (websocket_upgrade && websocket_handler_) {
             auto& hdrs = ws_request->headers;
             std::string client_key = hdrs.at("sec-websocket-key");
             std::string accept_key = compute_websocket_accept(client_key);

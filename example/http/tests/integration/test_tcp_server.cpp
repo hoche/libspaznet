@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include <chrono>
-#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/http/dispatcher.hpp>
 #include <libspaznet/server.hpp>
 #include <thread>
 #include <vector>
@@ -21,9 +21,9 @@
 using namespace spaznet;
 
 // Simple test HTTP handler
-class TestHTTPHandler : public HTTPHandler {
+class TestHTTPHandler : public spaznet::http::HTTPHandler {
   public:
-    Task handle_request(const HTTPRequest& request, HTTPResponse& response,
+    Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response,
                         Socket& socket) override {
         response.status_code = 200;
         response.reason_phrase = "OK";
@@ -38,7 +38,7 @@ class TCPServerTest : public ::testing::Test {
     void SetUp() override {
         server = std::make_unique<Server>(2);
         // Set up a simple handler to handle connections
-        server->set_http_handler(std::make_unique<TestHTTPHandler>());
+        server->set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<TestHTTPHandler>()));
         server_thread = std::thread([this]() { server->run(); });
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }

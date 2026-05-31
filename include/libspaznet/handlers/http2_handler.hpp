@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <libspaznet/handlers/http_handler.hpp> // Reuse HTTP structures where possible
 #include <libspaznet/io_context.hpp>
 #include <memory>
 #include <optional>
@@ -13,6 +12,13 @@ namespace spaznet {
 
 // Forward declaration
 class Socket;
+
+namespace {
+// Local copy of the constant formerly imported from http_handler.hpp.
+// HTTP/1.1 status-code conventions also apply to HTTP/2; the default
+// "200 OK" status is a protocol-shared idiom.
+constexpr int DEFAULT_HTTP_STATUS_CODE = 200;
+}
 
 // HTTP/2 Frame Types per RFC 9113 Section 4.1
 enum class HTTP2FrameType : uint8_t {

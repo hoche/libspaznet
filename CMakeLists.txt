@@ -84,7 +84,6 @@ set(SOURCES
     src/platform/io_context.cpp
     src/platform/platform_io.cpp
     src/handlers/udp_handler.cpp
-    src/handlers/http_handler.cpp
     src/handlers/http2_handler.cpp
     src/handlers/websocket_handler.cpp
     src/utils/string_utils.cpp
@@ -124,7 +123,6 @@ set(HEADERS
     include/libspaznet/platform/platform_io.hpp
     include/libspaznet/logger.hpp
     include/libspaznet/handlers/udp_handler.hpp
-    include/libspaznet/handlers/http_handler.hpp
     include/libspaznet/handlers/http2_handler.hpp
     include/libspaznet/handlers/websocket_handler.hpp
     include/libspaznet/quic/varint.hpp
@@ -324,10 +322,8 @@ set(SPAZNET_UNIT_TEST_SOURCES
     tests/unit/test_platform_io.cpp
     tests/unit/test_io_context.cpp
     tests/unit/test_timer.cpp
-    tests/unit/test_http_handler.cpp
     tests/unit/test_websocket_handler.cpp
     tests/unit/test_http2_handler.cpp
-    tests/unit/test_rfc9112_parser.cpp
     tests/unit/test_rfc9113_parser.cpp
     tests/unit/test_logger.cpp
 )
@@ -351,13 +347,8 @@ spaznet_apply_test_warnings(test_unit)
 
 add_executable(test_integration
     tests/test_main.cpp
-    tests/integration/test_tcp_server.cpp
-    tests/integration/test_http_server.cpp
-    tests/integration/test_thread_modes.cpp
     tests/integration/test_websocket_server.cpp
     tests/integration/test_udp_server.cpp
-    tests/integration/test_concurrent_connections.cpp
-    tests/integration/test_rfc9112_compliance.cpp
     tests/integration/test_rfc9113_compliance.cpp
 )
 target_link_libraries(test_integration PRIVATE spaznet GTest::gtest GTest::gmock)
@@ -365,11 +356,7 @@ spaznet_apply_test_warnings(test_integration)
 
 add_executable(test_performance
     tests/test_main.cpp
-    tests/performance/test_throughput.cpp
-    tests/performance/test_latency.cpp
-    tests/performance/test_concurrent_performance.cpp
     tests/performance/test_iperf_integration.cpp
-    tests/performance/test_rfc9112_performance.cpp
     tests/performance/test_rfc9113_performance.cpp
     tests/performance/test_websocket_rfc6455_performance.cpp
 )
@@ -384,12 +371,12 @@ if(SPAZNET_BUILD_QUIC)
     spaznet_apply_test_warnings(bench_quic_steady_state)
 endif()
 
-add_executable(bench_thread_modes
-    tests/performance/bench_thread_modes.cpp
-)
-target_link_libraries(bench_thread_modes PRIVATE spaznet)
-spaznet_apply_test_warnings(bench_thread_modes)
-
 add_test(NAME UnitTests COMMAND test_unit)
 add_test(NAME IntegrationTests COMMAND test_integration)
 add_test(NAME PerformanceTests COMMAND test_performance)
+
+# ---- example/ subprojects ----
+option(SPAZNET_BUILD_EXAMPLES "Build example protocol libraries (HTTP, etc.)" ON)
+if(SPAZNET_BUILD_EXAMPLES)
+    add_subdirectory(example/http)
+endif()

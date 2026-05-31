@@ -2,7 +2,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdlib>
-#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/http/handler.hpp>
 #include <libspaznet/utils/header_utils.hpp>
 #include <libspaznet/utils/number_utils.hpp>
 #include <libspaznet/utils/string_utils.hpp>
@@ -21,9 +21,9 @@
 //   readability-magic-numbers
 // )
 
-namespace spaznet {
+namespace spaznet::http {
 
-// HTTPRequest helper methods
+// spaznet::http::HTTPRequest helper methods
 std::optional<std::string> HTTPRequest::get_header(const std::string& name) const {
     return HeaderUtils::get_header_case_insensitive(headers, name);
 }
@@ -35,14 +35,14 @@ bool HTTPRequest::should_keep_alive() const {
     auto connection = get_header("Connection");
     if (connection) {
         // RFC 9110: Connection is a list of tokens.
-        std::string conn = HTTPParser::to_lower(*connection);
+        std::string conn = spaznet::http::HTTPParser::to_lower(*connection);
         bool has_close = false;
         bool has_keep_alive = false;
 
         std::istringstream iss(conn);
         std::string part;
         while (std::getline(iss, part, ',')) {
-            part = HTTPParser::trim_ows(part);
+            part = spaznet::http::HTTPParser::trim_ows(part);
             if (part == "close") {
                 has_close = true;
             } else if (part == "keep-alive") {
@@ -95,12 +95,12 @@ bool HTTPRequest::is_chunked() const {
     if (!te) {
         return false;
     }
-    std::string te_lower = HTTPParser::to_lower(*te);
+    std::string te_lower = spaznet::http::HTTPParser::to_lower(*te);
     std::string last_token;
     std::istringstream iss(te_lower);
     std::string part;
     while (std::getline(iss, part, ',')) {
-        part = HTTPParser::trim_ows(part);
+        part = spaznet::http::HTTPParser::trim_ows(part);
         if (!part.empty()) {
             last_token = part;
         }
@@ -117,7 +117,7 @@ bool is_valid_field_name(const std::string& name) {
         return false;
     }
     for (char c : name) {
-        if (!HTTPParser::is_token_char(c)) {
+        if (!spaznet::http::HTTPParser::is_token_char(c)) {
             return false;
         }
     }
@@ -139,7 +139,7 @@ bool is_valid_field_value(const std::string& value) {
 
 } // namespace
 
-// HTTPResponse helper methods
+// spaznet::http::HTTPResponse helper methods
 std::optional<std::string> HTTPResponse::get_header(const std::string& name) const {
     return HeaderUtils::get_header_case_insensitive(headers, name);
 }
@@ -210,7 +210,7 @@ std::vector<uint8_t> HTTPResponse::serialize_chunked() const {
         if (!is_valid_field_name(key) || !is_valid_field_value(value)) {
             continue;
         }
-        if (HTTPParser::to_lower(key) == "transfer-encoding") {
+        if (spaznet::http::HTTPParser::to_lower(key) == "transfer-encoding") {
             has_transfer_encoding = true;
         }
         oss << key << ": " << value << "\r\n";
@@ -247,7 +247,7 @@ std::vector<uint8_t> HTTPResponse::serialize_chunked() const {
 }
 
 // HTTPParser implementation
-bool HTTPParser::is_token_char(char c) {
+bool spaznet::http::HTTPParser::is_token_char(char c) {
     // Token characters per RFC 9112 Section 5.6.2
     // token = 1*tchar
     // tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
@@ -257,7 +257,7 @@ bool HTTPParser::is_token_char(char c) {
            c == '`' || c == '|' || c == '~';
 }
 
-bool HTTPParser::is_field_vchar(char c) {
+bool spaznet::http::HTTPParser::is_field_vchar(char c) {
     // Field value characters per RFC 9112 Section 5.5
     // field-value = *field-content / *( obs-fold CRLF ) field-content
     // field-content = field-vchar [ 1*( SP / HTAB / field-vchar ) field-vchar ]
@@ -266,15 +266,15 @@ bool HTTPParser::is_field_vchar(char c) {
     return c >= 0x21 && c <= 0x7E;
 }
 
-std::string HTTPParser::to_lower(const std::string& str) {
+std::string spaznet::http::HTTPParser::to_lower(const std::string& str) {
     return StringUtils::to_lower(str);
 }
 
-std::string HTTPParser::trim_ows(const std::string& str) {
+std::string spaznet::http::HTTPParser::trim_ows(const std::string& str) {
     return StringUtils::trim_ows(str);
 }
 
-bool HTTPParser::parse_request_line(const std::string& line, HTTPRequest& request) {
+bool spaznet::http::HTTPParser::parse_request_line(const std::string& line, HTTPRequest& request) {
     // Request line per RFC 9112 Section 3.1.1
     // request-line = method SP request-target SP HTTP-version CRLF
 
@@ -309,7 +309,7 @@ bool HTTPParser::parse_request_line(const std::string& line, HTTPRequest& reques
     return true;
 }
 
-bool HTTPParser::parse_status_line(const std::string& line, HTTPResponse& response) {
+bool spaznet::http::HTTPParser::parse_status_line(const std::string& line, spaznet::http::HTTPResponse& response) {
     // Status line per RFC 9112 Section 6.1
     // status-line = HTTP-version SP status-code SP [ reason-phrase ] CRLF
 
@@ -346,7 +346,7 @@ bool HTTPParser::parse_status_line(const std::string& line, HTTPResponse& respon
     return true;
 }
 
-bool HTTPParser::parse_header_field(const std::string& line,
+bool spaznet::http::HTTPParser::parse_header_field(const std::string& line,
                                     std::unordered_map<std::string, std::string>& headers) {
     // Header field per RFC 9112 Section 5.5
     // header-field = field-name ":" OWS field-value OWS
@@ -562,7 +562,7 @@ bool validate_framing_headers(std::unordered_map<std::string, std::string>& head
 
 } // namespace
 
-HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& buffer,
+spaznet::http::HTTPParser::ParseResult spaznet::http::HTTPParser::parse_request(const std::vector<uint8_t>& buffer,
                                                   HTTPRequest& request, size_t& bytes_consumed) {
     bytes_consumed = 0;
 
@@ -671,8 +671,8 @@ HTTPParser::ParseResult HTTPParser::parse_request(const std::vector<uint8_t>& bu
     return ParseResult::Success;
 }
 
-auto HTTPParser::parse_response(const std::vector<uint8_t>& buffer, HTTPResponse& response,
-                                size_t& bytes_consumed) -> HTTPParser::ParseResult {
+auto spaznet::http::HTTPParser::parse_response(const std::vector<uint8_t>& buffer, spaznet::http::HTTPResponse& response,
+                                size_t& bytes_consumed) -> spaznet::http::HTTPParser::ParseResult {
     bytes_consumed = 0;
 
     // Same idempotence story as parse_request — clear the output so a
@@ -791,7 +791,7 @@ auto HTTPParser::parse_response(const std::vector<uint8_t>& buffer, HTTPResponse
     return ParseResult::Success;
 }
 
-auto HTTPParser::parse_chunk_size(const std::string& line) -> std::optional<size_t> {
+auto spaznet::http::HTTPParser::parse_chunk_size(const std::string& line) -> std::optional<size_t> {
     // RFC 9112 §7.1:  chunk-size = 1*HEXDIG
     //                 chunk      = chunk-size [ chunk-ext ] CRLF chunk-data CRLF
     // Be strict: no leading sign, no whitespace, at least one hex digit; stop
@@ -830,8 +830,8 @@ auto HTTPParser::parse_chunk_size(const std::string& line) -> std::optional<size
     return value;
 }
 
-auto HTTPParser::parse_chunked_body(const std::vector<uint8_t>& buffer, std::vector<uint8_t>& body,
-                                    size_t& bytes_consumed) -> HTTPParser::ParseResult {
+auto spaznet::http::HTTPParser::parse_chunked_body(const std::vector<uint8_t>& buffer, std::vector<uint8_t>& body,
+                                    size_t& bytes_consumed) -> spaznet::http::HTTPParser::ParseResult {
     bytes_consumed = 0;
     body.clear();
 
@@ -907,4 +907,4 @@ auto HTTPParser::parse_chunked_body(const std::vector<uint8_t>& buffer, std::vec
 //   readability-magic-numbers
 // )
 
-} // namespace spaznet
+} // namespace spaznet::http
