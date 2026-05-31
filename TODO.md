@@ -8,6 +8,56 @@
 > long-standing macOS PlatformIO failures fixed earlier in e9d66f6
 > remain fixed.
 
+## Active multi-session work
+
+- [ ] **Pull protocol handlers out of core into `example/<protocol>/`**
+  - Goal: `src/` and `include/` contain only the low-level server
+    (`Server`, `Socket`, `IOContext`, `Task`, `PlatformIO`). Protocol
+    code (HTTP/1.1, WebSocket, HTTP/2, UDP, QUIC + HTTP/3) lives under
+    `example/<protocol>/` with its own headers, sources, tests, and
+    `CMakeLists.txt`.
+  - **Phase 1 — ✅ shipped (a7fab2d)**: low-level
+    `Server::set_connection_handler(std::function<Task(Socket)>)` and
+    `Server::set_datagram_handler(std::function<Task(Datagram)>)`.
+    `Datagram` struct added. Legacy `set_http_handler` /
+    `set_websocket_handler` / etc. still work as compatibility
+    wrappers while the move happens.
+  - **Phase 2 — HTTP/1.1 + WebSocket → `example/http/`** (Decided
+    via the 2026-05-30 plan: types live in `spaznet::http::`
+    namespace, names verbatim. `spaznet::http::make_dispatcher(...)`
+    returns a `ConnectionHandler`.) Big chunk: extract the
+    ~400-line WS upgrade + HTTP/1.1 parse + WS frame loop from
+    `src/server_impl.cpp::handle_connection` into
+    `example/http/src/dispatcher.cpp`. Also move
+    `Socket::send_websocket_message` into example/http as a free
+    function (Socket has no business knowing about WS framing).
+  - **Phase 3 — HTTP/2 → `example/http2/`**. Status quo: dispatch
+    isn't wired into `Server::handle_connection` today; move keeps
+    the parser/HPACK code visible without changing behavior.
+  - **Phase 4 — UDP → `example/udp/`**. Becomes a thin wrapper
+    around `set_datagram_handler` for code that prefers the
+    handler-interface idiom.
+  - **Phase 5 — QUIC + HTTP/3 → `example/quic-http3/`**. The
+    `quic::` and `http3::` namespaces stay; just relocate the
+    files and update `add_subdirectory` wiring.
+  - **Phase 6 — Strip dispatch from `src/server_impl.cpp`** and
+    remove legacy setters. `handle_connection` collapses to "call
+    `connection_handler_` if set, else close". `receive_udp`
+    similarly.
+  - **Phase 7 — CMake**: new top-level option
+    `SPAZNET_BUILD_EXAMPLES` (default ON). Each example/ has its
+    own CMakeLists adding its target + tests. SPAZNET_BUILD_QUIC
+    moves to example/quic-http3 scope.
+  - **Phase 8 — Docs**: update `api-status.md`, `http.md`,
+    `websocket.md`, `quic-http3.md`, `integration.md`,
+    `migration.md`, README. All `set_http_handler` references
+    become `set_connection_handler + spaznet::http::make_dispatcher`.
+  - **Phase 9 — netbench**: depend on `add_subdirectory(libspaznet/example/http)`
+    and link against the example target.
+  - **Phase 10 — Verify** on Mac + meep: all unit / integration /
+    perf tests pass, netbench builds and runs, CI workflow doesn't
+    reference the old layout.
+
 ## From the 2026-05-27 audit
 
 - [x] Replace QUIC + HPACK with a real implementation
