@@ -76,10 +76,16 @@ build: $(BUILD_DIR)/CMakeCache.txt
 	@echo "Building with $(NPROC) parallel jobs..."
 	@cd $(BUILD_DIR) && $(MAKE) -j$(NPROC)
 
-# Clean target
+# Clean target — wipe every build directory.  Globbing `build*` catches
+# the named sanitizer variants above plus ad-hoc ones (build-quic,
+# build-noquic, build-rel, …) that developers create directly with
+# `cmake -B build-foo`.  Use a glob rather than enumerating so a new
+# variant doesn't quietly accumulate.
 clean:
 	@echo "Cleaning build directories..."
-	@rm -rf $(BUILD_DIR) $(BUILD_ASAN) $(BUILD_TSAN) $(BUILD_MSAN) $(BUILD_UBSAN) $(BUILD_DEBUG)
+	@for d in build build-*; do \
+		if [ -d "$$d" ]; then echo "  rm -rf $$d"; rm -rf "$$d"; fi; \
+	done
 	@echo "Clean complete."
 
 # Test targets
