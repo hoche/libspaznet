@@ -24,16 +24,11 @@ namespace spaznet {
 // Forward declarations
 class UDPHandler;
 class HTTP2Handler;
-class WebSocketHandler;
 #ifdef SPAZNET_HAS_QUIC
 namespace http3 {
 class QuicHttp3Service;
 }
 #endif
-
-// Forward-declared so Socket::send_websocket_message can name it before
-// websocket_handler.hpp (which depends on Socket) is included below.
-enum class WebSocketOpcode : std::uint8_t;
 
 // Socket wrapper
 class Socket {
@@ -90,27 +85,6 @@ class Socket {
     // Async write
     Task async_write(std::vector<uint8_t> data);
 
-    // Build and send a server-origin (unmasked) WebSocket frame in one
-    // allocation, skipping the WebSocketFrame value type entirely. The
-    // typical handler pattern was:
-    //
-    //     WebSocketFrame f;          // ctor
-    //     f.payload = m.data;        // payload-sized copy
-    //     auto bytes = f.serialize();// alloc + payload-sized copy
-    //     co_await s.async_write(std::move(bytes));
-    //
-    // That's two copies of the payload + two heap allocs to send one
-    // frame. This method bypasses both: it sizes the output once
-    // (header + payload), writes header bytes directly, copies payload
-    // once, and hands the buffer to async_write by move.
-    //
-    // `fin` defaults to true (a single self-contained frame). Pass
-    // span<const uint8_t>{} for an empty payload (e.g. a Pong with no
-    // data, or a Close without a body).
-    Task send_websocket_message(WebSocketOpcode opcode,
-                                std::span<const std::uint8_t> payload,
-                                bool fin = true);
-
     void close();
 };
 
@@ -121,7 +95,6 @@ class Socket {
 // Include handlers after Socket is defined
 #include <libspaznet/handlers/http2_handler.hpp>
 #include <libspaznet/handlers/udp_handler.hpp>
-#include <libspaznet/handlers/websocket_handler.hpp>
 
 namespace spaznet {
 
@@ -155,7 +128,6 @@ class Server {
     DatagramHandler datagram_handler_;
     std::unique_ptr<UDPHandler> udp_handler_;
     std::unique_ptr<HTTP2Handler> http2_handler_;
-    std::unique_ptr<WebSocketHandler> websocket_handler_;
 #ifdef SPAZNET_HAS_QUIC
     std::unique_ptr<http3::QuicHttp3Service> quic_http3_service_;
 #endif
@@ -206,7 +178,6 @@ class Server {
     // and use the low-level setters above instead.
     void set_udp_handler(std::unique_ptr<UDPHandler> handler);
     void set_http2_handler(std::unique_ptr<HTTP2Handler> handler);
-    void set_websocket_handler(std::unique_ptr<WebSocketHandler> handler);
 #ifdef SPAZNET_HAS_QUIC
     // QUIC v1 + HTTP/3 entry point. The service object owns the
     // Listener + per-connection Http3Server instances; the Server just

@@ -1,17 +1,18 @@
 #include <gtest/gtest.h>
 #include <cstdint>
-#include <libspaznet/handlers/websocket_handler.hpp>
+#include <libspaznet/websocket/dispatcher.hpp>
+#include <libspaznet/websocket/send.hpp>
 #include <vector>
 
 using namespace spaznet;
 
-TEST(WebSocketFrameTest, SerializeBasicTextFrame) {
-    WebSocketFrame frame;
+TEST(WSFrameTest, SerializeBasicTextFrame) {
+    spaznet::websocket::Frame frame;
     frame.fin = true;
     frame.rsv1 = false;
     frame.rsv2 = false;
     frame.rsv3 = false;
-    frame.opcode = WebSocketOpcode::Text;
+    frame.opcode = spaznet::websocket::Opcode::Text;
     frame.masked = false;
     frame.payload = {'H', 'e', 'l', 'l', 'o'};
     frame.payload_length = frame.payload.size();
@@ -19,15 +20,15 @@ TEST(WebSocketFrameTest, SerializeBasicTextFrame) {
     auto serialized = frame.serialize();
 
     EXPECT_GE(serialized.size(), 6); // At least 2 bytes header + 5 bytes payload
-    EXPECT_EQ(serialized[0] & 0x0F, static_cast<uint8_t>(WebSocketOpcode::Text));
+    EXPECT_EQ(serialized[0] & 0x0F, static_cast<uint8_t>(spaznet::websocket::Opcode::Text));
     EXPECT_TRUE(serialized[0] & 0x80);  // FIN bit set
     EXPECT_EQ(serialized[1] & 0x7F, 5); // Payload length
 }
 
-TEST(WebSocketFrameTest, SerializeMaskedFrame) {
-    WebSocketFrame frame;
+TEST(WSFrameTest, SerializeMaskedFrame) {
+    spaznet::websocket::Frame frame;
     frame.fin = true;
-    frame.opcode = WebSocketOpcode::Text;
+    frame.opcode = spaznet::websocket::Opcode::Text;
     frame.masked = true;
     frame.masking_key = 0x12345678;
     frame.payload = {'T', 'e', 's', 't'};
@@ -40,10 +41,10 @@ TEST(WebSocketFrameTest, SerializeMaskedFrame) {
     EXPECT_EQ(serialized[1] & 0x7F, 4); // Payload length
 }
 
-TEST(WebSocketFrameTest, SerializeLargeFrame) {
-    WebSocketFrame frame;
+TEST(WSFrameTest, SerializeLargeFrame) {
+    spaznet::websocket::Frame frame;
     frame.fin = true;
-    frame.opcode = WebSocketOpcode::Binary;
+    frame.opcode = spaznet::websocket::Opcode::Binary;
     frame.masked = false;
     frame.payload.resize(126, 0x42);
     frame.payload_length = frame.payload.size();
@@ -54,21 +55,21 @@ TEST(WebSocketFrameTest, SerializeLargeFrame) {
     EXPECT_EQ(serialized.size(), 4 + 126); // 2 bytes header + 2 bytes length + 126 bytes payload
 }
 
-TEST(WebSocketFrameTest, ParseBasicFrame) {
+TEST(WSFrameTest, ParseBasicFrame) {
     std::vector<uint8_t> data = {0x81, // FIN + Text opcode
                                  0x05, // Unmasked, length 5
                                  'H',  'e', 'l', 'l', 'o'};
 
-    auto frame = WebSocketFrame::parse(data);
+    auto frame = spaznet::websocket::Frame::parse(data);
 
     EXPECT_TRUE(frame.fin);
-    EXPECT_EQ(frame.opcode, WebSocketOpcode::Text);
+    EXPECT_EQ(frame.opcode, spaznet::websocket::Opcode::Text);
     EXPECT_FALSE(frame.masked);
     EXPECT_EQ(frame.payload_length, 5);
     EXPECT_EQ(frame.payload, std::vector<uint8_t>({'H', 'e', 'l', 'l', 'o'}));
 }
 
-TEST(WebSocketFrameTest, ParseMaskedFrame) {
+TEST(WSFrameTest, ParseMaskedFrame) {
     std::vector<uint8_t> data = {
         0x81,                        // FIN + Text opcode
         0x85,                        // Masked, length 5
@@ -76,7 +77,7 @@ TEST(WebSocketFrameTest, ParseMaskedFrame) {
         0x7f, 0x9f, 0x4d, 0x51, 0x58 // Masked payload
     };
 
-    auto frame = WebSocketFrame::parse(data);
+    auto frame = spaznet::websocket::Frame::parse(data);
 
     EXPECT_TRUE(frame.masked);
     EXPECT_EQ(frame.masking_key, 0x37fa213d);
@@ -85,7 +86,7 @@ TEST(WebSocketFrameTest, ParseMaskedFrame) {
     EXPECT_EQ(frame.payload, std::vector<uint8_t>({'H', 'e', 'l', 'l', 'o'}));
 }
 
-TEST(WebSocketFrameTest, ParseExtendedLength) {
+TEST(WSFrameTest, ParseExtendedLength) {
     std::vector<uint8_t> data = {
         0x82,       // FIN + Binary opcode
         0x7E,       // Extended length (16-bit)
@@ -94,51 +95,51 @@ TEST(WebSocketFrameTest, ParseExtendedLength) {
     data.resize(132); // Add 128 bytes of payload
     std::fill(data.begin() + 4, data.end(), 0x42);
 
-    auto frame = WebSocketFrame::parse(data);
+    auto frame = spaznet::websocket::Frame::parse(data);
 
-    EXPECT_EQ(frame.opcode, WebSocketOpcode::Binary);
+    EXPECT_EQ(frame.opcode, spaznet::websocket::Opcode::Binary);
     EXPECT_EQ(frame.payload_length, 128);
     EXPECT_EQ(frame.payload.size(), 128);
 }
 
-TEST(WebSocketFrameTest, ParseCloseFrame) {
+TEST(WSFrameTest, ParseCloseFrame) {
     std::vector<uint8_t> data = {
         0x88, // FIN + Close opcode
         0x00  // No payload
     };
 
-    auto frame = WebSocketFrame::parse(data);
+    auto frame = spaznet::websocket::Frame::parse(data);
 
-    EXPECT_EQ(frame.opcode, WebSocketOpcode::Close);
+    EXPECT_EQ(frame.opcode, spaznet::websocket::Opcode::Close);
     EXPECT_EQ(frame.payload_length, 0);
 }
 
-TEST(WebSocketFrameTest, ParsePingPong) {
+TEST(WSFrameTest, ParsePingPong) {
     std::vector<uint8_t> ping = {0x89, // FIN + Ping opcode
                                  0x05, // Length 5
                                  'p',  'i', 'n', 'g', '!'};
 
-    auto ping_frame = WebSocketFrame::parse(ping);
-    EXPECT_EQ(ping_frame.opcode, WebSocketOpcode::Ping);
+    auto ping_frame = spaznet::websocket::Frame::parse(ping);
+    EXPECT_EQ(ping_frame.opcode, spaznet::websocket::Opcode::Ping);
 
     std::vector<uint8_t> pong = {0x8A, // FIN + Pong opcode
                                  0x05, // Length 5
                                  'p',  'o', 'n', 'g', '!'};
 
-    auto pong_frame = WebSocketFrame::parse(pong);
-    EXPECT_EQ(pong_frame.opcode, WebSocketOpcode::Pong);
+    auto pong_frame = spaznet::websocket::Frame::parse(pong);
+    EXPECT_EQ(pong_frame.opcode, spaznet::websocket::Opcode::Pong);
 }
 
-TEST(WebSocketFrameTest, RoundTripSerialization) {
-    WebSocketFrame original;
+TEST(WSFrameTest, RoundTripSerialization) {
+    spaznet::websocket::Frame original;
     original.fin = true;
-    original.opcode = WebSocketOpcode::Text;
+    original.opcode = spaznet::websocket::Opcode::Text;
     original.masked = false;
     original.payload = {'T', 'e', 's', 't', ' ', 'M', 'e', 's', 's', 'a', 'g', 'e'};
     original.payload_length = original.payload.size();
 
     auto serialized = original.serialize();
-    auto parsed = WebSocketFrame::parse(serialized);
+    auto parsed = spaznet::websocket::Frame::parse(serialized);
 
     EXPECT_EQ(parsed.fin, original.fin);
     EXPECT_EQ(parsed.opcode, original.opcode);
@@ -146,26 +147,26 @@ TEST(WebSocketFrameTest, RoundTripSerialization) {
     EXPECT_EQ(parsed.payload, original.payload);
 }
 
-TEST(WebSocketFrameTest, ContinuationFrame) {
-    WebSocketFrame frame;
+TEST(WSFrameTest, ContinuationFrame) {
+    spaznet::websocket::Frame frame;
     frame.fin = false; // Not final
-    frame.opcode = WebSocketOpcode::Continuation;
+    frame.opcode = spaznet::websocket::Opcode::Continuation;
     frame.masked = false;
     frame.payload = {'c', 'o', 'n', 't', 'i', 'n', 'u', 'e'};
     frame.payload_length = frame.payload.size();
 
     auto serialized = frame.serialize();
-    auto parsed = WebSocketFrame::parse(serialized);
+    auto parsed = spaznet::websocket::Frame::parse(serialized);
 
     EXPECT_FALSE(parsed.fin);
-    EXPECT_EQ(parsed.opcode, WebSocketOpcode::Continuation);
+    EXPECT_EQ(parsed.opcode, spaznet::websocket::Opcode::Continuation);
 }
 
-TEST(WebSocketFrameTest, SerializeAndParse64BitLength) {
-    WebSocketFrame frame;
+TEST(WSFrameTest, SerializeAndParse64BitLength) {
+    spaznet::websocket::Frame frame;
     frame.fin = true;
     frame.rsv1 = frame.rsv2 = frame.rsv3 = false;
-    frame.opcode = WebSocketOpcode::Binary;
+    frame.opcode = spaznet::websocket::Opcode::Binary;
     frame.masked = false;
     frame.payload.resize(70000, 0xAA);
     frame.payload_length = frame.payload.size();
@@ -173,7 +174,7 @@ TEST(WebSocketFrameTest, SerializeAndParse64BitLength) {
     auto serialized = frame.serialize();
     EXPECT_EQ(serialized[1] & 0x7F, 127); // Uses 64-bit length path
 
-    auto parsed = WebSocketFrame::parse(serialized);
+    auto parsed = spaznet::websocket::Frame::parse(serialized);
     EXPECT_EQ(parsed.payload_length, frame.payload_length);
     EXPECT_EQ(parsed.payload.size(), frame.payload.size());
     EXPECT_EQ(parsed.payload.front(), 0xAA);
@@ -183,84 +184,84 @@ TEST(WebSocketFrameTest, SerializeAndParse64BitLength) {
 // --- RFC 6455 compliance tests ---
 
 // Reserved opcodes (0x3–0x7, 0xB–0xF) MUST cause the connection to fail.
-TEST(WebSocketFrameTest, RejectReservedOpcode) {
+TEST(WSFrameTest, RejectReservedOpcode) {
     std::vector<uint8_t> data = {0x83, 0x00}; // FIN + reserved opcode 0x3
-    EXPECT_THROW(WebSocketFrame::parse(data), std::runtime_error);
+    EXPECT_THROW(spaznet::websocket::Frame::parse(data), std::runtime_error);
 
     std::vector<uint8_t> data2 = {0x8B, 0x00}; // FIN + reserved opcode 0xB
-    EXPECT_THROW(WebSocketFrame::parse(data2), std::runtime_error);
+    EXPECT_THROW(spaznet::websocket::Frame::parse(data2), std::runtime_error);
 }
 
 // RSV1/2/3 bits set without a negotiated extension MUST fail.
-TEST(WebSocketFrameTest, RejectRsvBits) {
+TEST(WSFrameTest, RejectRsvBits) {
     std::vector<uint8_t> rsv1 = {0xC1, 0x00}; // FIN + RSV1 + Text
-    EXPECT_THROW(WebSocketFrame::parse(rsv1), std::runtime_error);
+    EXPECT_THROW(spaznet::websocket::Frame::parse(rsv1), std::runtime_error);
 
     std::vector<uint8_t> rsv2 = {0xA1, 0x00}; // FIN + RSV2 + Text
-    EXPECT_THROW(WebSocketFrame::parse(rsv2), std::runtime_error);
+    EXPECT_THROW(spaznet::websocket::Frame::parse(rsv2), std::runtime_error);
 
     std::vector<uint8_t> rsv3 = {0x91, 0x00}; // FIN + RSV3 + Text
-    EXPECT_THROW(WebSocketFrame::parse(rsv3), std::runtime_error);
+    EXPECT_THROW(spaznet::websocket::Frame::parse(rsv3), std::runtime_error);
 }
 
 // 16-bit length must be used only when length >= 126.
-TEST(WebSocketFrameTest, RejectNonMinimal16BitLength) {
+TEST(WSFrameTest, RejectNonMinimal16BitLength) {
     std::vector<uint8_t> data = {
         0x82,       // FIN + Binary
         0x7E,       // 16-bit length form
         0x00, 0x05, // Length 5 — should have used 7-bit form
     };
     data.resize(4 + 5, 0); // pad to make the payload itself complete
-    EXPECT_THROW(WebSocketFrame::parse(data), std::runtime_error);
+    EXPECT_THROW(spaznet::websocket::Frame::parse(data), std::runtime_error);
 }
 
 // 64-bit length must be used only when length >= 65536.
-TEST(WebSocketFrameTest, RejectNonMinimal64BitLength) {
+TEST(WSFrameTest, RejectNonMinimal64BitLength) {
     std::vector<uint8_t> data = {
         0x82, // FIN + Binary
         0x7F, // 64-bit length form
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x01, 0x00, // Length 256 — should have used 16-bit form
     };
-    EXPECT_THROW(WebSocketFrame::parse(data), std::runtime_error);
+    EXPECT_THROW(spaznet::websocket::Frame::parse(data), std::runtime_error);
 }
 
 // 64-bit length with the high bit set is invalid (RFC 6455 §5.2).
-TEST(WebSocketFrameTest, Reject64BitLengthWithHighBit) {
+TEST(WSFrameTest, Reject64BitLengthWithHighBit) {
     std::vector<uint8_t> data = {
         0x82, // FIN + Binary
         0x7F, // 64-bit length form
         0x80, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, // High bit set
     };
-    EXPECT_THROW(WebSocketFrame::parse(data), std::runtime_error);
+    EXPECT_THROW(spaznet::websocket::Frame::parse(data), std::runtime_error);
 }
 
 // Control frames MUST NOT be fragmented (FIN must be set).
-TEST(WebSocketFrameTest, RejectFragmentedControlFrame) {
+TEST(WSFrameTest, RejectFragmentedControlFrame) {
     std::vector<uint8_t> ping_no_fin = {0x09, 0x00}; // !FIN + Ping
-    EXPECT_THROW(WebSocketFrame::parse(ping_no_fin), std::runtime_error);
+    EXPECT_THROW(spaznet::websocket::Frame::parse(ping_no_fin), std::runtime_error);
 
     std::vector<uint8_t> close_no_fin = {0x08, 0x00}; // !FIN + Close
-    EXPECT_THROW(WebSocketFrame::parse(close_no_fin), std::runtime_error);
+    EXPECT_THROW(spaznet::websocket::Frame::parse(close_no_fin), std::runtime_error);
 }
 
 // Control frames MUST have a payload length of 125 or less.
-TEST(WebSocketFrameTest, RejectOversizeControlFrame) {
+TEST(WSFrameTest, RejectOversizeControlFrame) {
     // FIN + Ping, 16-bit length form claiming 200 bytes
     std::vector<uint8_t> data = {0x89, 0x7E, 0x00, 0xC8};
     data.resize(4 + 200, 0);
-    EXPECT_THROW(WebSocketFrame::parse(data), std::runtime_error);
+    EXPECT_THROW(spaznet::websocket::Frame::parse(data), std::runtime_error);
 }
 
 // Payload above kMaxPayloadBytes must not be allocated.
-TEST(WebSocketFrameTest, RejectOversizePayload) {
-    const uint64_t huge = WebSocketFrame::kMaxPayloadBytes + 1;
+TEST(WSFrameTest, RejectOversizePayload) {
+    const uint64_t huge = spaznet::websocket::Frame::kMaxPayloadBytes + 1;
     std::vector<uint8_t> data = {0x82, 0x7F};
     for (int i = 7; i >= 0; --i) {
         data.push_back(static_cast<uint8_t>((huge >> (i * 8)) & 0xFF));
     }
     // Note: we do NOT extend data to the full declared length — parse must
     // reject before even attempting to read that much.
-    EXPECT_THROW(WebSocketFrame::parse(data), std::runtime_error);
+    EXPECT_THROW(spaznet::websocket::Frame::parse(data), std::runtime_error);
 }

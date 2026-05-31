@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <chrono>
-#include <libspaznet/handlers/websocket_handler.hpp>
+#include <libspaznet/websocket/dispatcher.hpp>
+#include <libspaznet/websocket/send.hpp>
 #include <libspaznet/server.hpp>
 #include <sstream>
 #include <string>
@@ -96,10 +97,10 @@ bool recv_exact(int fd, std::vector<uint8_t>& out, size_t n) {
 }
 
 std::vector<uint8_t> make_masked_frame(const std::vector<uint8_t>& payload, uint32_t mask) {
-    WebSocketFrame frame;
+    spaznet::websocket::Frame frame;
     frame.fin = true;
     frame.rsv1 = frame.rsv2 = frame.rsv3 = false;
-    frame.opcode = WebSocketOpcode::Text;
+    frame.opcode = spaznet::websocket::Opcode::Text;
     frame.masked = true;
     frame.masking_key = mask;
     frame.payload = payload;
@@ -154,13 +155,13 @@ std::string handshake_request(const std::string& key) {
     return oss.str();
 }
 
-class EchoWebSocketHandler : public WebSocketHandler {
+class EchoWSHandler : public spaznet::websocket::Handler {
   public:
     Task on_open(Socket&) override {
         co_return;
     }
-    Task handle_message(const WebSocketMessage& message, Socket& socket) override {
-        WebSocketFrame frame;
+    Task handle_message(const spaznet::websocket::Message& message, Socket& socket) override {
+        spaznet::websocket::Frame frame;
         frame.fin = true;
         frame.rsv1 = frame.rsv2 = frame.rsv3 = false;
         frame.opcode = message.opcode;
@@ -180,7 +181,7 @@ class EchoWebSocketHandler : public WebSocketHandler {
 TEST(WebSocketPerformance, EchoesHundredsOfFramesQuickly) {
     const uint16_t port = 7999;
     Server server(4);
-    server.set_websocket_handler(std::make_unique<EchoWebSocketHandler>());
+    server.set_connection_handler(spaznet::websocket::make_dispatcher(nullptr, std::make_unique<EchoWSHandler>()));
     server.listen_tcp(port);
     std::thread t([&]() { server.run(); });
     std::this_thread::sleep_for(std::chrono::milliseconds(200));

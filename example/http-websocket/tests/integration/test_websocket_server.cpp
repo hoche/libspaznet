@@ -2,7 +2,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
-#include <libspaznet/handlers/websocket_handler.hpp>
+#include <libspaznet/websocket/dispatcher.hpp>
+#include <libspaznet/websocket/send.hpp>
 #include <libspaznet/server.hpp>
 #include <random>
 #include <sstream>
@@ -98,9 +99,9 @@ bool recv_exact(int fd, std::vector<uint8_t>& out, size_t n) {
     return total_received == n;
 }
 
-std::vector<uint8_t> make_masked_frame(WebSocketOpcode opcode, const std::vector<uint8_t>& payload,
+std::vector<uint8_t> make_masked_frame(spaznet::websocket::Opcode opcode, const std::vector<uint8_t>& payload,
                                        uint32_t masking_key) {
-    WebSocketFrame frame;
+    spaznet::websocket::Frame frame;
     frame.fin = true;
     frame.rsv1 = frame.rsv2 = frame.rsv3 = false;
     frame.opcode = opcode;
@@ -111,7 +112,7 @@ std::vector<uint8_t> make_masked_frame(WebSocketOpcode opcode, const std::vector
     return frame.serialize();
 }
 
-WebSocketFrame read_frame(int fd) {
+spaznet::websocket::Frame read_frame(int fd) {
     std::vector<uint8_t> header;
     if (!recv_exact(fd, header, 2)) {
         throw std::runtime_error("failed to read header");
@@ -153,12 +154,12 @@ WebSocketFrame read_frame(int fd) {
             }
         }
     }
-    WebSocketFrame frame;
+    spaznet::websocket::Frame frame;
     frame.fin = (header[0] & 0x80) != 0;
     frame.rsv1 = (header[0] & 0x40) != 0;
     frame.rsv2 = (header[0] & 0x20) != 0;
     frame.rsv3 = (header[0] & 0x10) != 0;
-    frame.opcode = static_cast<WebSocketOpcode>(header[0] & 0x0F);
+    frame.opcode = static_cast<spaznet::websocket::Opcode>(header[0] & 0x0F);
     frame.masked = masked;
     frame.payload_length = payload.size();
     frame.payload = payload;
@@ -179,7 +180,7 @@ std::string handshake_request(const std::string& key) {
 
 } // namespace
 
-class EchoWebSocketHandler : public WebSocketHandler {
+class EchoWSHandler : public spaznet::websocket::Handler {
   public:
     std::atomic<int> open_count{0};
     std::atomic<int> close_count{0};
@@ -187,8 +188,8 @@ class EchoWebSocketHandler : public WebSocketHandler {
         open_count.fetch_add(1);
         co_return;
     }
-    Task handle_message(const WebSocketMessage& message, Socket& socket) override {
-        WebSocketFrame frame;
+    Task handle_message(const spaznet::websocket::Message& message, Socket& socket) override {
+        spaznet::websocket::Frame frame;
         frame.fin = true;
         frame.rsv1 = frame.rsv2 = frame.rsv3 = false;
         frame.opcode = message.opcode;
@@ -212,10 +213,10 @@ class WebSocketServerTest : public ::testing::Test {
         // the handler the server is calling into. (The old code
         // constructed two separate handler instances and read counters
         // off the wrong one.)
-        auto handler_unique = std::make_unique<EchoWebSocketHandler>();
+        auto handler_unique = std::make_unique<EchoWSHandler>();
         handler = handler_unique.get();
         server = std::make_unique<Server>(2);
-        server->set_websocket_handler(std::move(handler_unique));
+        server->set_connection_handler(spaznet::websocket::make_dispatcher(nullptr, std::move(handler_unique)));
         port = 7877;
         server->listen_tcp(port);
         server_thread = std::thread([this]() { server->run(); });
@@ -230,7 +231,7 @@ class WebSocketServerTest : public ::testing::Test {
     }
 
     uint16_t port{};
-    EchoWebSocketHandler* handler{nullptr}; // owned by the server
+    EchoWSHandler* handler{nullptr}; // owned by the server
     std::unique_ptr<Server> server;
     std::thread server_thread;
 };
@@ -271,14 +272,14 @@ TEST_F(WebSocketServerTest, EchoesMaskedTextFrame) {
 
     std::string message = "hello-rfc6455";
     auto frame = make_masked_frame(
-        WebSocketOpcode::Text, std::vector<uint8_t>(message.begin(), message.end()), 0x11223344);
+        spaznet::websocket::Opcode::Text, std::vector<uint8_t>(message.begin(), message.end()), 0x11223344);
     ASSERT_TRUE(send_all(fd, frame));
 
     // Wait for echo
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     auto echoed = read_frame(fd);
-    EXPECT_EQ(echoed.opcode, WebSocketOpcode::Text);
+    EXPECT_EQ(echoed.opcode, spaznet::websocket::Opcode::Text);
     std::string echoed_text(echoed.payload.begin(), echoed.payload.end());
     EXPECT_EQ(echoed_text, message);
     close_socket(fd);
@@ -294,13 +295,13 @@ TEST_F(WebSocketServerTest, RespondsToPingWithPong) {
     recv(fd, resp, sizeof(resp), 0);
 
     std::vector<uint8_t> payload = {'p', 'i', 'n', 'g'};
-    auto ping = make_masked_frame(WebSocketOpcode::Ping, payload, 0xA1B2C3D4);
+    auto ping = make_masked_frame(spaznet::websocket::Opcode::Ping, payload, 0xA1B2C3D4);
     ASSERT_TRUE(send_all(fd, ping));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     auto frame = read_frame(fd);
-    EXPECT_EQ(frame.opcode, WebSocketOpcode::Pong);
+    EXPECT_EQ(frame.opcode, spaznet::websocket::Opcode::Pong);
     EXPECT_EQ(frame.payload, payload);
     close_socket(fd);
 }
@@ -318,10 +319,10 @@ TEST_F(WebSocketServerTest, HandlesFragmentedMessage) {
     std::string part2 = "fragmented world";
 
     // First fragment (FIN = 0)
-    WebSocketFrame f1;
+    spaznet::websocket::Frame f1;
     f1.fin = false;
     f1.rsv1 = f1.rsv2 = f1.rsv3 = false;
-    f1.opcode = WebSocketOpcode::Text;
+    f1.opcode = spaznet::websocket::Opcode::Text;
     f1.masked = true;
     f1.masking_key = 0xCAFEBABE;
     f1.payload.assign(part1.begin(), part1.end());
@@ -329,10 +330,10 @@ TEST_F(WebSocketServerTest, HandlesFragmentedMessage) {
     auto bytes1 = f1.serialize();
 
     // Continuation (FIN = 1)
-    WebSocketFrame f2;
+    spaznet::websocket::Frame f2;
     f2.fin = true;
     f2.rsv1 = f2.rsv2 = f2.rsv3 = false;
-    f2.opcode = WebSocketOpcode::Continuation;
+    f2.opcode = spaznet::websocket::Opcode::Continuation;
     f2.masked = true;
     f2.masking_key = 0xCAFEBABE;
     f2.payload.assign(part2.begin(), part2.end());
@@ -346,7 +347,7 @@ TEST_F(WebSocketServerTest, HandlesFragmentedMessage) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Wait for server to process
 
     auto echoed = read_frame(fd);
-    EXPECT_EQ(echoed.opcode, WebSocketOpcode::Text);
+    EXPECT_EQ(echoed.opcode, spaznet::websocket::Opcode::Text);
     std::string combined(echoed.payload.begin(), echoed.payload.end());
     EXPECT_EQ(combined, part1 + part2);
     close_socket(fd);
@@ -362,10 +363,10 @@ TEST_F(WebSocketServerTest, RejectsUnmaskedClientFrame) {
     recv(fd, resp, sizeof(resp), 0);
 
     // Send unmasked frame (protocol error)
-    WebSocketFrame bad;
+    spaznet::websocket::Frame bad;
     bad.fin = true;
     bad.rsv1 = bad.rsv2 = bad.rsv3 = false;
-    bad.opcode = WebSocketOpcode::Text;
+    bad.opcode = spaznet::websocket::Opcode::Text;
     bad.masked = false;
     bad.payload = {'b', 'a', 'd'};
     bad.payload_length = bad.payload.size();
@@ -376,7 +377,7 @@ TEST_F(WebSocketServerTest, RejectsUnmaskedClientFrame) {
 
     // Server should respond with Close
     auto close_frame = read_frame(fd);
-    EXPECT_EQ(close_frame.opcode, WebSocketOpcode::Close);
+    EXPECT_EQ(close_frame.opcode, spaznet::websocket::Opcode::Close);
     close_socket(fd);
 }
 
@@ -402,7 +403,7 @@ int open_and_handshake(uint16_t port) {
 }
 
 // Extract the 2-byte close code from a Close frame's payload (RFC 6455 §5.5.1).
-uint16_t close_code(const WebSocketFrame& f) {
+uint16_t close_code(const spaznet::websocket::Frame& f) {
     if (f.payload.size() < 2) {
         return 0;
     }
@@ -422,7 +423,7 @@ TEST_F(WebSocketServerTest, RejectsReservedOpcode) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     auto frame = read_frame(fd);
-    EXPECT_EQ(frame.opcode, WebSocketOpcode::Close);
+    EXPECT_EQ(frame.opcode, spaznet::websocket::Opcode::Close);
     EXPECT_EQ(close_code(frame), 1002);
     close_socket(fd);
 }
@@ -437,7 +438,7 @@ TEST_F(WebSocketServerTest, RejectsRsvBitSet) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     auto frame = read_frame(fd);
-    EXPECT_EQ(frame.opcode, WebSocketOpcode::Close);
+    EXPECT_EQ(frame.opcode, spaznet::websocket::Opcode::Close);
     EXPECT_EQ(close_code(frame), 1002);
     close_socket(fd);
 }
@@ -456,7 +457,7 @@ TEST_F(WebSocketServerTest, RejectsNonMinimal16BitLength) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     auto frame = read_frame(fd);
-    EXPECT_EQ(frame.opcode, WebSocketOpcode::Close);
+    EXPECT_EQ(frame.opcode, spaznet::websocket::Opcode::Close);
     EXPECT_EQ(close_code(frame), 1002);
     close_socket(fd);
 }
@@ -473,7 +474,7 @@ TEST_F(WebSocketServerTest, RejectsNonMinimal64BitLength) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     auto frame = read_frame(fd);
-    EXPECT_EQ(frame.opcode, WebSocketOpcode::Close);
+    EXPECT_EQ(frame.opcode, spaznet::websocket::Opcode::Close);
     EXPECT_EQ(close_code(frame), 1002);
     close_socket(fd);
 }
@@ -490,7 +491,7 @@ TEST_F(WebSocketServerTest, RejectsLength64HighBitSet) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     auto frame = read_frame(fd);
-    EXPECT_EQ(frame.opcode, WebSocketOpcode::Close);
+    EXPECT_EQ(frame.opcode, spaznet::websocket::Opcode::Close);
     EXPECT_EQ(close_code(frame), 1002);
     close_socket(fd);
 }
@@ -503,7 +504,7 @@ TEST_F(WebSocketServerTest, RejectsOversizePayloadWithoutAllocating) {
     int fd = open_and_handshake(port);
     ASSERT_GE(fd, 0);
 
-    const uint64_t huge = WebSocketFrame::kMaxPayloadBytes + 1;
+    const uint64_t huge = spaznet::websocket::Frame::kMaxPayloadBytes + 1;
     std::vector<uint8_t> raw = {0x82, 0xFF}; // FIN + Binary, MASKED, 64-bit length
     for (int i = 7; i >= 0; --i) {
         raw.push_back(static_cast<uint8_t>((huge >> (i * 8)) & 0xFF));
@@ -513,7 +514,7 @@ TEST_F(WebSocketServerTest, RejectsOversizePayloadWithoutAllocating) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     auto frame = read_frame(fd);
-    EXPECT_EQ(frame.opcode, WebSocketOpcode::Close);
+    EXPECT_EQ(frame.opcode, spaznet::websocket::Opcode::Close);
     EXPECT_EQ(close_code(frame), 1009);
     close_socket(fd);
 }

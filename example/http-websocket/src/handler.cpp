@@ -1,10 +1,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
-#include <libspaznet/handlers/websocket_handler.hpp>
+#include <libspaznet/websocket/handler.hpp>
 #include <limits>
 
-namespace spaznet {
+namespace spaznet::websocket {
 
 namespace {
 constexpr uint8_t kFinBit = 0x80;
@@ -30,7 +30,7 @@ constexpr uint32_t kShift24 = 24;
 constexpr uint32_t kShift16 = 16;
 } // namespace
 
-auto WebSocketFrame::serialize() const -> std::vector<uint8_t> {
+auto Frame::serialize() const -> std::vector<uint8_t> {
     std::vector<uint8_t> result;
     result.reserve(kMaxHeaderSizeBytes + payload.size()); // Max header size
 
@@ -84,29 +84,29 @@ namespace {
 
 // RFC 6455 §5.2 defines a fixed set of opcodes. Anything else (0x3–0x7,
 // 0xB–0xF) is reserved and MUST cause the connection to fail.
-bool is_known_opcode(WebSocketOpcode op) {
+bool is_known_opcode(Opcode op) {
     switch (op) {
-        case WebSocketOpcode::Continuation:
-        case WebSocketOpcode::Text:
-        case WebSocketOpcode::Binary:
-        case WebSocketOpcode::Close:
-        case WebSocketOpcode::Ping:
-        case WebSocketOpcode::Pong:
+        case Opcode::Continuation:
+        case Opcode::Text:
+        case Opcode::Binary:
+        case Opcode::Close:
+        case Opcode::Ping:
+        case Opcode::Pong:
             return true;
     }
     return false;
 }
 
-bool is_control_opcode(WebSocketOpcode op) {
-    return op == WebSocketOpcode::Close || op == WebSocketOpcode::Ping ||
-           op == WebSocketOpcode::Pong;
+bool is_control_opcode(Opcode op) {
+    return op == Opcode::Close || op == Opcode::Ping ||
+           op == Opcode::Pong;
 }
 
 } // namespace
 
 
-auto WebSocketFrame::parse(const std::vector<uint8_t>& data) -> WebSocketFrame {
-    WebSocketFrame frame;
+auto Frame::parse(const std::vector<uint8_t>& data) -> Frame {
+    Frame frame;
 
     if (data.size() < kBaseHeaderSize) {
         throw std::runtime_error("WebSocket frame: short header");
@@ -117,7 +117,7 @@ auto WebSocketFrame::parse(const std::vector<uint8_t>& data) -> WebSocketFrame {
     frame.rsv1 = (data[0] & kRsv1Bit) != 0;
     frame.rsv2 = (data[0] & kRsv2Bit) != 0;
     frame.rsv3 = (data[0] & kRsv3Bit) != 0;
-    frame.opcode = static_cast<WebSocketOpcode>(data[0] & kOpcodeMask);
+    frame.opcode = static_cast<Opcode>(data[0] & kOpcodeMask);
 
     // RFC 6455 §5.2: reserved opcodes and RSV bits (absent a negotiated
     // extension) MUST fail the connection. We have no extensions, so any
@@ -210,4 +210,4 @@ auto WebSocketFrame::parse(const std::vector<uint8_t>& data) -> WebSocketFrame {
     return frame;
 }
 
-} // namespace spaznet
+} // namespace spaznet::websocket

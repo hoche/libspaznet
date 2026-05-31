@@ -85,7 +85,6 @@ set(SOURCES
     src/platform/platform_io.cpp
     src/handlers/udp_handler.cpp
     src/handlers/http2_handler.cpp
-    src/handlers/websocket_handler.cpp
     src/utils/string_utils.cpp
     src/utils/number_utils.cpp
     src/utils/binary_utils.cpp
@@ -124,7 +123,6 @@ set(HEADERS
     include/libspaznet/logger.hpp
     include/libspaznet/handlers/udp_handler.hpp
     include/libspaznet/handlers/http2_handler.hpp
-    include/libspaznet/handlers/websocket_handler.hpp
     include/libspaznet/quic/varint.hpp
     include/libspaznet/quic/crypto.hpp
     include/libspaznet/quic/packet.hpp
@@ -227,11 +225,6 @@ endfunction()
 
 spaznet_apply_warnings(spaznet)
 
-# ---- Example ------------------------------------------------------------
-add_executable(example example/server.cpp)
-target_link_libraries(example PRIVATE spaznet)
-spaznet_apply_warnings(example)
-
 # ---- Install + find_package config --------------------------------------
 install(TARGETS spaznet
     EXPORT spaznetTargets
@@ -322,7 +315,6 @@ set(SPAZNET_UNIT_TEST_SOURCES
     tests/unit/test_platform_io.cpp
     tests/unit/test_io_context.cpp
     tests/unit/test_timer.cpp
-    tests/unit/test_websocket_handler.cpp
     tests/unit/test_http2_handler.cpp
     tests/unit/test_rfc9113_parser.cpp
     tests/unit/test_logger.cpp
@@ -347,7 +339,6 @@ spaznet_apply_test_warnings(test_unit)
 
 add_executable(test_integration
     tests/test_main.cpp
-    tests/integration/test_websocket_server.cpp
     tests/integration/test_udp_server.cpp
     tests/integration/test_rfc9113_compliance.cpp
 )
@@ -358,7 +349,6 @@ add_executable(test_performance
     tests/test_main.cpp
     tests/performance/test_iperf_integration.cpp
     tests/performance/test_rfc9113_performance.cpp
-    tests/performance/test_websocket_rfc6455_performance.cpp
 )
 target_link_libraries(test_performance PRIVATE spaznet GTest::gtest GTest::gmock)
 spaznet_apply_test_warnings(test_performance)
@@ -379,4 +369,5 @@ add_test(NAME PerformanceTests COMMAND test_performance)
 option(SPAZNET_BUILD_EXAMPLES "Build example protocol libraries (HTTP, etc.)" ON)
 if(SPAZNET_BUILD_EXAMPLES)
     add_subdirectory(example/http)
+    add_subdirectory(example/http-websocket)
 endif()

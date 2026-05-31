@@ -20,22 +20,19 @@
 
 namespace spaznet::http {
 
-namespace {
-
-// Per-connection keep-alive loop.  Mirrors what
-// Server::handle_connection used to do for plain-HTTP requests before
-// the dispatch was extracted into example/http.
-auto serve(Socket socket, HTTPHandler& handler) -> ::spaznet::Task {
+auto serve_keep_alive(::spaznet::Socket socket, HTTPHandler& handler,
+                      std::vector<std::uint8_t> initial_buffer) -> ::spaznet::Task {
     constexpr std::size_t kReadChunk = 8192;
     constexpr std::size_t kMaxRequestBytes = 1024 * 1024; // 1 MiB safety cap
 
-    std::vector<uint8_t> buffer;
-    // First read primes the buffer; subsequent reads top up as the
-    // parser asks for more.
-    co_await socket.async_read(buffer, 2048);
+    std::vector<uint8_t> buffer = std::move(initial_buffer);
     if (buffer.empty()) {
-        socket.close();
-        co_return;
+        // No prior sniff — prime from the socket.
+        co_await socket.async_read(buffer, 2048);
+        if (buffer.empty()) {
+            socket.close();
+            co_return;
+        }
     }
 
     while (true) {
@@ -115,8 +112,6 @@ auto serve(Socket socket, HTTPHandler& handler) -> ::spaznet::Task {
     }
 }
 
-} // namespace
-
 auto make_dispatcher(std::unique_ptr<HTTPHandler> handler) -> ::spaznet::ConnectionHandler {
     // std::function requires its callable to be copyable; std::unique_ptr
     // isn't.  Wrap the handler in a shared_ptr so the std::function
@@ -124,7 +119,7 @@ auto make_dispatcher(std::unique_ptr<HTTPHandler> handler) -> ::spaznet::Connect
     // shared across all connections.
     std::shared_ptr<HTTPHandler> shared(handler.release());
     return [shared](::spaznet::Socket sock) -> ::spaznet::Task {
-        co_await serve(std::move(sock), *shared);
+        co_await serve_keep_alive(std::move(sock), *shared, {});
     };
 }
 
