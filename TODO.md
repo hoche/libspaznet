@@ -22,15 +22,34 @@
     `Datagram` struct added. Legacy `set_http_handler` /
     `set_websocket_handler` / etc. still work as compatibility
     wrappers while the move happens.
-  - **Phase 2 — HTTP/1.1 + WebSocket → `example/http/`** (Decided
-    via the 2026-05-30 plan: types live in `spaznet::http::`
-    namespace, names verbatim. `spaznet::http::make_dispatcher(...)`
-    returns a `ConnectionHandler`.) Big chunk: extract the
-    ~400-line WS upgrade + HTTP/1.1 parse + WS frame loop from
-    `src/server_impl.cpp::handle_connection` into
-    `example/http/src/dispatcher.cpp`. Also move
-    `Socket::send_websocket_message` into example/http as a free
-    function (Socket has no business knowing about WS framing).
+  - **Phase 2a — HTTP/1.1 → `example/http/`** (plain HTTP, no
+    WebSocket). Types in `spaznet::http::` namespace, names
+    verbatim (`HTTPHandler`, `HTTPRequest`, `HTTPResponse`,
+    `HTTPParser`). Factory:
+    `spaznet::http::make_dispatcher(unique_ptr<HTTPHandler>)
+    -> ConnectionHandler`. Dispatcher reads requests, runs
+    keep-alive loop, calls the user's handler — no WS upgrade
+    detection. Demo: `example/http/demo/hello.cpp` (10-line
+    "Hello, World" server).
+  - **Phase 2b — HTTP/1.1 + WebSocket → `example/http-websocket/`**
+    (combined stack, depends on `example/http/` for the HTTP/1.1
+    parser used during upgrade). WS types live in
+    `spaznet::websocket::` namespace, prefix dropped from names
+    (`Handler`, `Frame`, `Message`, `Opcode`).
+    `spaznet::websocket::send_message(Socket&, Opcode, span,
+    bool fin=true)` is the free-function replacement for
+    `Socket::send_websocket_message`. Factory:
+    `spaznet::websocket::make_dispatcher(
+        unique_ptr<spaznet::http::HTTPHandler>,
+        unique_ptr<spaznet::websocket::Handler>)
+        -> ConnectionHandler`. Dispatcher reads first request,
+    detects WS upgrade, either runs the WS frame loop or hands
+    to the HTTP dispatcher (composing example/http's
+    machinery). Demo: `example/http-websocket/demo/echo.cpp`
+    (WebSocket echo server). This phase is where the ~400-line
+    WS frame loop currently inline in
+    `src/server_impl.cpp::handle_connection` ends up — it moves
+    to `example/http-websocket/src/dispatcher.cpp`.
   - **Phase 3 — HTTP/2 → `example/http2/`**. Status quo: dispatch
     isn't wired into `Server::handle_connection` today; move keeps
     the parser/HPACK code visible without changing behavior.
