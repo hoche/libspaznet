@@ -10,6 +10,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <sys/socket.h>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -126,10 +127,34 @@ class Socket {
 
 namespace spaznet {
 
+// Raw UDP datagram delivered to a DatagramHandler.  The peer fields are
+// filled in from the kernel-reported sockaddr; `peer` + `peer_len` are
+// kept verbatim so a handler can sendto() back without re-resolving.
+struct Datagram {
+    std::vector<std::uint8_t> data;
+    std::string peer_addr;     // dotted-quad / colon-hex (best-effort, diagnostics)
+    std::uint16_t peer_port{0};
+    sockaddr_storage peer{};
+    socklen_t peer_len{0};
+    int fd{-1};                // the UDP socket the datagram arrived on
+};
+
+// Per-connection callback: the Server invokes this once for each
+// accepted TCP connection, handing ownership of the Socket.  The
+// connection lives until the Task completes; the Socket destructor
+// closes the fd if the handler hasn't already.
+using ConnectionHandler = std::function<Task(Socket)>;
+
+// Per-datagram callback: the Server invokes this once for each UDP
+// datagram received on any port it's listening on.
+using DatagramHandler = std::function<Task(Datagram)>;
+
 // Server class
 class Server {
   private:
     std::unique_ptr<IOContext> io_context_;
+    ConnectionHandler connection_handler_;
+    DatagramHandler datagram_handler_;
     std::unique_ptr<UDPHandler> udp_handler_;
     std::unique_ptr<HTTPHandler> http_handler_;
     std::unique_ptr<HTTP2Handler> http2_handler_;
@@ -167,7 +192,21 @@ class Server {
     void listen_tcp(uint16_t port);
     void listen_udp(uint16_t port);
 
-    // Register handlers
+    // ---- Low-level callbacks (preferred). ----
+    // set_connection_handler is invoked once per accepted TCP
+    // connection.  set_datagram_handler is invoked once per received
+    // UDP datagram.  Examples under example/<protocol>/ provide
+    // factory helpers (e.g. spaznet::http::make_dispatcher) that
+    // build these callbacks from higher-level handler interfaces.
+    void set_connection_handler(ConnectionHandler handler);
+    void set_datagram_handler(DatagramHandler handler);
+
+    // ---- Legacy handler-pattern setters (deprecated). ----
+    // These remain as compatibility wrappers around
+    // set_connection_handler / set_datagram_handler while the
+    // protocol-specific handlers are moved out of the core library.
+    // New code should depend on the example/<protocol> libraries
+    // and use the low-level setters above instead.
     void set_udp_handler(std::unique_ptr<UDPHandler> handler);
     void set_http_handler(std::unique_ptr<HTTPHandler> handler);
     void set_http2_handler(std::unique_ptr<HTTP2Handler> handler);

@@ -490,6 +490,14 @@ Server::~Server() {
     stop();
 }
 
+void Server::set_connection_handler(ConnectionHandler handler) {
+    connection_handler_ = std::move(handler);
+}
+
+void Server::set_datagram_handler(DatagramHandler handler) {
+    datagram_handler_ = std::move(handler);
+}
+
 void Server::set_udp_handler(std::unique_ptr<UDPHandler> handler) {
     udp_handler_ = std::move(handler);
 }
@@ -669,21 +677,38 @@ Task Server::receive_udp(int udp_fd) {
 
         buffer.resize(static_cast<size_t>(received));
 
+        // Best-effort address/port stringification for diagnostics.
+        char host[INET6_ADDRSTRLEN]{};
+        uint16_t port = 0;
+        if (addr.ss_family == AF_INET) {
+            const auto* a = reinterpret_cast<const sockaddr_in*>(&addr);
+            inet_ntop(AF_INET, &a->sin_addr, host, sizeof(host));
+            port = ntohs(a->sin_port);
+        } else if (addr.ss_family == AF_INET6) {
+            const auto* a6 = reinterpret_cast<const sockaddr_in6*>(&addr);
+            inet_ntop(AF_INET6, &a6->sin6_addr, host, sizeof(host));
+            port = ntohs(a6->sin6_port);
+        }
+
+        // Low-level path: deliver the raw datagram to the user's
+        // datagram_handler if one is installed.
+        if (datagram_handler_) {
+            Datagram dg;
+            dg.data = buffer;
+            dg.peer_addr = host;
+            dg.peer_port = port;
+            std::memcpy(&dg.peer, &addr, addr_len);
+            dg.peer_len = addr_len;
+            dg.fd = udp_fd;
+            try {
+                co_await datagram_handler_(std::move(dg));
+            } catch (...) {
+            }
+        }
+
         if (udp_handler_) {
             UDPPacket pkt;
             pkt.data = buffer;
-            // Best-effort address/port fill for diagnostics.
-            char host[INET6_ADDRSTRLEN]{};
-            uint16_t port = 0;
-            if (addr.ss_family == AF_INET) {
-                const auto* a = reinterpret_cast<const sockaddr_in*>(&addr);
-                inet_ntop(AF_INET, &a->sin_addr, host, sizeof(host));
-                port = ntohs(a->sin_port);
-            } else if (addr.ss_family == AF_INET6) {
-                const auto* a6 = reinterpret_cast<const sockaddr_in6*>(&addr);
-                inet_ntop(AF_INET6, &a6->sin6_addr, host, sizeof(host));
-                port = ntohs(a6->sin6_port);
-            }
             pkt.address = host;
             pkt.port = port;
             co_await udp_handler_->handle_packet(pkt, udp_socket);
@@ -768,6 +793,42 @@ Task Server::accept_connections(int listen_fd) {
 }
 
 Task Server::handle_connection(Socket socket) {
+    // Low-level path: if the user installed a connection_handler_,
+    // hand the Socket over and let them speak whatever protocol they
+    // want.  The Socket is moved into a guard so cleanup is correct
+    // whether the user's coroutine completes normally, throws, or
+    // unwinds via Server::stop().
+    if (connection_handler_) {
+        struct ConnGuard {
+            Server* server;
+            int fd;
+            ConnGuard(Server* s, int f) : server(s), fd(f) {
+                {
+                    std::lock_guard<std::mutex> lock(server->client_fds_mutex_);
+                    server->active_client_fds_.insert(fd);
+                }
+                server->active_connections_.fetch_add(1, std::memory_order_acq_rel);
+            }
+            ~ConnGuard() {
+                {
+                    std::lock_guard<std::mutex> lock(server->client_fds_mutex_);
+                    server->active_client_fds_.erase(fd);
+                }
+                server->active_connections_.fetch_sub(1, std::memory_order_acq_rel);
+            }
+            ConnGuard(const ConnGuard&) = delete;
+            ConnGuard& operator=(const ConnGuard&) = delete;
+        };
+        ConnGuard cg(this, socket.fd());
+        try {
+            co_await connection_handler_(std::move(socket));
+        } catch (...) {
+            // Swallow; the Socket's destructor closes the fd if the
+            // handler didn't already.
+        }
+        co_return;
+    }
+
     if (!http_handler_ && !http2_handler_ && !websocket_handler_) {
         socket.close();
         co_return;
