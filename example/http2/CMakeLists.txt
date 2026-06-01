@@ -20,7 +20,7 @@ target_link_libraries(spaznet_http2 PUBLIC spaznet)
 
 if(BUILD_TESTING OR TARGET test_unit)
     set(SPAZNET_HTTP2_UNIT_SOURCES
-        ${CMAKE_SOURCE_DIR}/tests/test_main.cpp
+        ${PROJECT_SOURCE_DIR}/tests/test_main.cpp
         tests/unit/test_codec.cpp
         tests/unit/test_parser.cpp
     )
@@ -30,7 +30,7 @@ if(BUILD_TESTING OR TARGET test_unit)
     add_test(NAME Http2UnitTests COMMAND test_http2_unit)
 
     set(SPAZNET_HTTP2_INTEGRATION_SOURCES
-        ${CMAKE_SOURCE_DIR}/tests/test_main.cpp
+        ${PROJECT_SOURCE_DIR}/tests/test_main.cpp
         tests/integration/test_rfc9113_compliance.cpp
     )
     add_executable(test_http2_integration ${SPAZNET_HTTP2_INTEGRATION_SOURCES})
@@ -39,7 +39,7 @@ if(BUILD_TESTING OR TARGET test_unit)
     add_test(NAME Http2IntegrationTests COMMAND test_http2_integration)
 
     set(SPAZNET_HTTP2_PERFORMANCE_SOURCES
-        ${CMAKE_SOURCE_DIR}/tests/test_main.cpp
+        ${PROJECT_SOURCE_DIR}/tests/test_main.cpp
         tests/performance/test_rfc9113_performance.cpp
     )
     add_executable(test_http2_performance ${SPAZNET_HTTP2_PERFORMANCE_SOURCES})

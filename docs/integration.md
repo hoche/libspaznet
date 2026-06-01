@@ -83,8 +83,7 @@ wasn't found), the build skips:
 
 - `src/quic/*`, `src/http3/*`
 - `include/libspaznet/quic/*`, `include/libspaznet/http3/*`
-- The `Server::set_quic_http3_service` method (the declaration is
-  `#ifdef`-gated by `SPAZNET_HAS_QUIC`).
+- The `spaznet::quic_http3` library (`example/quic-http3/`).
 - All QUIC + HTTP/3 tests + benchmarks.
 
 The HTTP/1.1, HTTP/2 parser, WebSocket, and UDP paths build with no
@@ -107,9 +106,13 @@ To detect from your own code whether you got the QUIC API:
 
 ```cpp
 #ifdef SPAZNET_HAS_QUIC
-    server.set_quic_http3_service(std::move(svc));
+    server.set_datagram_handler(
+        spaznet::http3::make_dispatcher(std::move(svc)));
 #endif
 ```
+
+`SPAZNET_HAS_QUIC` is defined by the `spaznet::quic_http3` target's
+public interface, so any TU that links it gets the macro.
 
 ## OpenSSL location
 
@@ -146,13 +149,14 @@ deep in compilation.
 
 ```cpp
 #include <libspaznet/server.hpp>
-#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/http/dispatcher.hpp>
+#include <libspaznet/http/handler.hpp>
 
-class Hello : public spaznet::HTTPHandler {
+class Hello : public spaznet::http::HTTPHandler {
 public:
     spaznet::Task handle_request(
-        const spaznet::HTTPRequest&,
-        spaznet::HTTPResponse& r,
+        const spaznet::http::HTTPRequest&,
+        spaznet::http::HTTPResponse& r,
         spaznet::Socket&
     ) override {
         r.body = {'O','K'};
@@ -162,7 +166,8 @@ public:
 
 int main() {
     spaznet::Server server(4);
-    server.set_http_handler(std::make_unique<Hello>());
+    server.set_connection_handler(
+        spaznet::http::make_dispatcher(std::make_unique<Hello>()));
     server.listen_tcp(8080);
     server.run();
 }
@@ -171,7 +176,7 @@ int main() {
 Build with:
 
 ```bash
-g++-13 -std=c++20 main.cpp -lspaznet -lpthread -o myapp
+g++-13 -std=c++20 main.cpp -lspaznet_http -lspaznet -lpthread -o myapp
 ```
 
 Or in CMake:
@@ -185,8 +190,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(spaznet REQUIRED)
 
 add_executable(myapp main.cpp)
-target_link_libraries(myapp PRIVATE spaznet::spaznet)
+target_link_libraries(myapp PRIVATE spaznet::spaznet spaznet::http)
 ```
+
+The core `spaznet::spaznet` target has only the low-level
+`Server` / `Socket` / `IOContext` / `Task` / `PlatformIO`.  Protocol
+support comes from the example libraries:
+
+| Library | Headers | Use for |
+|---|---|---|
+| `spaznet::http` | `<libspaznet/http/{handler,dispatcher}.hpp>` | HTTP/1.1 |
+| `spaznet::http_websocket` | `<libspaznet/websocket/{handler,dispatcher,send}.hpp>` + the http ones | HTTP/1.1 + WebSocket on the same port |
+| `spaznet::http2` | `<libspaznet/http2/{handler,dispatcher}.hpp>` | HTTP/2 (h2c) |
+| `spaznet::udp` | `<libspaznet/udp/{handler,dispatcher}.hpp>` | UDP handler-interface idiom |
+| `spaznet::quic_http3` | `<libspaznet/{quic,http3}/...>` | QUIC v1 + HTTP/3 |
+
+Link only the libraries you need; the core target is dependency-free
+(no OpenSSL even if `SPAZNET_BUILD_QUIC=ON`).
 
 ## Versioning + upgrades
 

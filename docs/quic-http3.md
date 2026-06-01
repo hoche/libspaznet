@@ -18,8 +18,8 @@ The pieces, top to bottom:
 
 | Type | Header | Role |
 |---|---|---|
-| `HTTP3Handler` | `<libspaznet/handlers/http3_handler.hpp>` | Your code. `handle_request(req, resp, socket)`. |
-| `http3::QuicHttp3Service` | `<libspaznet/http3/service.hpp>` | Owns the `Listener` + per-connection `Http3Server`. Drop-in for `Server::set_quic_http3_service`. |
+| `http3::Http3Server::RequestFn` | `<libspaznet/http3/server.hpp>` | Your code — a callable invoked with each fully-arrived HTTP/3 request. |
+| `http3::QuicHttp3Service` | `<libspaznet/http3/service.hpp>` | Owns the `Listener` + per-connection `Http3Server`. Wrap with `http3::make_dispatcher` and hand to `Server::set_datagram_handler`. |
 | `http3::Http3Server` | `<libspaznet/http3/server.hpp>` | One per active QUIC connection. Speaks HTTP/3 framing, QPACK-decodes headers, dispatches to `HTTP3Handler`. |
 | `quic::Listener` | `<libspaznet/quic/listener.hpp>` | UDP-side dispatcher. Demuxes datagrams by Destination Connection ID, creates new `quic::Connection`s on incoming Initials, emits Version Negotiation / Retry as configured. |
 | `quic::Connection` | `<libspaznet/quic/connection.hpp>` | Per-peer state machine. Three PN spaces (Initial / Handshake / Application), streams, recovery, congestion. |
@@ -30,23 +30,11 @@ The pieces, top to bottom:
 
 ```cpp
 #include <libspaznet/server.hpp>
-#include <libspaznet/handlers/http3_handler.hpp>
 #include <libspaznet/quic/listener.hpp>
 #include <libspaznet/quic/tls.hpp>
 #include <libspaznet/http3/service.hpp>
 
-class HelloH3 : public spaznet::HTTP3Handler {
-public:
-    spaznet::Task handle_request(
-        const spaznet::HTTP3Request& req,
-        spaznet::HTTP3Response& resp,
-        spaznet::Socket&
-    ) override {
-        resp.status_code = 200;
-        resp.body = {'H','e','l','l','o',',',' ','h','3','!'};
-        co_return;
-    }
-};
+#include <sys/socket.h>
 
 int main() {
     using namespace spaznet;
@@ -59,8 +47,7 @@ int main() {
     };
     auto tls = quic::TlsContext::make_server(tls_cfg);
 
-    // 2. Build the QuicHttp3Service.  This wires the Listener +
-    //    per-conn Http3Server with your handler.
+    // 2. Configure the Listener.
     quic::Listener::Config lcfg;
     lcfg.tls_ctx = tls;
     lcfg.server_tp.initial_max_data                 = 1 << 20;
@@ -69,27 +56,47 @@ int main() {
     lcfg.server_tp.initial_max_streams_uni          = 100;
     // lcfg.require_retry = true;   // see quic-security.md
 
+    // 3. Build the QuicHttp3Service.  The SendFn closes over the UDP
+    //    fd so outbound datagrams sendto() the right place.
+    int udp_fd = -1;  // captured by the SendFn below
+    auto send_fn = [&](const quic::PeerAddr& peer,
+                       std::span<const uint8_t> bytes) {
+        ::sendto(udp_fd, bytes.data(), bytes.size(), 0, peer.data(), peer.length);
+    };
+    auto on_request = [](spaznet::http3::Http3Server& srv,
+                         uint64_t stream_id,
+                         const std::unordered_map<std::string, std::string>& headers,
+                         std::span<const uint8_t> body) {
+        spaznet::http3::Http3Server::Response resp;
+        resp.status = 200;
+        resp.headers["content-type"] = "text/plain";
+        const char hello[] = "Hello, h3!";
+        resp.body.assign(hello, hello + sizeof(hello) - 1);
+        srv.send_response(stream_id, std::move(resp));
+    };
     auto service = std::make_unique<http3::QuicHttp3Service>(
-        std::move(lcfg),
-        std::make_unique<HelloH3>());
+        std::move(lcfg), send_fn, on_request);
 
-    // 3. Hand it to a Server and start a UDP listener.
+    // 4. Hand it to a Server via the new DatagramHandler factory.
     Server server(4);
-    server.set_quic_http3_service(std::move(service));
+    server.set_datagram_handler(
+        spaznet::http3::make_dispatcher(std::move(service)));
     server.listen_udp(4433);
+    udp_fd = /* obtain via Server stats / IOContext if needed */ 0;
     server.run();
 }
 ```
 
 Three things to notice:
 
-1. **No `set_http_handler` / `set_websocket_handler` is required.** The
-   QUIC stack is wholly independent of HTTP/1.1 / WebSocket. You can
-   mix them on the same `Server` instance (different ports), but
-   you don't have to.
-2. **`listen_udp`, not `listen_tcp`.** QUIC runs over UDP. The
-   `Server` routes incoming datagrams to `QuicHttp3Service::handle_datagram`
-   when one is registered.
+1. **`listen_udp`, not `listen_tcp`.** QUIC runs over UDP. The
+   `Server` routes incoming datagrams via the
+   `DatagramHandler` callback installed with
+   `set_datagram_handler`.
+2. **Link against `spaznet::quic_http3`** to use any of the
+   `spaznet::quic::` / `spaznet::http3::` types — the QUIC stack
+   is in `example/quic-http3` and isn't part of the core
+   `spaznet` library.
 3. **Transport parameters** are advertised to the peer at handshake
    time. Set the `initial_max_*` knobs to non-zero or the peer can't
    send any STREAM bytes.

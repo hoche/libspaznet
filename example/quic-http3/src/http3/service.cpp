@@ -1,5 +1,9 @@
 #include <libspaznet/http3/service.hpp>
 
+#include <cstring>
+#include <memory>
+#include <utility>
+
 namespace spaznet {
 namespace http3 {
 
@@ -26,6 +30,20 @@ auto QuicHttp3Service::pump_all() -> void {
         }
         it->second->pump();
     });
+}
+
+auto make_dispatcher(std::unique_ptr<QuicHttp3Service> service)
+    -> ::spaznet::DatagramHandler {
+    // shared_ptr so the std::function payload stays copyable.
+    std::shared_ptr<QuicHttp3Service> shared(service.release());
+    return [shared](::spaznet::Datagram dg) -> ::spaznet::Task {
+        ::spaznet::quic::PeerAddr peer{};
+        peer.length = dg.peer_len;
+        std::memcpy(&peer.storage, &dg.peer, dg.peer_len);
+        shared->handle_datagram(peer, {dg.data.data(), dg.data.size()});
+        shared->pump_all();
+        co_return;
+    };
 }
 
 } // namespace http3

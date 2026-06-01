@@ -8,6 +8,7 @@
 
 #include <libspaznet/http3/server.hpp>
 #include <libspaznet/quic/listener.hpp>
+#include <libspaznet/server.hpp>
 
 namespace spaznet {
 namespace http3 {
@@ -53,6 +54,19 @@ class QuicHttp3Service {
 
     auto ensure_http3_for(uint64_t /*placeholder*/) -> void {}
 };
+
+// Build a ::spaznet::DatagramHandler that owns `service` and forwards
+// every received datagram into it.  Hand the result to
+// Server::set_datagram_handler:
+//
+//   auto svc = std::make_unique<QuicHttp3Service>(...);
+//   server.set_datagram_handler(spaznet::http3::make_dispatcher(std::move(svc)));
+//   server.listen_udp(4433);
+//
+// The Listener's SendFn (configured inside QuicHttp3Service) should
+// route outbound datagrams via `::sendto(datagram.fd, ...)` so the
+// reply goes back through the same listening socket.
+auto make_dispatcher(std::unique_ptr<QuicHttp3Service> service) -> ::spaznet::DatagramHandler;
 
 } // namespace http3
 } // namespace spaznet

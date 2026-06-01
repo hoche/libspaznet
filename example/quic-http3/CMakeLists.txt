@@ -36,7 +36,7 @@ target_compile_definitions(spaznet_quic_http3 PUBLIC SPAZNET_HAS_QUIC)
 
 if(BUILD_TESTING OR TARGET test_unit)
     set(SPAZNET_QH3_UNIT_SOURCES
-        ${CMAKE_SOURCE_DIR}/tests/test_main.cpp
+        ${PROJECT_SOURCE_DIR}/tests/test_main.cpp
         tests/unit/test_quic_phase1.cpp
         tests/unit/test_quic_frame.cpp
         tests/unit/test_quic_tls.cpp

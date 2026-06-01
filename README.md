@@ -179,13 +179,14 @@ make lint
 
 ```cpp
 #include <libspaznet/server.hpp>
-#include <libspaznet/handlers/http_handler.hpp>
+#include <libspaznet/http/dispatcher.hpp>
+#include <libspaznet/http/handler.hpp>
 
-class MyHTTPHandler : public spaznet::HTTPHandler {
+class MyHTTPHandler : public spaznet::http::HTTPHandler {
 public:
     spaznet::Task handle_request(
-        const spaznet::HTTPRequest& request,
-        spaznet::HTTPResponse& response,
+        const spaznet::http::HTTPRequest& request,
+        spaznet::http::HTTPResponse& response,
         spaznet::Socket& socket
     ) override {
         response.status_code = 200;
@@ -197,17 +198,34 @@ public:
 
 int main() {
     spaznet::Server server(4);  // 4 worker threads (0 = single-threaded)
-    server.set_http_handler(std::make_unique<MyHTTPHandler>());
+    server.set_connection_handler(
+        spaznet::http::make_dispatcher(std::make_unique<MyHTTPHandler>()));
     server.listen_tcp(8080);
-    
+
     // Optional: Monitor server statistics
     auto stats = server.get_statistics();
     std::cout << "Active coroutines: " << stats.active_coroutines << std::endl;
-    
+
     server.run();
     return 0;
 }
 ```
+
+Core ships only the low-level server.  Each protocol — HTTP/1.1,
+WebSocket, HTTP/2, UDP, QUIC + HTTP/3 — is an `example/<protocol>/`
+library you link in addition to `spaznet::spaznet`.  Working demos
+under `example/*/demo/`:
+
+```bash
+./build/example/http/http_hello              # HTTP/1.1 hello world
+./build/example/http-websocket/ws_echo       # WebSocket echo (HTTP fallback)
+./build/example/http2/http2_hello            # HTTP/2 (h2c)
+./build/example/udp/udp_echo                 # UDP echo
+```
+
+See [docs/integration.md](docs/integration.md) for the CMake
+linkage and [docs/migration.md](docs/migration.md) if you're
+porting code from before the restructure.
 
 ## Architecture
 

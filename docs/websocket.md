@@ -1,40 +1,67 @@
-# WebSocket handlers
+# WebSocket — `example/http-websocket`
 
-`WebSocketHandler` is the entry point for RFC 6455 WebSocket connections.
-The server handles the HTTP/1.1 → WebSocket upgrade handshake; your
-handler sees only the post-handshake message stream.
+`spaznet::websocket::Handler` is the entry point for RFC 6455
+WebSocket connections.  The combined dispatcher in
+`example/http-websocket` sniffs the first request on each accepted
+connection and either runs the WS frame loop (if it's an upgrade) or
+hands the buffer off to the HTTP/1.1 dispatcher from
+`example/http`.  You provide both handlers up front.
 
 ```cpp
+#include <libspaznet/http/handler.hpp>
 #include <libspaznet/server.hpp>
-#include <libspaznet/handlers/websocket_handler.hpp>
+#include <libspaznet/websocket/dispatcher.hpp>
+#include <libspaznet/websocket/handler.hpp>
+#include <libspaznet/websocket/send.hpp>
 
-class EchoHandler : public spaznet::WebSocketHandler {
+class EchoWS : public spaznet::websocket::Handler {
 public:
     spaznet::Task on_open(spaznet::Socket&) override { co_return; }
     spaznet::Task on_close(spaznet::Socket&) override { co_return; }
 
-    // Echo back every message we receive. Take by rvalue so we can
-    // move the payload into the outgoing frame without copying.
-    spaznet::Task handle_message(spaznet::WebSocketMessage&& m,
+    // Take by rvalue so we can move the payload into the outgoing
+    // frame without copying.
+    spaznet::Task handle_message(spaznet::websocket::Message&& m,
                                  spaznet::Socket& s) override {
-        co_await s.send_websocket_message(m.opcode, m.data);
+        co_await spaznet::websocket::send_message(s, m.opcode, m.data);
     }
 
-    // The const& overload is still required (pure-virtual in the base);
-    // forward to the rvalue one so both paths agree.
-    spaznet::Task handle_message(const spaznet::WebSocketMessage& m,
+    spaznet::Task handle_message(const spaznet::websocket::Message& m,
                                  spaznet::Socket& s) override {
-        co_await s.send_websocket_message(m.opcode, m.data);
+        co_await spaznet::websocket::send_message(s, m.opcode, m.data);
+    }
+};
+
+class HttpFallback : public spaznet::http::HTTPHandler {
+public:
+    spaznet::Task handle_request(const spaznet::http::HTTPRequest&,
+                                 spaznet::http::HTTPResponse& r,
+                                 spaznet::Socket&) override {
+        r.status_code = 200;
+        r.body = {'O','K'};
+        co_return;
     }
 };
 
 int main() {
     spaznet::Server server(4);
-    server.set_websocket_handler(std::make_unique<EchoHandler>());
+    server.set_connection_handler(spaznet::websocket::make_dispatcher(
+        std::make_unique<HttpFallback>(),
+        std::make_unique<EchoWS>()));
     server.listen_tcp(8080);
     server.run();
 }
 ```
+
+Link:
+
+```cmake
+target_link_libraries(myapp PRIVATE spaznet::spaznet spaznet::http_websocket)
+```
+
+`spaznet::http_websocket` transitively brings in `spaznet::http` (the
+combined dispatcher reuses example/http's HTTP/1.1 keep-alive serve
+loop on the non-upgrade path).
 
 ## Connection lifecycle
 
@@ -58,90 +85,86 @@ client                            server
 ```
 
 - `on_open` runs once, after the handshake response has been written.
-  Suspend here if you need to do per-connection setup before accepting
-  messages.
 - `handle_message` runs once per fully-reassembled message (RFC 6455
   fragments are joined for you).
-- `on_close` runs once, after the connection is torn down. The `Socket&`
-  is still alive at this point but writing to it is a no-op.
+- `on_close` runs once, after the connection is torn down.
 
 All three are coroutines — `co_await` freely inside them.
 
 ## The two `handle_message` overloads
 
 ```cpp
-virtual Task handle_message(const WebSocketMessage&, Socket&) = 0;
-virtual Task handle_message(WebSocketMessage&&,      Socket&);
+virtual Task handle_message(const Message&, Socket&) = 0;
+virtual Task handle_message(Message&&,      Socket&);
 ```
 
-The dispatcher always calls the rvalue overload first. The default
-rvalue body forwards to the `const&` form — so existing handlers that
-override only `const&` continue to work.
+The dispatcher always calls the rvalue overload first.  The default
+rvalue body forwards to the `const&` form — so existing handlers
+that override only `const&` continue to work.
 
-Override the rvalue form when you want to **consume** the payload (move
-it into a buffer, into a response, into a parser). Override the `const&`
-form when you only need to read it.
+Override the rvalue form when you want to **consume** the payload
+(move it into a buffer, into a response, into a parser).  Override
+the `const&` form when you only need to read it.
 
-If you override both — like the echo example above — make sure they agree.
+If you override both, make sure they agree.
 
 ## Sending messages
 
-Two send paths exist; prefer the first.
-
-### `Socket::send_websocket_message` (preferred)
+`spaznet::websocket::send_message` is the preferred path:
 
 ```cpp
-co_await socket.send_websocket_message(WebSocketOpcode::Binary, payload);
-co_await socket.send_websocket_message(WebSocketOpcode::Text,   bytes_of("hi"));
-co_await socket.send_websocket_message(WebSocketOpcode::Pong,   ping_payload);
+co_await spaznet::websocket::send_message(socket, Opcode::Binary, payload);
+co_await spaznet::websocket::send_message(socket, Opcode::Text,   bytes_of("hi"));
+co_await spaznet::websocket::send_message(socket, Opcode::Pong,   ping_payload);
 ```
 
 Builds the WebSocket frame header (FIN=1, no mask) directly into a
-single buffer with one allocation, copies the payload once, and hands
-it to `async_write`. This is the fast path; bench_websocket shows it
-running ~30% lower CPU/msg than the older `WebSocketFrame::serialize()`
-path on small payloads.
+single buffer with one allocation, copies the payload once, and
+hands it to `async_write`.  This is the fast path; bench_websocket
+shows it running ~30% lower CPU/msg than building a `Frame` value
+and `.serialize()`'ing it.
 
-Pass `false` for `fin` to send a non-final fragment (rare; only useful
-for streaming a huge payload as multiple frames).
+Pass `false` for `fin` to send a non-final fragment.
 
-### `WebSocketFrame::serialize()` (legacy, still works)
+The legacy `Frame::serialize()` path still exists for code that wants
+to round-trip a frame through the value type:
 
 ```cpp
-WebSocketFrame f;
+spaznet::websocket::Frame f;
 f.fin = true;
-f.opcode = WebSocketOpcode::Binary;
+f.opcode = spaznet::websocket::Opcode::Binary;
 f.masked = false;            // server frames are never masked
 f.payload = std::move(data);
 f.payload_length = f.payload.size();
 co_await socket.async_write(f.serialize());
 ```
 
-This path allocates twice (once for the value type, once for the
-serialized output) and copies the payload twice. Functional but slow.
+This allocates twice (once for the value type, once for the
+serialized output) and copies the payload twice.
 
 ## Opcodes
 
 | Opcode | Hex | Meaning |
 |---|---|---|
 | `Continuation` | `0x0` | Fragment of a previous message. You never see this — the server joins fragments for you. |
-| `Text` | `0x1` | UTF-8 payload. The server doesn't validate UTF-8; that's your responsibility per RFC 6455 §8.1 if it matters. |
+| `Text` | `0x1` | UTF-8 payload. The server doesn't validate UTF-8; that's your responsibility per RFC 6455 §8.1. |
 | `Binary` | `0x2` | Opaque bytes. |
 | `Close` | `0x8` | Connection-close. The server handles the Close handshake; you'll see `on_close` shortly. |
 | `Ping` | `0x9` | The server auto-Pongs and does not deliver Ping to your handler. |
-| `Pong` | `0xA` | Server-side ping replies. Delivered to your handler only if you initiated a Ping yourself. |
+| `Pong` | `0xA` | Delivered to your handler only if you initiated a Ping yourself. |
 
 Control frames (`Close`, `Ping`, `Pong`) MUST have payload ≤125 bytes
-per RFC 6455 §5.5; the server rejects oversized control frames with a
-`1002 protocol error` close.
+per RFC 6455 §5.5; the dispatcher rejects oversized control frames
+with a `1002 protocol error` close.
 
 ## Close codes
 
 To initiate a close yourself:
 
 ```cpp
-co_await socket.send_websocket_message(WebSocketOpcode::Close,
-                                       /* empty body */ std::span<const uint8_t>{});
+co_await spaznet::websocket::send_message(socket,
+    spaznet::websocket::Opcode::Close,
+    /* empty body */ std::span<const uint8_t>{});
 ```
 
 To send a close with a status code + reason, build the body manually:
@@ -152,12 +175,13 @@ body.push_back(uint8_t(1011 >> 8));   // status code, big-endian
 body.push_back(uint8_t(1011 & 0xFF));
 auto reason = std::string_view("server shutting down");
 body.insert(body.end(), reason.begin(), reason.end());
-co_await socket.send_websocket_message(WebSocketOpcode::Close, body);
+co_await spaznet::websocket::send_message(socket,
+    spaznet::websocket::Opcode::Close, body);
 ```
 
-The server echoes any incoming Close frame back to the peer with the
-peer's code + reason intact, then closes the TCP connection. Your
-`on_close` runs after that round-trip.
+The dispatcher echoes any incoming Close frame back to the peer with
+the peer's code + reason intact, then closes the TCP connection.
+Your `on_close` runs after that round-trip.
 
 Reserved close codes (RFC 6455 §7.4):
 
@@ -176,37 +200,39 @@ Reserved close codes (RFC 6455 §7.4):
 
 | Limit | Value | Notes |
 |---|---:|---|
-| Maximum frame payload | 16 MiB (`WebSocketFrame::kMaxPayloadBytes`) | A peer that declares more gets a `1009 message too big` close. |
+| Maximum frame payload | 16 MiB (`Frame::kMaxPayloadBytes`) | A peer that declares more gets a `1009 message too big` close. |
 | Handshake size | 8 KiB | Upgrade request headers must fit. |
 
 Reserved bits (RSV1/RSV2/RSV3) in incoming frames trigger a `1002`
-close. There's no per-message-deflate (RFC 7692) support — peers that
-advertise it will see their offer ignored and use uncompressed frames.
+close.  There's no per-message-deflate (RFC 7692) support — peers
+that advertise it will see their offer ignored and use uncompressed
+frames.
 
 ## Threading
 
-The handler is a single shared instance across all connections. The
-same connection's coroutines all run on the same IOContext thread
-(coroutines can migrate between threads on `co_await`, but for any
-given suspension point the resume lands on whatever thread the IO
-event came in on).
+The handler is a single shared instance across all connections.  The
+same connection's coroutines all run on whichever IOContext thread
+the IO event landed on (coroutines can migrate between threads on
+`co_await`).
 
-If you store per-connection state, key it by `socket.fd()` and protect
-the lookup with a `std::mutex` — the default IOContext doesn't pin
-connections to a thread.
+If you store per-connection state, key it by `socket.fd()` and
+protect the lookup with a `std::mutex` — the default IOContext
+doesn't pin connections to a thread.
 
 ## Errors
 
 Throwing from any of the three callbacks closes the connection (the
-exception is swallowed in `Server::handle_connection`'s catch-all). The
-peer sees the TCP connection drop without a Close frame.
+exception is swallowed in the dispatcher's catch-all).  The peer sees
+the TCP connection drop without a Close frame.
 
 To gracefully close, send a Close frame yourself and return from the
-handler; the server will tear down the connection after.
+handler; the dispatcher will tear down the connection after.
 
 ## Related
 
 - [api-status.md](api-status.md) — overall feature matrix
 - [http.md](http.md) — HTTP/1.1 handler (the upgrade handshake goes
-  through the same `Server`)
+  through the same dispatcher)
 - [threading.md](threading.md) — `Server(N)` thread count tuning
+- [migration.md](migration.md) — names changed in the restructure
+  (`spaznet::WebSocketHandler` → `spaznet::websocket::Handler`, etc.)

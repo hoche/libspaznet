@@ -19,7 +19,7 @@ target_link_libraries(spaznet_http_websocket PUBLIC spaznet spaznet_http)
 
 if(BUILD_TESTING OR TARGET test_unit)
     set(SPAZNET_WS_UNIT_SOURCES
-        ${CMAKE_SOURCE_DIR}/tests/test_main.cpp
+        ${PROJECT_SOURCE_DIR}/tests/test_main.cpp
         tests/unit/test_handler.cpp
     )
     add_executable(test_ws_unit ${SPAZNET_WS_UNIT_SOURCES})
@@ -28,7 +28,7 @@ if(BUILD_TESTING OR TARGET test_unit)
     add_test(NAME WebSocketUnitTests COMMAND test_ws_unit)
 
     set(SPAZNET_WS_INTEGRATION_SOURCES
-        ${CMAKE_SOURCE_DIR}/tests/test_main.cpp
+        ${PROJECT_SOURCE_DIR}/tests/test_main.cpp
         tests/integration/test_websocket_server.cpp
     )
     add_executable(test_ws_integration ${SPAZNET_WS_INTEGRATION_SOURCES})
@@ -37,7 +37,7 @@ if(BUILD_TESTING OR TARGET test_unit)
     add_test(NAME WebSocketIntegrationTests COMMAND test_ws_integration)
 
     set(SPAZNET_WS_PERFORMANCE_SOURCES
-        ${CMAKE_SOURCE_DIR}/tests/test_main.cpp
+        ${PROJECT_SOURCE_DIR}/tests/test_main.cpp
         tests/performance/test_websocket_rfc6455_performance.cpp
     )
     add_executable(test_ws_performance ${SPAZNET_WS_PERFORMANCE_SOURCES})

@@ -19,7 +19,7 @@ target_link_libraries(spaznet_http PUBLIC spaznet)
 # Tests
 if(BUILD_TESTING OR TARGET test_unit)
     set(SPAZNET_HTTP_UNIT_SOURCES
-        ${CMAKE_SOURCE_DIR}/tests/test_main.cpp
+        ${PROJECT_SOURCE_DIR}/tests/test_main.cpp
         tests/unit/test_handler.cpp
         tests/unit/test_parser.cpp
     )
@@ -29,7 +29,7 @@ if(BUILD_TESTING OR TARGET test_unit)
     add_test(NAME HttpUnitTests COMMAND test_http_unit)
 
     set(SPAZNET_HTTP_INTEGRATION_SOURCES
-        ${CMAKE_SOURCE_DIR}/tests/test_main.cpp
+        ${PROJECT_SOURCE_DIR}/tests/test_main.cpp
         tests/integration/test_tcp_server.cpp
         tests/integration/test_http_server.cpp
         tests/integration/test_thread_modes.cpp
@@ -42,7 +42,7 @@ if(BUILD_TESTING OR TARGET test_unit)
     add_test(NAME HttpIntegrationTests COMMAND test_http_integration)
 
     set(SPAZNET_HTTP_PERFORMANCE_SOURCES
-        ${CMAKE_SOURCE_DIR}/tests/test_main.cpp
+        ${PROJECT_SOURCE_DIR}/tests/test_main.cpp
         tests/performance/test_throughput.cpp
         tests/performance/test_latency.cpp
         tests/performance/test_concurrent_performance.cpp

@@ -16,7 +16,7 @@ target_link_libraries(spaznet_udp PUBLIC spaznet)
 
 if(BUILD_TESTING OR TARGET test_unit)
     set(SPAZNET_UDP_INTEGRATION_SOURCES
-        ${CMAKE_SOURCE_DIR}/tests/test_main.cpp
+        ${PROJECT_SOURCE_DIR}/tests/test_main.cpp
         tests/integration/test_udp_server.cpp
     )
     add_executable(test_udp_integration ${SPAZNET_UDP_INTEGRATION_SOURCES})

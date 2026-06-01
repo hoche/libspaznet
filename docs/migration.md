@@ -7,6 +7,76 @@ for the full list of what changed.
 The library has not yet shipped versioned releases — pin a SHA, read
 this page, and re-run your test suite when you bump.
 
+## 2026-05-31 — protocol handlers pulled out of core (Phases 1–5)
+
+Commits `a7fab2d`, `aefbd64`, `e8f372f`, `d812849`, `63da693`,
+`05f818f`.
+
+### What broke
+
+Protocol implementations (HTTP/1.1, WebSocket, HTTP/2, UDP wrapper,
+QUIC, HTTP/3) moved from the core `spaznet` library to separate
+`example/<protocol>/` libraries. Core now ships only the low-level
+server.
+
+The `Server::set_*_handler` setters and the
+`<libspaznet/handlers/*.hpp>` headers are **all gone**. Replace with
+the new low-level `set_connection_handler` / `set_datagram_handler`
+callbacks and per-protocol `make_dispatcher(...)` factories.
+
+| Removed | Replacement |
+|---|---|
+| `Server::set_http_handler(unique_ptr<HTTPHandler>)` | `Server::set_connection_handler(spaznet::http::make_dispatcher(unique_ptr<spaznet::http::HTTPHandler>))` |
+| `Server::set_websocket_handler(unique_ptr<WebSocketHandler>)` | `Server::set_connection_handler(spaznet::websocket::make_dispatcher(http_handler, ws_handler))` (combined dispatcher) |
+| `Server::set_http2_handler(unique_ptr<HTTP2Handler>)` | `Server::set_connection_handler(spaznet::http2::make_dispatcher(unique_ptr<spaznet::http2::Handler>))` |
+| `Server::set_udp_handler(unique_ptr<UDPHandler>)` | `Server::set_datagram_handler(spaznet::udp::make_dispatcher(unique_ptr<spaznet::udp::Handler>))` |
+| `Server::set_quic_http3_service(unique_ptr<QuicHttp3Service>)` | `Server::set_datagram_handler(spaznet::http3::make_dispatcher(unique_ptr<spaznet::http3::QuicHttp3Service>))` |
+| `Socket::send_websocket_message(opcode, payload, fin)` | `spaznet::websocket::send_message(socket, opcode, payload, fin)` (free function) |
+| `<libspaznet/handlers/http_handler.hpp>` | `<libspaznet/http/handler.hpp>` + `<libspaznet/http/dispatcher.hpp>` |
+| `<libspaznet/handlers/websocket_handler.hpp>` | `<libspaznet/websocket/handler.hpp>` + `<libspaznet/websocket/dispatcher.hpp>` + `<libspaznet/websocket/send.hpp>` |
+| `<libspaznet/handlers/http2_handler.hpp>` | `<libspaznet/http2/handler.hpp>` + `<libspaznet/http2/dispatcher.hpp>` |
+| `<libspaznet/handlers/udp_handler.hpp>` | `<libspaznet/udp/handler.hpp>` + `<libspaznet/udp/dispatcher.hpp>` |
+| `<libspaznet/http3/huffman.hpp>` (RFC 7541 §B codec) | `<libspaznet/codec/huffman.hpp>` — same codec, new namespace `spaznet::codec::huffman_{encode,decode}`. Stays in core. |
+| `spaznet::HTTPHandler` / `HTTPRequest` / `HTTPResponse` / `HTTPParser` | `spaznet::http::HTTPHandler` / `HTTPRequest` / `HTTPResponse` / `HTTPParser` |
+| `spaznet::WebSocketHandler` / `WebSocketFrame` / `WebSocketMessage` / `WebSocketOpcode` | `spaznet::websocket::Handler` / `Frame` / `Message` / `Opcode` (prefix dropped) |
+| `spaznet::HTTP2Handler` / `HTTP2Request` / `HTTP2Response` / `HTTP2Frame` / … | `spaznet::http2::Handler` / `Request` / `Response` / `Frame` / … |
+| `spaznet::UDPHandler` / `UDPPacket` | `spaznet::udp::Handler` / `Packet`. The `Packet` no longer takes a `Socket&` — it carries `listen_fd` + raw `sockaddr_storage` for direct `::sendto()`. |
+
+### What to do
+
+CMake: add the per-protocol example libraries to your link line.
+
+```cmake
+find_package(spaznet REQUIRED)
+target_link_libraries(myapp PRIVATE
+    spaznet::spaznet                # core
+    spaznet::http                   # HTTP/1.1
+    spaznet::http_websocket         # HTTP/1.1 + WebSocket (transitively pulls spaznet::http)
+    spaznet::http2                  # HTTP/2 h2c
+    spaznet::udp                    # UDP handler-interface wrapper
+    # spaznet::quic_http3           # QUIC + HTTP/3 (only when SPAZNET_BUILD_QUIC=ON)
+)
+```
+
+Code: switch handler base classes to the namespaced names and
+replace setter calls with `make_dispatcher`. The
+[`http.md`](http.md), [`websocket.md`](websocket.md), and
+[`quic-http3.md`](quic-http3.md) guides each have a complete
+minimal example.
+
+### What it bought you
+
+- Core builds with **no OpenSSL dependency** (gated only by
+  `SPAZNET_BUILD_QUIC` on `example/quic-http3`).
+- HTTP/2 dispatch is now **actually wired up** —
+  `set_http2_handler` used to be a no-op (the parser existed but
+  the connection coroutine never invoked it); `spaznet::http2::make_dispatcher`
+  is the first version of an HTTP/2 server that actually serves
+  HTTP/2 requests. Verified against `curl --http2-prior-knowledge`.
+- HPACK rewritten to actual RFC 7541 (proper varints + Huffman
+  decode via the shared `spaznet::codec` codec). The pre-restructure
+  HPACK only round-tripped its own (broken) output.
+
 ## 2026-05-29 — toy QUIC/HTTP/3 types removed
 
 Commit `5c1f39d`.
