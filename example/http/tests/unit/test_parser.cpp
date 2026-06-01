@@ -176,6 +176,96 @@ TEST_F(RFC9112ParserTest, ParseChunkedBodyIncomplete) {
     EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Incomplete);
 }
 
+// RFC 9112 §7.1.2: zero-or-more trailer-field lines may appear between
+// the last-chunk and the final CRLF.  The body is unchanged; trailers
+// are consumed and dropped (we don't surface them on HTTPRequest).
+TEST_F(RFC9112ParserTest, ParseChunkedBodyWithTrailers) {
+    std::string chunked_data = "5\r\n"
+                               "hello\r\n"
+                               "0\r\n"
+                               "X-Trailer: tag-abc\r\n"
+                               "X-Other: yes\r\n"
+                               "\r\n";
+
+    std::vector<uint8_t> buffer(chunked_data.begin(), chunked_data.end());
+    std::vector<uint8_t> body;
+    size_t bytes_consumed = 0;
+
+    auto result = spaznet::http::HTTPParser::parse_chunked_body(buffer, body, bytes_consumed);
+
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Success);
+    EXPECT_EQ(std::string(body.begin(), body.end()), "hello");
+    EXPECT_EQ(bytes_consumed, chunked_data.size());
+}
+
+// A single trailer field, then the terminator.
+TEST_F(RFC9112ParserTest, ParseChunkedBodyWithSingleTrailer) {
+    std::string chunked_data = "0\r\n"
+                               "Etag: \"abc\"\r\n"
+                               "\r\n";
+
+    std::vector<uint8_t> buffer(chunked_data.begin(), chunked_data.end());
+    std::vector<uint8_t> body;
+    size_t bytes_consumed = 0;
+
+    auto result = spaznet::http::HTTPParser::parse_chunked_body(buffer, body, bytes_consumed);
+
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Success);
+    EXPECT_TRUE(body.empty());
+    EXPECT_EQ(bytes_consumed, chunked_data.size());
+}
+
+// Trailers, but the message is truncated mid-trailer-line.  The parser
+// should report Incomplete and wait for more bytes, not fail.
+TEST_F(RFC9112ParserTest, ParseChunkedBodyIncompleteTrailer) {
+    std::string chunked_data = "0\r\n"
+                               "X-Trailer: tag-abc"; // no CRLF yet
+
+    std::vector<uint8_t> buffer(chunked_data.begin(), chunked_data.end());
+    std::vector<uint8_t> body;
+    size_t bytes_consumed = 0;
+
+    auto result = spaznet::http::HTTPParser::parse_chunked_body(buffer, body, bytes_consumed);
+
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Incomplete);
+}
+
+// RFC 9112 §7.1.1: chunk-extension lines have no length limit.  Our
+// cap is now 4 KiB; a 200-byte extension (typical integrity-tag use)
+// must parse successfully.  Pre-fix, the 64-byte cap rejected this.
+TEST_F(RFC9112ParserTest, ParseChunkedBodyWithLongExtension) {
+    const std::string long_ext(200, 'x');
+    std::string chunked_data = "4;tag=" + long_ext + "\r\n"
+                               "data\r\n"
+                               "0\r\n"
+                               "\r\n";
+
+    std::vector<uint8_t> buffer(chunked_data.begin(), chunked_data.end());
+    std::vector<uint8_t> body;
+    size_t bytes_consumed = 0;
+
+    auto result = spaznet::http::HTTPParser::parse_chunked_body(buffer, body, bytes_consumed);
+
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Success);
+    EXPECT_EQ(std::string(body.begin(), body.end()), "data");
+}
+
+// A chunk-extension longer than the 4 KiB cap must still be rejected
+// — this is what defends against an unbounded scan.
+TEST_F(RFC9112ParserTest, ParseChunkedBodyRejectsOverlongExtension) {
+    const std::string huge_ext(8192, 'x');
+    std::string chunked_data = "4;tag=" + huge_ext + "\r\n"
+                               "data\r\n";
+
+    std::vector<uint8_t> buffer(chunked_data.begin(), chunked_data.end());
+    std::vector<uint8_t> body;
+    size_t bytes_consumed = 0;
+
+    auto result = spaznet::http::HTTPParser::parse_chunked_body(buffer, body, bytes_consumed);
+
+    EXPECT_EQ(result, spaznet::http::HTTPParser::ParseResult::Error);
+}
+
 // Test spaznet::http::HTTPRequest helper methods
 TEST_F(RFC9112ParserTest, RequestGetHeaderCaseInsensitive) {
     spaznet::http::HTTPRequest request;

@@ -132,16 +132,16 @@ A request that exceeds the size cap gets a `400 Bad Request` with
 
 `Transfer-Encoding: chunked` requests are decoded for you — `body`
 holds the concatenated chunks by the time `handle_request` runs.
-Two known gaps:
 
-- **Trailers** (RFC 9112 §7.1.2) are not parsed. A peer that emits
-  any trailer field after the last chunk stalls in `Incomplete` until
-  the read timeout closes the connection.
-- **Chunk-extension lines** are capped at 64 bytes. Real-world
-  integrity-tag extensions exceed this.
-
-If your peer is well-behaved (no trailers, no extensions), neither
-limit fires.
+- **Trailers** (RFC 9112 §7.1.2) between the last-chunk (`0\r\n`)
+  and the final CRLF are consumed and dropped. We don't expose
+  trailer fields on `HTTPRequest` today; if you need them, the
+  hook is in `parse_chunked_body` in
+  `example/http/src/handler.cpp`.
+- **Chunk-extension lines** (the optional `;key=value` after a
+  chunk size) are capped at 4 KiB so a peer can't make us scan an
+  unbounded buffer. That's well above any real-world integrity-tag
+  extension.
 
 ## HTTP/1.1 + WebSocket — `example/http-websocket`
 

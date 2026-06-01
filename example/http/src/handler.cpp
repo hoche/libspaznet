@@ -838,9 +838,13 @@ auto spaznet::http::HTTPParser::parse_chunked_body(const std::vector<uint8_t>& b
     size_t pos = 0;
 
     while (pos < buffer.size()) {
-        // Cap the chunk-size line length so a peer cannot make us scan an
-        // unbounded buffer looking for CRLF.
-        const size_t chunk_line_max = 64;
+        // Cap the chunk-size line length so a peer cannot make us scan
+        // an unbounded buffer looking for CRLF.  RFC 9112 §7.1.1 puts
+        // no limit on chunk-extensions, but a 4 KiB cap is comfortably
+        // larger than any real-world integrity-tag extension while
+        // still small enough to bound the scan.  The earlier 64-byte
+        // cap rejected legitimate peers.
+        const size_t chunk_line_max = 4096;
         size_t crlf_pos = pos;
         while (crlf_pos + 1 < buffer.size() &&
                (buffer[crlf_pos] != '\r' || buffer[crlf_pos + 1] != '\n')) {
@@ -868,10 +872,34 @@ auto spaznet::http::HTTPParser::parse_chunked_body(const std::vector<uint8_t>& b
         pos = crlf_pos + 2; // Skip CRLF
 
         if (chunk_size == 0) {
-            // Last chunk - check for trailing CRLF
-            if (pos + 1 < buffer.size() && buffer[pos] == '\r' && buffer[pos + 1] == '\n') {
-                bytes_consumed = pos + 2;
-                return ParseResult::Success;
+            // Last chunk.  Per RFC 9112 §7.1.2 a zero-or-more sequence
+            // of trailer-field lines may appear between the last-chunk
+            // and the final empty line.  Consume them until we either
+            // hit the terminating CRLF (success) or run out of buffer
+            // (incomplete).  Trailers themselves are dropped — the
+            // decoded body is the concatenation of the chunks; trailer
+            // fields are advisory and not exposed on HTTPRequest.
+            // The trailer-line scan reuses the chunk_line_max cap so
+            // a peer can't ship an unbounded "trailer" header that
+            // makes us scan forever.
+            while (pos + 1 < buffer.size()) {
+                if (buffer[pos] == '\r' && buffer[pos + 1] == '\n') {
+                    bytes_consumed = pos + 2;
+                    return ParseResult::Success;
+                }
+                size_t trailer_crlf = pos;
+                while (trailer_crlf + 1 < buffer.size() &&
+                       (buffer[trailer_crlf] != '\r' ||
+                        buffer[trailer_crlf + 1] != '\n')) {
+                    if (trailer_crlf - pos > chunk_line_max) {
+                        return ParseResult::Error;
+                    }
+                    trailer_crlf++;
+                }
+                if (trailer_crlf + 1 >= buffer.size()) {
+                    return ParseResult::Incomplete;
+                }
+                pos = trailer_crlf + 2; // skip the trailer line + its CRLF
             }
             return ParseResult::Incomplete;
         }

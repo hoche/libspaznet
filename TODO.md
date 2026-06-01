@@ -170,19 +170,12 @@ items from the same re-audit, none critical:
     should be opt-in to IOCP via -DSPAZNET_ENABLE_BROKEN_IOCP=ON
     (rename the flag once the backend is actually finished).
 
-- [ ] parse_chunked_body should accept trailer headers
-  - RFC 9112 §7.1.2 allows zero-or-more trailer-field lines between
-    the last-chunk (`0\r\n`) and the final `\r\n`. The current parser
-    requires the final CRLF immediately, so a compliant peer that
-    emits any trailer field stalls in Incomplete forever (until read
-    timeout closes the connection).
+- [x] parse_chunked_body should accept trailer headers — landed
+  2026-05-31 in example/http/src/handler.cpp; trailers are
+  consumed and dropped (not surfaced on HTTPRequest).
 
-- [ ] Bump the chunk-size line max (currently 64 bytes)
-  - http_handler.cpp's parse_chunked_body uses chunk_line_max = 64.
-    RFC 9112 places no limit on chunk-extensions, and real-world
-    extensions (e.g. trailer-style integrity tags) routinely exceed
-    that. Bump to ~4 KiB to remain DoS-safe while accommodating
-    real usage.
+- [x] Bump the chunk-size line max — landed 2026-05-31;
+  chunk_line_max is now 4 KiB (was 64).
 
 - [ ] Don't hold the pending_io_ spinlock across add_fd / modify_fd
   - register_io and process_io_events hold map_lock_ (an atomic_flag
