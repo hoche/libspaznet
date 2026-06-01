@@ -64,19 +64,7 @@ jobs:
           cd build
           cmake --build . --config Release -j$(nproc)
 
-      - name: Run Unit Tests
-        run: |
-          cd build
-          LD_LIBRARY_PATH="${OPENSSL_PREFIX}/lib64:${OPENSSL_PREFIX}/lib" \
-            ./test_unit || ctest -R UnitTests --output-on-failure
-
-      - name: Run Integration Tests
-        run: |
-          cd build
-          LD_LIBRARY_PATH="${OPENSSL_PREFIX}/lib64:${OPENSSL_PREFIX}/lib" \
-            ./test_integration || ctest -R IntegrationTests --output-on-failure
-
-      - name: Run All Tests with CTest
+      - name: Run Tests
         env:
           LD_LIBRARY_PATH: ${{ env.OPENSSL_PREFIX }}/lib64:${{ env.OPENSSL_PREFIX }}/lib
         run: |
@@ -126,8 +114,6 @@ jobs:
             cmake .. -DOPENSSL_ROOT_DIR=/opt/openssl-3.5
             cmake --build . --config Release -j$(nproc)
             export LD_LIBRARY_PATH=/opt/openssl-3.5/lib64:/opt/openssl-3.5/lib
-            ./test_unit         || ctest -R UnitTests        --output-on-failure
-            ./test_integration  || ctest -R IntegrationTests --output-on-failure
             ctest --output-on-failure
           '
 
@@ -161,17 +147,7 @@ jobs:
           cd build
           cmake --build . --config Release -j$(sysctl -n hw.ncpu)
 
-      - name: Run Unit Tests
-        run: |
-          cd build
-          ./test_unit || ctest -R UnitTests --output-on-failure
-
-      - name: Run Integration Tests
-        run: |
-          cd build
-          ./test_integration || ctest -R IntegrationTests --output-on-failure
-
-      - name: Run All Tests with CTest
+      - name: Run Tests
         run: |
           cd build
           ctest --output-on-failure
@@ -206,17 +182,7 @@ jobs:
           cd build
           arch -x86_64 cmake --build . --config Release -j$(sysctl -n hw.ncpu) || cmake --build . --config Release -j$(sysctl -n hw.ncpu)
 
-      - name: Run Unit Tests
-        run: |
-          cd build
-          arch -x86_64 ./test_unit || ./test_unit || ctest -R UnitTests --output-on-failure
-
-      - name: Run Integration Tests
-        run: |
-          cd build
-          arch -x86_64 ./test_integration || ./test_integration || ctest -R IntegrationTests --output-on-failure
-
-      - name: Run All Tests with CTest
+      - name: Run Tests
         run: |
           cd build
           ctest --output-on-failure
@@ -271,17 +237,7 @@ jobs:
           cd build
           cmake --build . --config Release -j
 
-      - name: Run Unit Tests
-        run: |
-          cd build
-          .\Release\test_unit.exe || ctest -C Release -R UnitTests --output-on-failure
-
-      - name: Run Integration Tests
-        run: |
-          cd build
-          .\Release\test_integration.exe || ctest -C Release -R IntegrationTests --output-on-failure
-
-      - name: Run All Tests with CTest
+      - name: Run Tests
         run: |
           cd build
           ctest -C Release --output-on-failure
@@ -336,17 +292,7 @@ jobs:
           cd build
           cmake --build . --config Release -j
 
-      - name: Run Unit Tests
-        run: |
-          cd build
-          .\Release\test_unit.exe || ctest -C Release -R UnitTests --output-on-failure
-
-      - name: Run Integration Tests
-        run: |
-          cd build
-          .\Release\test_integration.exe || ctest -C Release -R IntegrationTests --output-on-failure
-
-      - name: Run All Tests with CTest
+      - name: Run Tests
         run: |
           cd build
           ctest -C Release --output-on-failure
@@ -381,8 +327,6 @@ jobs:
             cd build
             cmake .. -DOPENSSL_ROOT_DIR=/usr/local/openssl35
             cmake --build . --config Release -j$(sysctl -n hw.ncpu)
-            ./test_unit || ctest -R UnitTests --output-on-failure
-            ./test_integration || ctest -R IntegrationTests --output-on-failure
             ctest --output-on-failure
 
   # FreeBSD aarch64 — same shape, ARM64 via QEMU TCG. No KVM, so
@@ -409,6 +353,4 @@ jobs:
             cd build
             cmake ..
             cmake --build . --config Release -j$(sysctl -n hw.ncpu)
-            ./test_unit || ctest -R UnitTests --output-on-failure
-            ./test_integration || ctest -R IntegrationTests --output-on-failure
             ctest --output-on-failure
