@@ -58,3 +58,19 @@ endif()
 add_executable(bench_quic_steady_state tests/performance/bench_quic_steady_state.cpp)
 target_link_libraries(bench_quic_steady_state PRIVATE spaznet_quic_http3)
 spaznet_apply_test_warnings(bench_quic_steady_state)
+
+# Fuzz harnesses for every untrusted-byte parser in the stack.
+# Gated by SPAZNET_BUILD_FUZZ; spaznet_add_fuzzer no-ops when off.
+spaznet_add_fuzzer(fuzz_quic_frame             fuzz/fuzz_quic_frame.cpp)
+spaznet_add_fuzzer(fuzz_quic_long_header       fuzz/fuzz_quic_long_header.cpp)
+spaznet_add_fuzzer(fuzz_quic_transport_params  fuzz/fuzz_quic_transport_params.cpp)
+spaznet_add_fuzzer(fuzz_quic_varint            fuzz/fuzz_quic_varint.cpp)
+spaznet_add_fuzzer(fuzz_qpack_decode           fuzz/fuzz_qpack_decode.cpp)
+spaznet_add_fuzzer(fuzz_h3_frame               fuzz/fuzz_h3_frame.cpp)
+spaznet_add_fuzzer(fuzz_huffman_decode         fuzz/fuzz_huffman_decode.cpp)
+if(SPAZNET_BUILD_FUZZ)
+    foreach(_f fuzz_quic_frame fuzz_quic_long_header fuzz_quic_transport_params
+                fuzz_quic_varint fuzz_qpack_decode fuzz_h3_frame fuzz_huffman_decode)
+        target_link_libraries(${_f} PRIVATE spaznet_quic_http3)
+    endforeach()
+endif()

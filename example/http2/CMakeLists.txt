@@ -50,3 +50,10 @@ endif()
 
 add_executable(http2_hello demo/hello.cpp)
 target_link_libraries(http2_hello PRIVATE spaznet_http2)
+
+spaznet_add_fuzzer(fuzz_hpack_decode fuzz/fuzz_hpack_decode.cpp)
+spaznet_add_fuzzer(fuzz_h2_frame     fuzz/fuzz_h2_frame.cpp)
+if(SPAZNET_BUILD_FUZZ)
+    target_link_libraries(fuzz_hpack_decode PRIVATE spaznet_http2)
+    target_link_libraries(fuzz_h2_frame     PRIVATE spaznet_http2)
+endif()

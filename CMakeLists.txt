@@ -59,6 +59,38 @@ if(SPAZNET_BUILD_QUIC)
     endif()
 endif()
 
+# ---- Fuzzing ------------------------------------------------------------
+# Optional libFuzzer harnesses for every untrusted-byte parser in the
+# tree.  Requires a Clang-family compiler (libFuzzer ships with clang).
+# When enabled, applies -fsanitize=fuzzer-no-link + ASan + UBSan to
+# every target globally so the fuzzer binaries link cleanly against
+# the libraries.  Don't enable for release builds — sanitizers slow
+# everything down by ~2x.
+option(SPAZNET_BUILD_FUZZ "Build libFuzzer harnesses for parser surfaces (requires Clang)" OFF)
+if(SPAZNET_BUILD_FUZZ)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR
+            "SPAZNET_BUILD_FUZZ requires a Clang-family compiler "
+            "(libFuzzer ships with clang).  Re-run with "
+            "-DCMAKE_CXX_COMPILER=clang++.")
+    endif()
+    add_compile_options(-fsanitize=fuzzer-no-link,address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=fuzzer-no-link,address,undefined)
+endif()
+
+# Helper: turn `target` into a libFuzzer binary.  Links the fuzzer
+# runtime and applies the standard test-warning relaxations so harness
+# scaffolding doesn't trip -Wunused.
+function(spaznet_add_fuzzer name source)
+    if(NOT SPAZNET_BUILD_FUZZ)
+        return()
+    endif()
+    add_executable(${name} ${source})
+    target_compile_options(${name} PRIVATE -fsanitize=fuzzer)
+    target_link_options(${name} PRIVATE -fsanitize=fuzzer)
+    spaznet_apply_test_warnings(${name})
+endfunction()
+
 # CMake helpers for install(EXPORT) below.
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)

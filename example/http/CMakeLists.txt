@@ -61,3 +61,11 @@ endif()
 # Demo
 add_executable(http_hello demo/hello.cpp)
 target_link_libraries(http_hello PRIVATE spaznet_http)
+
+# Fuzz harnesses (only built under SPAZNET_BUILD_FUZZ).
+spaznet_add_fuzzer(fuzz_http_request   fuzz/fuzz_http_request.cpp)
+spaznet_add_fuzzer(fuzz_chunked_body   fuzz/fuzz_chunked_body.cpp)
+if(SPAZNET_BUILD_FUZZ)
+    target_link_libraries(fuzz_http_request PRIVATE spaznet_http)
+    target_link_libraries(fuzz_chunked_body PRIVATE spaznet_http)
+endif()
