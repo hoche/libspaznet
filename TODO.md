@@ -252,12 +252,18 @@ Ordered by priority.
     most recent inbound came from. RFC 9000 §9 requires PATH_CHALLENGE
     / PATH_RESPONSE on a new path before sending non-probing data.
 
-- [ ] PTO retransmission + idle timeout
-  - `Recovery` tracks the math (`pto_timeout`, `loss_time_threshold`)
-    but `Connection::on_timer()` never consults it. Packets dropped on
-    the wire never get re-sent today; the existing loopback test only
-    passes because there's no loss. Plumb PTO into `on_timer`, and
-    enforce the negotiated `max_idle_timeout`.
+- [x] PTO retransmission — landed 2026-05-31.
+  `Connection::on_timer` now calls `check_pto()`, ACK
+  processing samples RTT and runs the packet-threshold +
+  time-threshold loss-detection rules from RFC 9002 §6.1, and
+  losses re-queue via `Stream::on_lost` / `crypto_pending_`.
+  Test: `QuicConnection.PtoRetransmitsDroppedStream`.
+
+- [ ] Idle timeout enforcement
+  - Connections honor the peer's `max_idle_timeout` transport
+    parameter at handshake but don't actually tear down stale
+    connections.  `Connection::on_timer` needs to check
+    `now - last_activity_` against the negotiated minimum.
 
 - [ ] CONNECTION_CLOSE emission on protocol errors
   - We parse incoming CONNECTION_CLOSE and flip to `Draining`, but on

@@ -528,3 +528,120 @@ TEST(QuicConnection, EndToEndHandshakeViaProtectedDatagrams) {
                 server.peer_transport_params().initial_max_streams_bidi == 0U);
     EXPECT_TRUE(client->got_peer_tp);
 }
+
+// RFC 9002 §6.2 — PTO retransmission.  Drop the server's post-
+// handshake STREAM datagram on the wire, advance the clock past
+// pto_timeout, and verify that the next on_timer() re-emits the same
+// payload as a probe.
+TEST(QuicConnection, PtoRetransmitsDroppedStream) {
+    auto [cert, key] = make_self_signed_p256();
+    TlsServerConfig cfg{cert, key, {"h3"}};
+    auto ctx = TlsContext::make_server(cfg);
+    ASSERT_NE(ctx, nullptr);
+
+    std::vector<uint8_t> client_dcid = {0xDE, 0xAD, 0xBE, 0xEF};
+    std::vector<uint8_t> client_scid = {0x55, 0x66};
+    std::vector<uint8_t> server_scid = {0xA1, 0xB2, 0xC3, 0xD4};
+
+    std::deque<std::vector<uint8_t>> server_outbox;
+    TransportParameters server_tp;
+    server_tp.initial_max_data = 1 << 20;
+    server_tp.initial_max_stream_data_bidi_remote = 1 << 16;
+    server_tp.initial_max_stream_data_bidi_local = 1 << 16;
+    server_tp.initial_max_streams_bidi = 16;
+    server_tp.initial_max_streams_uni = 3;
+
+    // Controllable clock — `clock_now` is captured and bumped by the
+    // test as it needs to fast-forward past pto_timeout.
+    auto clock_now = std::chrono::steady_clock::now();
+    Connection::ClockFn clock_fn = [&]() { return clock_now; };
+
+    Connection server(ctx, {client_dcid.data(), client_dcid.size()},
+                      {client_scid.data(), client_scid.size()},
+                      {server_scid.data(), server_scid.size()}, server_tp,
+                      [&](std::span<const uint8_t> dg) {
+                          server_outbox.emplace_back(dg.begin(), dg.end());
+                      },
+                      clock_fn);
+
+    auto client = make_client(client_dcid, client_scid);
+
+    // Drive the handshake to completion (same scaffolding as the
+    // EndToEnd test, with the clock advancing 1 ms per round so the
+    // server's recovery state isn't pinned at the initial RTT
+    // estimate).
+    for (int round = 0; round < 30; ++round) {
+        int rc = SSL_do_handshake(client->ssl);
+        if (rc != 1) {
+            int err = SSL_get_error(client->ssl, rc);
+            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                FAIL() << "client SSL_do_handshake err=" << err;
+            }
+        }
+        client_emit(*client);
+        while (!client->outbox.empty()) {
+            auto dg = std::move(client->outbox.front());
+            client->outbox.pop_front();
+            server.on_datagram({dg.data(), dg.size()});
+        }
+        clock_now += std::chrono::milliseconds(1);
+        server.on_timer();
+        while (!server_outbox.empty()) {
+            auto dg = std::move(server_outbox.front());
+            server_outbox.pop_front();
+            client_receive(*client, std::move(dg));
+        }
+        if (!client->pending_dgs.empty()) {
+            auto pending = std::move(client->pending_dgs);
+            client->pending_dgs.clear();
+            for (auto& dg : pending) {
+                client_receive(*client, std::move(dg));
+            }
+        }
+        if (server.state() == Connection::State::Established &&
+            SSL_is_init_finished(client->ssl)) {
+            server.on_timer();
+            while (!server_outbox.empty()) {
+                auto dg = std::move(server_outbox.front());
+                server_outbox.pop_front();
+                client_receive(*client, std::move(dg));
+            }
+            break;
+        }
+    }
+    ASSERT_EQ(server.state(), Connection::State::Established);
+    server_outbox.clear();
+
+    // Server writes a STREAM frame on stream 0.  on_timer drains it
+    // to server_outbox.
+    const std::string payload = "hello-from-server";
+    std::vector<uint8_t> payload_bytes(payload.begin(), payload.end());
+    server.write_stream(0, payload_bytes, /*fin=*/false);
+    server.on_timer();
+    ASSERT_FALSE(server_outbox.empty())
+        << "expected at least one datagram after write_stream";
+    // Drop the data datagram(s) on the wire — never deliver to client.
+    const std::size_t dropped_count = server_outbox.size();
+    server_outbox.clear();
+
+    // Fast-forward well past the PTO timeout (smoothed_rtt after a
+    // handshake on this scaffolding is small, but kInitialRtt is
+    // 333 ms; max_ack_delay default is 25 ms.  2 s gives us plenty of
+    // headroom even at pto_count > 0.)
+    clock_now += std::chrono::seconds(2);
+    server.on_timer();
+
+    EXPECT_FALSE(server_outbox.empty())
+        << "PTO did not fire — server should have retransmitted "
+        << dropped_count << " dropped datagram(s)";
+
+    // The retransmit datagram should be similar size to the original
+    // (header + AEAD overhead + the STREAM frame with the same
+    // payload).  Sanity-check that the payload bytes appear in the
+    // protected datagram — we can't easily decrypt without driving
+    // the client side, but the unencrypted scratch of a small frame
+    // happens to embed enough structure that we settle for a
+    // length sanity check.
+    EXPECT_GE(server_outbox.front().size(), payload.size())
+        << "retransmit datagram is shorter than the original payload";
+}

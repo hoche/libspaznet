@@ -128,6 +128,18 @@ class Connection {
     }
 
   private:
+    // For lightweight in-flight tracking: per outgoing PN, the frames
+    // we'd need to (selectively) replay on loss. We don't replay ACK or
+    // PADDING; CRYPTO and STREAM frames are the main retransmit targets.
+    struct SentRecord {
+        EncryptionLevel level;
+        bool ack_eliciting;
+        std::size_t bytes;
+        TimePoint sent_at;
+        std::vector<CryptoFrame> crypto;
+        std::vector<StreamFrame> streams;
+    };
+
     // Per-PN-space derived keys + ACK bookkeeping.
     struct Space {
         Aead aead{Aead::Aes128Gcm};
@@ -152,6 +164,14 @@ class Connection {
         std::map<uint64_t, std::vector<uint8_t>> crypto_recv_;
         uint64_t crypto_read_offset{0};
         uint64_t crypto_send_offset{0};
+        // RFC 9002 loss + PTO bookkeeping.  We record the most-recent
+        // ack-eliciting send so on_timer can compare against now +
+        // pto_timeout, and the largest PN we've seen acked so on_ack
+        // can run the packet-threshold lost-packet rule.
+        TimePoint last_ack_eliciting_send_time_{};
+        bool any_ack_eliciting_sent_{false};
+        uint64_t largest_acked_pn_{0};
+        bool any_acked_{false};
     };
 
     auto space(EncryptionLevel l) -> Space& {
@@ -184,6 +204,26 @@ class Connection {
     // Get-or-create stream.
     auto ensure_stream(uint64_t stream_id) -> Stream*;
 
+    // Re-queue the CRYPTO + STREAM frames carried by `rec` for
+    // retransmission, and notify congestion control of the loss.
+    // After this, build_and_send will emit those frames in a fresh
+    // packet on its next call.  The caller is responsible for erasing
+    // `rec` from sent_[level] (it's typically the iterator they're
+    // walking).
+    auto declare_lost(SentRecord& rec, EncryptionLevel level) -> void;
+
+    // RFC 9002 §6.1.1+§6.1.2: walk sent_[level] for packets sent
+    // before `largest_acked_pn - kPacketThreshold` OR sent more than
+    // loss_time_threshold ago, declare them lost.  Called after each
+    // ACK is processed.
+    auto detect_and_handle_loss(EncryptionLevel level) -> void;
+
+    // RFC 9002 §6.2: if any in-flight ack-eliciting packet is older
+    // than the PTO timeout, fire — bump pto_count, declare the
+    // most-recent ack-eliciting record(s) lost so the next
+    // build_and_send re-emits them as a probe.
+    auto check_pto() -> void;
+
     // ---- Members --------------------------------------------------------
     Role role_{Role::Server};
     State state_{State::Handshaking};
@@ -208,17 +248,6 @@ class Connection {
     // Streams indexed by ID.
     std::map<uint64_t, std::unique_ptr<Stream>> streams_;
 
-    // For lightweight in-flight tracking: per outgoing PN, the frames
-    // we'd need to (selectively) replay on loss. We don't replay ACK or
-    // PADDING; CRYPTO and STREAM frames are the main retransmit targets.
-    struct SentRecord {
-        EncryptionLevel level;
-        bool ack_eliciting;
-        std::size_t bytes;
-        TimePoint sent_at;
-        std::vector<CryptoFrame> crypto;
-        std::vector<StreamFrame> streams;
-    };
     std::array<std::map<uint64_t, SentRecord>, 4> sent_{};
     // CRYPTO frames pulled from TLS but not yet packetized. One bucket
     // per encryption level (Initial/0-RTT/Handshake/Application).

@@ -366,7 +366,24 @@ auto Connection::on_stream_frame(const StreamFrame& f) -> void {
 }
 
 auto Connection::on_ack_frame(EncryptionLevel level, const AckFrame& f) -> void {
+    auto& sp = space(level);
     auto& by_pn = sent_[static_cast<std::size_t>(level)];
+
+    // RFC 9002 §5.1: take an RTT sample iff the largest-acked PN is
+    // newly acked by this frame AND that record is ack-eliciting.
+    // We snapshot whether it's "new" before the ack-erase loop.
+    const auto largest_it = by_pn.find(f.largest_acked);
+    const bool sample_rtt =
+        largest_it != by_pn.end() && largest_it->second.ack_eliciting;
+    TimePoint largest_sent_at{};
+    if (sample_rtt) {
+        largest_sent_at = largest_it->second.sent_at;
+    }
+    if (!sp.any_acked_ || f.largest_acked > sp.largest_acked_pn_) {
+        sp.largest_acked_pn_ = f.largest_acked;
+        sp.any_acked_ = true;
+    }
+
     auto ack_entry = [&](typename std::map<uint64_t, SentRecord>::iterator it) {
         // Notify streams of acked bytes.
         for (const auto& sf : it->second.streams) {
@@ -406,6 +423,130 @@ auto Connection::on_ack_frame(EncryptionLevel level, const AckFrame& f) -> void 
         ack_range(lo, hi);
     }
     recovery_.reset_pto();
+
+    // RFC 9002 §5.3: sample RTT now that the largest-acked record is
+    // confirmed gone from in-flight (the ack-eliciting check is from
+    // before the erase loop, so it still tells us whether we should
+    // sample).  ack_delay on the wire is microseconds scaled by
+    // 2^peer.ack_delay_exponent; decode against the peer's parameter.
+    if (sample_rtt) {
+        const auto now = clock_fn_();
+        Duration latest = std::chrono::duration_cast<Duration>(now - largest_sent_at);
+        const auto& peer_tp = tls_.peer_transport_params();
+        uint64_t scaled = f.ack_delay << peer_tp.ack_delay_exponent;
+        // Cap against peer's max_ack_delay to defend against a
+        // pathological peer.
+        const uint64_t cap_us = peer_tp.max_ack_delay_ms * 1000U;
+        if (cap_us > 0 && scaled > cap_us) {
+            scaled = cap_us;
+        }
+        Duration ack_delay = std::chrono::microseconds(scaled);
+        recovery_.on_rtt_sample(latest, ack_delay);
+    }
+
+    // RFC 9002 §6.1: declare any unacked packet older than the
+    // largest-acked-minus-threshold (or older than the time threshold)
+    // lost, and re-queue its frames.
+    detect_and_handle_loss(level);
+}
+
+auto Connection::declare_lost(SentRecord& rec, EncryptionLevel level) -> void {
+    // Re-queue stream frames via the Stream's lost-ranges machinery.
+    for (auto& sf : rec.streams) {
+        if (auto* st = ensure_stream(sf.stream_id); st != nullptr) {
+            st->on_lost(sf.offset, sf.data.size());
+        }
+    }
+    // Re-queue CRYPTO frames into the pending list for `level`.  The
+    // frame carries its original offset, so the peer will reassemble
+    // by offset; no separate retransmit-offset bookkeeping needed.
+    auto& pending = crypto_pending_[static_cast<std::size_t>(level)];
+    for (auto& cf : rec.crypto) {
+        pending.push_back(std::move(cf));
+    }
+    rec.crypto.clear();
+    rec.streams.clear();
+    if (rec.ack_eliciting) {
+        congestion_.on_packets_lost(clock_fn_(), rec.bytes, rec.sent_at);
+    }
+}
+
+auto Connection::detect_and_handle_loss(EncryptionLevel level) -> void {
+    auto& sp = space(level);
+    if (!sp.any_acked_) return;
+    auto& by_pn = sent_[static_cast<std::size_t>(level)];
+    if (by_pn.empty()) return;
+
+    const auto now = clock_fn_();
+    const Duration time_threshold = recovery_.loss_time_threshold();
+    const TimePoint time_cutoff = now - time_threshold;
+
+    // Iterate while erasing — capture next before declare_lost+erase.
+    auto it = by_pn.begin();
+    while (it != by_pn.end()) {
+        const uint64_t pn = it->first;
+        // Stop once we hit packets at or above largest_acked — those
+        // can't be considered lost (they may not have been acked yet
+        // but the threshold rules don't apply).
+        if (pn >= sp.largest_acked_pn_) break;
+        const bool packet_threshold =
+            sp.largest_acked_pn_ - pn >= Recovery::kPacketThreshold;
+        const bool time_threshold_hit = it->second.sent_at <= time_cutoff;
+        if (!packet_threshold && !time_threshold_hit) {
+            ++it;
+            continue;
+        }
+        auto next = std::next(it);
+        declare_lost(it->second, level);
+        by_pn.erase(it);
+        it = next;
+    }
+}
+
+auto Connection::check_pto() -> void {
+    // PTO uses the peer's max_ack_delay (in ms) per RFC 9002 §6.2.1.
+    const auto& peer_tp = tls_.peer_transport_params();
+    const Duration max_ack_delay =
+        std::chrono::milliseconds(peer_tp.max_ack_delay_ms);
+    const Duration pto = recovery_.pto_timeout(max_ack_delay);
+    const auto now = clock_fn_();
+
+    bool fired = false;
+    for (auto lvl : {EncryptionLevel::Initial, EncryptionLevel::Handshake,
+                     EncryptionLevel::Application}) {
+        auto& sp = space(lvl);
+        if (!sp.any_ack_eliciting_sent_) continue;
+        auto& by_pn = sent_[static_cast<std::size_t>(lvl)];
+        if (by_pn.empty()) continue;
+        if (now - sp.last_ack_eliciting_send_time_ < pto) continue;
+
+        // PTO has expired for this space.  Per RFC 9002 §6.2.4 we
+        // ought to send 1-2 probe packets.  Simplest correct behavior:
+        // declare every in-flight ack-eliciting record at this level
+        // lost so build_and_send re-emits the contents in a fresh
+        // packet.  The peer will eventually ACK whichever copy
+        // arrives; spurious "loss" of a slow-but-not-lost packet
+        // costs us a duplicate transmission, which is acceptable.
+        fired = true;
+        auto it = by_pn.begin();
+        while (it != by_pn.end()) {
+            if (!it->second.ack_eliciting) {
+                ++it;
+                continue;
+            }
+            auto next = std::next(it);
+            declare_lost(it->second, lvl);
+            by_pn.erase(it);
+            it = next;
+        }
+        // After draining, mark "no longer any ack-eliciting in flight"
+        // so we don't keep firing every tick until the retransmits
+        // land.  The retransmit itself will set it back to true.
+        sp.any_ack_eliciting_sent_ = false;
+    }
+    if (fired) {
+        recovery_.on_pto_fired();
+    }
 }
 
 auto Connection::ensure_stream(uint64_t stream_id) -> Stream* {
@@ -569,12 +710,17 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
         rec.sent_at = clock_fn_();
         rec.crypto = std::move(crypto_pending);
         rec.streams = std::move(stream_pending);
+        const bool was_ack_eliciting = rec.ack_eliciting;
+        const auto sent_at = rec.sent_at;
+        const auto sent_bytes = datagram.size();
         sent_[static_cast<std::size_t>(level)].emplace(pn, std::move(rec));
-        if (rec.ack_eliciting) {
-            congestion_.on_packet_sent(rec.sent_at, datagram.size());
+        if (was_ack_eliciting) {
+            congestion_.on_packet_sent(sent_at, sent_bytes);
+            sp.last_ack_eliciting_send_time_ = sent_at;
+            sp.any_ack_eliciting_sent_ = true;
         }
         if (!peer_address_validated_) {
-            sent_bytes_unvalidated_ += datagram.size();
+            sent_bytes_unvalidated_ += sent_bytes;
         }
         send_fn_({datagram.data(), datagram.size()});
         return true;
@@ -649,9 +795,14 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
     rec.sent_at = clock_fn_();
     rec.crypto = std::move(crypto_pending);
     rec.streams = std::move(stream_pending);
+    const bool was_ack_eliciting2 = rec.ack_eliciting;
+    const auto sent_at2 = rec.sent_at;
+    const auto sent_bytes2 = buf.size();
     sent_[static_cast<std::size_t>(level)].emplace(pn, std::move(rec));
-    if (rec.ack_eliciting) {
-        congestion_.on_packet_sent(rec.sent_at, buf.size());
+    if (was_ack_eliciting2) {
+        congestion_.on_packet_sent(sent_at2, sent_bytes2);
+        sp.last_ack_eliciting_send_time_ = sent_at2;
+        sp.any_ack_eliciting_sent_ = true;
     }
 
     if (include_hs_done) sent_handshake_done_ = true;
@@ -667,6 +818,12 @@ auto Connection::on_timer() -> void {
     install_new_keys();
     tls_.advance();
     install_new_keys();
+    // RFC 9002 §6.2: PTO expiry re-queues any in-flight ack-eliciting
+    // frames so the subsequent build_and_send pass re-emits them as
+    // probe packets.  Check before pulling new TLS data so the probe
+    // includes the actual lost-and-retransmitted payload rather than
+    // freshly-arrived bytes.
+    check_pto();
     pull_crypto_from_tls();
     for (auto lvl :
          {EncryptionLevel::Initial, EncryptionLevel::Handshake, EncryptionLevel::Application}) {

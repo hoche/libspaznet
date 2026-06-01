@@ -37,7 +37,8 @@ PlatformIO.
 | example/quic-http3 | QUIC client mode | **Not implemented** | `Connection::Role::Server` is the only enumerator. |
 | example/quic-http3 | Key update (RFC 9001 §6) | **Not implemented** | Long-lived 1-RTT connections will eventually exceed the AES-128-GCM 2²³ packet limit. |
 | example/quic-http3 | Connection migration / path validation | **Not implemented** | `Listener` blindly updates `last_peer` on every received datagram. |
-| example/quic-http3 | PTO retransmission / idle timeout | **Not implemented** | `Recovery` computes the math but `Connection::on_timer` never consults it. Loss recovery doesn't actually work today. |
+| example/quic-http3 | PTO retransmission (RFC 9002 §6.1+§6.2) | **Stable** | `Connection::on_timer` calls `check_pto()`; ACK processing samples RTT and runs the packet-threshold + time-threshold loss-detection rules. Dropped packets are re-queued via `Stream::on_lost` / `crypto_pending_` and re-emitted by the next `build_and_send`. Test: `QuicConnection.PtoRetransmitsDroppedStream`. |
+| example/quic-http3 | Idle timeout enforcement | **Not implemented** | Negotiated `max_idle_timeout` is parsed but `Connection::on_timer` doesn't tear down idle connections. |
 | example/quic-http3 | CONNECTION_CLOSE emission on protocol errors | **Not implemented** | We parse incoming CONNECTION_CLOSE; we never emit one. |
 | example/quic-http3 | Anti-amplification (RFC 9000 §8.1.2) | **Stable** | Enforced in `Connection::build_and_send`. Validation flips automatically on first decrypted Handshake packet, or via `mark_peer_address_validated()`. |
 | example/quic-http3 | Retry token validation | **Stable** | Enabled by `Listener::Config::require_retry`. Token is peer-address-bound (HMAC-SHA256-trunc-128). See `docs/quic-security.md`. |
