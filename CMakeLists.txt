@@ -84,7 +84,6 @@ set(SOURCES
     src/platform/io_context.cpp
     src/platform/platform_io.cpp
     src/handlers/udp_handler.cpp
-    src/handlers/http2_handler.cpp
     src/utils/string_utils.cpp
     src/utils/number_utils.cpp
     src/utils/binary_utils.cpp
@@ -122,7 +121,6 @@ set(HEADERS
     include/libspaznet/platform/platform_io.hpp
     include/libspaznet/logger.hpp
     include/libspaznet/handlers/udp_handler.hpp
-    include/libspaznet/handlers/http2_handler.hpp
     include/libspaznet/quic/varint.hpp
     include/libspaznet/quic/crypto.hpp
     include/libspaznet/quic/packet.hpp
@@ -315,8 +313,6 @@ set(SPAZNET_UNIT_TEST_SOURCES
     tests/unit/test_platform_io.cpp
     tests/unit/test_io_context.cpp
     tests/unit/test_timer.cpp
-    tests/unit/test_http2_handler.cpp
-    tests/unit/test_rfc9113_parser.cpp
     tests/unit/test_logger.cpp
 )
 if(SPAZNET_BUILD_QUIC)
@@ -340,7 +336,6 @@ spaznet_apply_test_warnings(test_unit)
 add_executable(test_integration
     tests/test_main.cpp
     tests/integration/test_udp_server.cpp
-    tests/integration/test_rfc9113_compliance.cpp
 )
 target_link_libraries(test_integration PRIVATE spaznet GTest::gtest GTest::gmock)
 spaznet_apply_test_warnings(test_integration)
@@ -348,7 +343,6 @@ spaznet_apply_test_warnings(test_integration)
 add_executable(test_performance
     tests/test_main.cpp
     tests/performance/test_iperf_integration.cpp
-    tests/performance/test_rfc9113_performance.cpp
 )
 target_link_libraries(test_performance PRIVATE spaznet GTest::gtest GTest::gmock)
 spaznet_apply_test_warnings(test_performance)
@@ -370,4 +364,5 @@ option(SPAZNET_BUILD_EXAMPLES "Build example protocol libraries (HTTP, etc.)" ON
 if(SPAZNET_BUILD_EXAMPLES)
     add_subdirectory(example/http)
     add_subdirectory(example/http-websocket)
+    add_subdirectory(example/http2)
 endif()

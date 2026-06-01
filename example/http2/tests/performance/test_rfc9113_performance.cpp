@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <chrono>
 #include <iostream>
-#include <libspaznet/handlers/http2_handler.hpp>
+#include <libspaznet/http2/handler.hpp>
 #include <random>
 #include <string>
 #include <vector>
@@ -63,22 +63,22 @@ class RFC9113PerformanceTest : public ::testing::Test {
         large_response.body.resize(100000, 'D');
     }
 
-    HTTP2Request small_request;
-    HTTP2Request medium_request;
-    HTTP2Request large_request;
+    spaznet::http2::Request small_request;
+    spaznet::http2::Request medium_request;
+    spaznet::http2::Request large_request;
 
-    HTTP2Response small_response;
-    HTTP2Response medium_response;
-    HTTP2Response large_response;
+    spaznet::http2::Response small_response;
+    spaznet::http2::Response medium_response;
+    spaznet::http2::Response large_response;
 };
 
 // Benchmark frame serialization
 TEST_F(RFC9113PerformanceTest, FrameSerializationSmall) {
     const int iterations = 100000;
-    HTTP2Frame frame;
+    spaznet::http2::Frame frame;
     frame.length = 10;
-    frame.type = HTTP2FrameType::HEADERS;
-    frame.flags = HTTP2Flags::END_HEADERS;
+    frame.type = spaznet::http2::FrameType::HEADERS;
+    frame.flags = spaznet::http2::Flags::END_HEADERS;
     frame.stream_id = 1;
     frame.payload.resize(10, 'X');
 
@@ -100,10 +100,10 @@ TEST_F(RFC9113PerformanceTest, FrameSerializationSmall) {
 
 TEST_F(RFC9113PerformanceTest, FrameSerializationLarge) {
     const int iterations = 1000;
-    HTTP2Frame frame;
+    spaznet::http2::Frame frame;
     frame.length = 16384;
-    frame.type = HTTP2FrameType::DATA;
-    frame.flags = HTTP2Flags::END_STREAM;
+    frame.type = spaznet::http2::FrameType::DATA;
+    frame.flags = spaznet::http2::Flags::END_STREAM;
     frame.stream_id = 1;
     frame.payload.resize(16384, 'Y');
 
@@ -126,10 +126,10 @@ TEST_F(RFC9113PerformanceTest, FrameSerializationLarge) {
 // Benchmark frame parsing
 TEST_F(RFC9113PerformanceTest, FrameParsingSmall) {
     const int iterations = 100000;
-    HTTP2Frame original;
+    spaznet::http2::Frame original;
     original.length = 10;
-    original.type = HTTP2FrameType::HEADERS;
-    original.flags = HTTP2Flags::END_HEADERS;
+    original.type = spaznet::http2::FrameType::HEADERS;
+    original.flags = spaznet::http2::Flags::END_HEADERS;
     original.stream_id = 1;
     original.payload.resize(10, 'Z');
 
@@ -139,7 +139,7 @@ TEST_F(RFC9113PerformanceTest, FrameParsingSmall) {
 
     for (int i = 0; i < iterations; ++i) {
         size_t offset = 0;
-        HTTP2Frame::parse(serialized, offset);
+        spaznet::http2::Frame::parse(serialized, offset);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -154,10 +154,10 @@ TEST_F(RFC9113PerformanceTest, FrameParsingSmall) {
 
 TEST_F(RFC9113PerformanceTest, FrameParsingLarge) {
     const int iterations = 1000;
-    HTTP2Frame original;
+    spaznet::http2::Frame original;
     original.length = 16384;
-    original.type = HTTP2FrameType::DATA;
-    original.flags = HTTP2Flags::END_STREAM;
+    original.type = spaznet::http2::FrameType::DATA;
+    original.flags = spaznet::http2::Flags::END_STREAM;
     original.stream_id = 1;
     original.payload.resize(16384, 'W');
 
@@ -167,7 +167,7 @@ TEST_F(RFC9113PerformanceTest, FrameParsingLarge) {
 
     for (int i = 0; i < iterations; ++i) {
         size_t offset = 0;
-        HTTP2Frame::parse(serialized, offset);
+        spaznet::http2::Frame::parse(serialized, offset);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -187,7 +187,7 @@ TEST_F(RFC9113PerformanceTest, BuildHeadersFrameSmall) {
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        HTTP2Parser::build_headers_frame(small_request, 1, true, true);
+        spaznet::http2::Parser::build_headers_frame(small_request, 1, true, true);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -207,7 +207,7 @@ TEST_F(RFC9113PerformanceTest, BuildHeadersFrameMedium) {
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        HTTP2Parser::build_headers_frame(medium_request, 1, true, true);
+        spaznet::http2::Parser::build_headers_frame(medium_request, 1, true, true);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -229,7 +229,7 @@ TEST_F(RFC9113PerformanceTest, BuildDataFrameSmall) {
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        HTTP2Parser::build_data_frame(1, data, false);
+        spaznet::http2::Parser::build_data_frame(1, data, false);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -249,7 +249,7 @@ TEST_F(RFC9113PerformanceTest, BuildDataFrameLarge) {
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        HTTP2Parser::build_data_frame(1, data, false);
+        spaznet::http2::Parser::build_data_frame(1, data, false);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -262,42 +262,42 @@ TEST_F(RFC9113PerformanceTest, BuildDataFrameLarge) {
     EXPECT_LT(avg_time_us, 500);
 }
 
-// Benchmark HPACK encoding
+// Benchmark spaznet::http2::HPACK encoding
 TEST_F(RFC9113PerformanceTest, HPACKEncoding) {
     const int iterations = 10000;
 
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        HPACK::encode_headers(medium_request.headers);
+        spaznet::http2::HPACK::encode_headers(medium_request.headers);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
     double avg_time_us = static_cast<double>(duration.count()) / iterations;
-    std::cout << "\n[PERF] HPACK encoding: " << avg_time_us << " μs/headers" << std::endl;
+    std::cout << "\n[PERF] spaznet::http2::HPACK encoding: " << avg_time_us << " μs/headers" << std::endl;
     std::cout << "[PERF] Throughput: " << (1000000.0 / avg_time_us) << " headers/sec" << std::endl;
 
     EXPECT_LT(avg_time_us, 50);
 }
 
-// Benchmark HPACK decoding
+// Benchmark spaznet::http2::HPACK decoding
 TEST_F(RFC9113PerformanceTest, HPACKDecoding) {
     const int iterations = 10000;
-    auto encoded = HPACK::encode_headers(medium_request.headers);
+    auto encoded = spaznet::http2::HPACK::encode_headers(medium_request.headers);
 
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        HPACK::decode_headers(encoded);
+        spaznet::http2::HPACK::decode_headers(encoded);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
     double avg_time_us = static_cast<double>(duration.count()) / iterations;
-    std::cout << "\n[PERF] HPACK decoding: " << avg_time_us << " μs/headers" << std::endl;
+    std::cout << "\n[PERF] spaznet::http2::HPACK decoding: " << avg_time_us << " μs/headers" << std::endl;
     std::cout << "[PERF] Throughput: " << (1000000.0 / avg_time_us) << " headers/sec" << std::endl;
 
     EXPECT_LT(avg_time_us, 50);
@@ -352,12 +352,12 @@ TEST_F(RFC9113PerformanceTest, MultipleFramesRoundTrip) {
     const int frames_per_iteration = 10;
 
     // Create frames
-    std::vector<HTTP2Frame> frames;
+    std::vector<spaznet::http2::Frame> frames;
     for (int i = 0; i < frames_per_iteration; ++i) {
-        HTTP2Frame frame;
+        spaznet::http2::Frame frame;
         frame.length = 100;
-        frame.type = HTTP2FrameType::DATA;
-        frame.flags = (i == frames_per_iteration - 1) ? HTTP2Flags::END_STREAM : 0;
+        frame.type = spaznet::http2::FrameType::DATA;
+        frame.flags = (i == frames_per_iteration - 1) ? spaznet::http2::Flags::END_STREAM : 0;
         frame.stream_id = 1;
         frame.payload.resize(100, static_cast<uint8_t>('A' + i));
         frames.push_back(frame);
@@ -376,7 +376,7 @@ TEST_F(RFC9113PerformanceTest, MultipleFramesRoundTrip) {
         // Parse all frames back
         size_t offset = 0;
         while (offset < buffer.size()) {
-            HTTP2Frame::parse(buffer, offset);
+            spaznet::http2::Frame::parse(buffer, offset);
         }
     }
 
@@ -394,15 +394,15 @@ TEST_F(RFC9113PerformanceTest, MultipleFramesRoundTrip) {
 // Benchmark connection stream management
 TEST_F(RFC9113PerformanceTest, StreamManagement) {
     const int iterations = 100000;
-    HTTP2Connection conn;
+    spaznet::http2::Connection conn;
 
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        HTTP2Frame frame;
-        frame.type = HTTP2FrameType::HEADERS;
+        spaznet::http2::Frame frame;
+        frame.type = spaznet::http2::FrameType::HEADERS;
         frame.stream_id = (i * 2) + 1; // Odd stream IDs
-        frame.flags = HTTP2Flags::END_HEADERS;
+        frame.flags = spaznet::http2::Flags::END_HEADERS;
 
         conn.process_frame(frame);
         conn.get_stream_state(frame.stream_id);
@@ -422,7 +422,7 @@ TEST_F(RFC9113PerformanceTest, StreamManagement) {
 // Benchmark SETTINGS serialization/parsing
 TEST_F(RFC9113PerformanceTest, SettingsSerialization) {
     const int iterations = 100000;
-    HTTP2Settings settings;
+    spaznet::http2::Settings settings;
 
     auto start = std::chrono::high_resolution_clock::now();
 
@@ -442,13 +442,13 @@ TEST_F(RFC9113PerformanceTest, SettingsSerialization) {
 
 TEST_F(RFC9113PerformanceTest, SettingsParsing) {
     const int iterations = 100000;
-    HTTP2Settings settings;
+    spaznet::http2::Settings settings;
     auto serialized = settings.serialize();
 
     auto start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < iterations; ++i) {
-        HTTP2Settings::parse(serialized);
+        spaznet::http2::Settings::parse(serialized);
     }
 
     auto end = std::chrono::high_resolution_clock::now();

@@ -23,7 +23,6 @@ namespace spaznet {
 
 // Forward declarations
 class UDPHandler;
-class HTTP2Handler;
 #ifdef SPAZNET_HAS_QUIC
 namespace http3 {
 class QuicHttp3Service;
@@ -93,7 +92,6 @@ class Socket {
 // NOLINTEND
 
 // Include handlers after Socket is defined
-#include <libspaznet/handlers/http2_handler.hpp>
 #include <libspaznet/handlers/udp_handler.hpp>
 
 namespace spaznet {
@@ -127,7 +125,6 @@ class Server {
     ConnectionHandler connection_handler_;
     DatagramHandler datagram_handler_;
     std::unique_ptr<UDPHandler> udp_handler_;
-    std::unique_ptr<HTTP2Handler> http2_handler_;
 #ifdef SPAZNET_HAS_QUIC
     std::unique_ptr<http3::QuicHttp3Service> quic_http3_service_;
 #endif
@@ -177,7 +174,6 @@ class Server {
     // New code should depend on the example/<protocol> libraries
     // and use the low-level setters above instead.
     void set_udp_handler(std::unique_ptr<UDPHandler> handler);
-    void set_http2_handler(std::unique_ptr<HTTP2Handler> handler);
 #ifdef SPAZNET_HAS_QUIC
     // QUIC v1 + HTTP/3 entry point. The service object owns the
     // Listener + per-connection Http3Server instances; the Server just

@@ -1,7 +1,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
-#include <libspaznet/handlers/http2_handler.hpp>
+#include <libspaznet/http2/handler.hpp>
+#include <libspaznet/http3/huffman.hpp>
 #include <libspaznet/utils/binary_utils.hpp>
 #include <libspaznet/utils/number_utils.hpp>
 #include <sstream>
@@ -23,14 +24,14 @@
 //   modernize-use-default-member-init
 // )
 
-namespace spaznet {
+namespace spaznet::http2 {
 
 // HTTP/2 Connection Preface (RFC 9113 Section 3.5)
-constexpr const char* HTTP2_CONNECTION_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-constexpr size_t HTTP2_CONNECTION_PREFACE_LEN = 24;
+constexpr const char* CONNECTION_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+constexpr size_t CONNECTION_PREFACE_LEN = 24;
 
 // HTTP/2 Frame serialization per RFC 9113 Section 4.1
-std::vector<uint8_t> HTTP2Frame::serialize() const {
+std::vector<uint8_t> Frame::serialize() const {
     std::vector<uint8_t> result;
     result.reserve(9 + payload.size()); // 9-byte header + payload
 
@@ -56,12 +57,12 @@ std::vector<uint8_t> HTTP2Frame::serialize() const {
 }
 
 // HTTP/2 Frame parsing per RFC 9113 Section 4.1
-std::optional<HTTP2Frame> HTTP2Frame::parse(const std::vector<uint8_t>& data, size_t& offset) {
+std::optional<Frame> Frame::parse(const std::vector<uint8_t>& data, size_t& offset) {
     if (offset + 9 > data.size()) {
         return std::nullopt; // Not enough data for frame header
     }
 
-    HTTP2Frame frame;
+    Frame frame;
 
     // Parse length (24 bits, big-endian)
     frame.length = BinaryUtils::decode_uint24_be(&data[offset]);
@@ -73,7 +74,7 @@ std::optional<HTTP2Frame> HTTP2Frame::parse(const std::vector<uint8_t>& data, si
     }
 
     // Parse type
-    frame.type = static_cast<HTTP2FrameType>(data[offset++]);
+    frame.type = static_cast<FrameType>(data[offset++]);
 
     // Parse flags
     frame.flags = data[offset++];
@@ -93,8 +94,8 @@ std::optional<HTTP2Frame> HTTP2Frame::parse(const std::vector<uint8_t>& data, si
     return frame;
 }
 
-// HTTP2Settings serialization
-std::vector<uint8_t> HTTP2Settings::serialize() const {
+// Settings serialization
+std::vector<uint8_t> Settings::serialize() const {
     std::vector<uint8_t> result;
 
     // SETTINGS_HEADER_TABLE_SIZE (0x1)
@@ -148,9 +149,9 @@ std::vector<uint8_t> HTTP2Settings::serialize() const {
     return result;
 }
 
-// HTTP2Settings parsing
-HTTP2Settings HTTP2Settings::parse(const std::vector<uint8_t>& payload) {
-    HTTP2Settings settings;
+// Settings parsing
+Settings Settings::parse(const std::vector<uint8_t>& payload) {
+    Settings settings;
 
     for (size_t i = 0; i + 6 <= payload.size(); i += 6) {
         uint16_t id = (static_cast<uint16_t>(payload[i]) << 8) | payload[i + 1];
@@ -186,8 +187,8 @@ HTTP2Settings HTTP2Settings::parse(const std::vector<uint8_t>& payload) {
     return settings;
 }
 
-// HTTP2Request helper methods
-std::optional<std::string> HTTP2Request::get_pseudo_header(const std::string& name) const {
+// Request helper methods
+std::optional<std::string> Request::get_pseudo_header(const std::string& name) const {
     auto it = headers.find(name);
     if (it != headers.end() && it->first[0] == ':') {
         return it->second;
@@ -195,7 +196,7 @@ std::optional<std::string> HTTP2Request::get_pseudo_header(const std::string& na
     return std::nullopt;
 }
 
-std::unordered_map<std::string, std::string> HTTP2Request::get_regular_headers() const {
+std::unordered_map<std::string, std::string> Request::get_regular_headers() const {
     std::unordered_map<std::string, std::string> regular;
     for (const auto& [key, value] : headers) {
         if (key[0] != ':') {
@@ -205,8 +206,8 @@ std::unordered_map<std::string, std::string> HTTP2Request::get_regular_headers()
     return regular;
 }
 
-// HTTP2Response helper methods
-void HTTP2Response::set_status(int code, const std::string& reason) {
+// Response helper methods
+void Response::set_status(int code, const std::string& reason) {
     status_code = code;
     headers[":status"] = std::to_string(code);
     if (!reason.empty()) {
@@ -214,12 +215,12 @@ void HTTP2Response::set_status(int code, const std::string& reason) {
     }
 }
 
-std::vector<HTTP2Frame> HTTP2Response::to_frames(uint32_t max_frame_size) const {
-    std::vector<HTTP2Frame> frames;
+std::vector<Frame> Response::to_frames(uint32_t max_frame_size) const {
+    std::vector<Frame> frames;
 
     // Build headers frame
-    HTTP2Frame headers_frame =
-        HTTP2Parser::build_headers_frame(*this, stream_id, true, body.empty());
+    Frame headers_frame =
+        Parser::build_headers_frame(*this, stream_id, true, body.empty());
     frames.push_back(headers_frame);
 
     // Build data frames if body is not empty
@@ -230,7 +231,7 @@ std::vector<HTTP2Frame> HTTP2Response::to_frames(uint32_t max_frame_size) const 
             bool end_stream = (offset + chunk_size >= body.size());
 
             std::vector<uint8_t> chunk(body.begin() + offset, body.begin() + offset + chunk_size);
-            HTTP2Frame data_frame = HTTP2Parser::build_data_frame(stream_id, chunk, end_stream);
+            Frame data_frame = Parser::build_data_frame(stream_id, chunk, end_stream);
             frames.push_back(data_frame);
 
             offset += chunk_size;
@@ -323,162 +324,262 @@ size_t HPACK::get_static_table_size() {
     return get_static_table().size();
 }
 
-// Simplified HPACK encoding (basic implementation)
+// ---- HPACK (RFC 7541) — proper implementation -----------------------
+//
+// Supports:
+//   - Indexed header field (1-bit prefix)
+//   - Literal with incremental indexing (2-bit prefix)
+//   - Literal without indexing (4-bit prefix)
+//   - Literal never indexed (4-bit prefix)
+//   - Dynamic table size update (3-bit prefix) — accepted + ignored
+//   - Static table lookup
+//   - Variable-length prefix-N integers (RFC 7541 §5.1)
+//   - Huffman-coded strings on decode (RFC 7541 §5.2 / Appendix B),
+//     using the codec from libspaznet/http3/huffman.hpp
+//
+// We do not maintain a dynamic table on receive — we advertise
+// SETTINGS_HEADER_TABLE_SIZE=0 to peers in the dispatcher, which tells
+// them not to index against our table.  We accept (and ignore)
+// table-size-update frames if a peer sends them anyway.
+//
+// On encode we emit literal-without-Huffman for everything that isn't
+// a pure static-table hit.  That's RFC-conformant and trivial to
+// produce; the savings from Huffman-encoding outbound headers are
+// small compared with the size of typical response bodies.
+
+namespace {
+
+// Decode a prefix-N integer.  `prefix_bits` is the number of low bits
+// of the current byte that hold the integer (1..8).  Returns false on
+// truncation; advances `offset` past the encoded integer on success.
+bool decode_prefix_int(const std::vector<uint8_t>& data, size_t& offset,
+                       uint8_t prefix_bits, uint32_t& out) {
+    if (offset >= data.size() || prefix_bits < 1 || prefix_bits > 8) {
+        return false;
+    }
+    const uint32_t prefix_max = (1U << prefix_bits) - 1U;
+    uint32_t v = data[offset++] & prefix_max;
+    if (v < prefix_max) {
+        out = v;
+        return true;
+    }
+    // Multi-byte form.
+    uint32_t m = 0;
+    while (offset < data.size()) {
+        const uint8_t b = data[offset++];
+        v += (b & 0x7FU) << m;
+        if ((b & 0x80U) == 0) {
+            out = v;
+            return true;
+        }
+        m += 7;
+        if (m > 28) {
+            return false; // overflow guard
+        }
+    }
+    return false; // truncated
+}
+
+// Encode a prefix-N integer.  Caller must have already stuffed the
+// high bits of the first byte (the pattern that identifies the
+// representation); we OR the low `prefix_bits` in.
+void encode_prefix_int(std::vector<uint8_t>& out, uint8_t high_bits, uint8_t prefix_bits,
+                       uint32_t value) {
+    const uint32_t prefix_max = (1U << prefix_bits) - 1U;
+    if (value < prefix_max) {
+        out.push_back(static_cast<uint8_t>(high_bits | static_cast<uint8_t>(value)));
+        return;
+    }
+    out.push_back(static_cast<uint8_t>(high_bits | static_cast<uint8_t>(prefix_max)));
+    value -= prefix_max;
+    while (value >= 128) {
+        out.push_back(static_cast<uint8_t>((value & 0x7FU) | 0x80U));
+        value >>= 7;
+    }
+    out.push_back(static_cast<uint8_t>(value));
+}
+
+// Decode an HPACK string (RFC 7541 §5.2).  Sets `out` and advances
+// `offset`.  Handles Huffman strings via spaznet::http3::huffman_decode.
+bool decode_string(const std::vector<uint8_t>& data, size_t& offset, std::string& out) {
+    if (offset >= data.size()) {
+        return false;
+    }
+    const bool huffman = (data[offset] & 0x80U) != 0;
+    uint32_t length = 0;
+    if (!decode_prefix_int(data, offset, 7, length)) {
+        return false;
+    }
+    if (offset + length > data.size()) {
+        return false;
+    }
+    if (huffman) {
+        std::string decoded;
+        if (!::spaznet::http3::huffman_decode(
+                std::span<const uint8_t>(data.data() + offset, length), decoded)) {
+            return false;
+        }
+        out = std::move(decoded);
+    } else {
+        out.assign(data.begin() + static_cast<std::ptrdiff_t>(offset),
+                   data.begin() + static_cast<std::ptrdiff_t>(offset + length));
+    }
+    offset += length;
+    return true;
+}
+
+// Encode an HPACK string literal-without-Huffman (RFC 7541 §5.2).
+// The high bit of the length byte is the Huffman flag — we set it to 0.
+void encode_string(std::vector<uint8_t>& out, const std::string& s) {
+    encode_prefix_int(out, /*high_bits=*/0x00, /*prefix_bits=*/7,
+                      static_cast<uint32_t>(s.size()));
+    out.insert(out.end(), s.begin(), s.end());
+}
+
+} // namespace
+
 std::vector<uint8_t> HPACK::encode_headers(
     const std::unordered_map<std::string, std::string>& headers) {
     std::vector<uint8_t> result;
-
-    // Simple encoding: for each header, try to find in static table
-    // If found, use index; otherwise, encode as literal
     const auto& static_table = get_static_table();
-    for (const auto& [name, value] : headers) {
-        // Try to find in static table
-        bool found = false;
-        for (size_t i = 1; i < static_table.size(); ++i) {
-            if (static_table[i].first == name &&
-                (value.empty() || static_table[i].second == value)) {
-                // Found in static table - use index (6-bit prefix with 1-bit flag)
-                if (i < 64) {
-                    result.push_back(0x80 | static_cast<uint8_t>(i));
-                } else {
-                    // Indexed header field (6-bit prefix)
-                    result.push_back(0x80 | 0x3F);
-                    result.push_back(static_cast<uint8_t>(i - 64));
-                }
-                found = true;
-                break;
-            }
-        }
 
-        if (!found) {
-            // Literal header field - never indexed (4-bit prefix)
-            result.push_back(0x10);
-
-            // Encode name length
-            if (name.size() < 31) {
-                result.push_back(static_cast<uint8_t>(name.size()));
-            } else {
-                result.push_back(0x1F);
-                // Would need to encode larger lengths here
-            }
-
-            // Encode name
-            result.insert(result.end(), name.begin(), name.end());
-
-            // Encode value length
-            if (value.size() < 31) {
-                result.push_back(static_cast<uint8_t>(value.size()));
-            } else {
-                result.push_back(0x1F);
-            }
-
-            // Encode value
-            result.insert(result.end(), value.begin(), value.end());
+    // Emit pseudo-headers first (RFC 9113 §8.1.2.1: pseudo-headers
+    // MUST appear before regular headers).  Sort regular headers
+    // alphabetically for deterministic output (tests are easier).
+    std::vector<std::pair<std::string, std::string>> pseudo;
+    std::vector<std::pair<std::string, std::string>> regular;
+    for (const auto& [k, v] : headers) {
+        if (!k.empty() && k.front() == ':') {
+            pseudo.emplace_back(k, v);
+        } else {
+            regular.emplace_back(k, v);
         }
     }
+    std::sort(pseudo.begin(), pseudo.end());
+    std::sort(regular.begin(), regular.end());
 
+    auto emit = [&](const std::string& name, const std::string& value) {
+        // First try for a (name, value) exact hit in the static table.
+        for (size_t i = 1; i < static_table.size(); ++i) {
+            if (static_table[i].first == name && static_table[i].second == value) {
+                encode_prefix_int(result, /*high_bits=*/0x80, /*prefix_bits=*/7,
+                                  static_cast<uint32_t>(i));
+                return;
+            }
+        }
+        // Try a name-only hit: emit literal-without-indexing with the
+        // indexed name (4-bit prefix, pattern 0000).
+        for (size_t i = 1; i < static_table.size(); ++i) {
+            if (static_table[i].first == name) {
+                encode_prefix_int(result, /*high_bits=*/0x00, /*prefix_bits=*/4,
+                                  static_cast<uint32_t>(i));
+                encode_string(result, value);
+                return;
+            }
+        }
+        // No name match: literal-without-indexing with new name
+        // (4-bit prefix 0000, name-index = 0 -> next byte starts the
+        // name string).
+        result.push_back(0x00);
+        encode_string(result, name);
+        encode_string(result, value);
+    };
+
+    for (const auto& [k, v] : pseudo) {
+        emit(k, v);
+    }
+    for (const auto& [k, v] : regular) {
+        emit(k, v);
+    }
     return result;
 }
 
-// Simplified HPACK decoding
 std::unordered_map<std::string, std::string> HPACK::decode_headers(
     const std::vector<uint8_t>& data) {
     std::unordered_map<std::string, std::string> headers;
+    const auto& static_table = get_static_table();
     size_t offset = 0;
 
     while (offset < data.size()) {
-        uint8_t first_byte = data[offset++];
+        const uint8_t b = data[offset];
 
-        const auto& static_table = get_static_table();
-        if ((first_byte & 0x80) != 0) {
-            // Indexed header field
-            uint32_t index = first_byte & 0x7F;
-            if (index < static_table.size()) {
-                const auto& entry = static_table[index];
-                if (!entry.second.empty()) {
-                    headers[entry.first] = entry.second;
-                } else {
-                    // Header name only - would need to read value
-                }
+        if ((b & 0x80U) != 0) {
+            // Indexed header field (1-bit prefix).
+            uint32_t index = 0;
+            if (!decode_prefix_int(data, offset, 7, index)) break;
+            if (index == 0 || index >= static_table.size()) {
+                // Out of range — RFC says protocol error; we just drop.
+                continue;
             }
-        } else if ((first_byte & 0xE0) == 0x20) {
-            // Dynamic table size update - skip
-            continue;
-        } else if ((first_byte & 0xC0) == 0x40) {
-            // Literal header field - indexed name
-            uint32_t name_index = first_byte & 0x3F;
-            // Read value length and value
-            if (offset < data.size()) {
-                uint8_t value_len = data[offset++];
-                if (offset + value_len <= data.size()) {
-                    std::string value(data.begin() + offset, data.begin() + offset + value_len);
-                    offset += value_len;
-                    if (name_index < static_table.size()) {
-                        headers[static_table[name_index].first] = value;
-                    }
-                }
+            const auto& [n, v] = static_table[index];
+            headers[n] = v;
+
+        } else if ((b & 0xC0U) == 0x40U) {
+            // Literal with incremental indexing (2-bit prefix 01).
+            uint32_t name_index = 0;
+            if (!decode_prefix_int(data, offset, 6, name_index)) break;
+            std::string name;
+            std::string value;
+            if (name_index == 0) {
+                if (!decode_string(data, offset, name)) break;
+            } else if (name_index < static_table.size()) {
+                name = static_table[name_index].first;
             }
-        } else if ((first_byte & 0xF0) == 0x10) {
-            // Literal header field - never indexed
-            // Read name length
-            if (offset < data.size()) {
-                uint8_t name_len = first_byte & 0x0F;
-                if (name_len == 0x0F) {
-                    // Extended length - simplified, assume next byte
-                    if (offset < data.size()) {
-                        name_len = data[offset++];
-                    }
-                }
+            if (!decode_string(data, offset, value)) break;
+            if (!name.empty()) headers[name] = value;
+            // (We don't maintain a dynamic table — indexing the entry
+            //  is intentionally a no-op.)
 
-                // Read name
-                if (offset + name_len <= data.size()) {
-                    std::string name(data.begin() + offset, data.begin() + offset + name_len);
-                    offset += name_len;
+        } else if ((b & 0xE0U) == 0x20U) {
+            // Dynamic table size update (3-bit prefix 001).
+            uint32_t new_size = 0;
+            if (!decode_prefix_int(data, offset, 5, new_size)) break;
+            // We advertise capacity 0; peer-issued updates within that
+            // bound are fine, anything else would be a protocol error.
+            // Either way: ignore.
 
-                    // Read value length
-                    if (offset < data.size()) {
-                        uint8_t value_len = data[offset++];
-                        if (value_len == 0x0F) {
-                            if (offset < data.size()) {
-                                value_len = data[offset++];
-                            }
-                        }
-
-                        // Read value
-                        if (offset + value_len <= data.size()) {
-                            std::string value(data.begin() + offset,
-                                              data.begin() + offset + value_len);
-                            offset += value_len;
-                            headers[name] = value;
-                        }
-                    }
-                }
+        } else if ((b & 0xF0U) == 0x00U || (b & 0xF0U) == 0x10U) {
+            // Literal without indexing (0000xxxx) or never-indexed
+            // (0001xxxx).  Both use a 4-bit prefix for the name index.
+            uint32_t name_index = 0;
+            if (!decode_prefix_int(data, offset, 4, name_index)) break;
+            std::string name;
+            std::string value;
+            if (name_index == 0) {
+                if (!decode_string(data, offset, name)) break;
+            } else if (name_index < static_table.size()) {
+                name = static_table[name_index].first;
             }
+            if (!decode_string(data, offset, value)) break;
+            if (!name.empty()) headers[name] = value;
+
+        } else {
+            // Unknown prefix — bail to keep partial progress.
+            break;
         }
     }
-
     return headers;
 }
 
-// HTTP2Parser implementation
-bool HTTP2Parser::parse_connection_preface(const std::vector<uint8_t>& data, size_t& offset) {
-    if (offset + HTTP2_CONNECTION_PREFACE_LEN > data.size()) {
+// Parser implementation
+bool Parser::parse_connection_preface(const std::vector<uint8_t>& data, size_t& offset) {
+    if (offset + CONNECTION_PREFACE_LEN > data.size()) {
         return false;
     }
 
     std::string preface(data.begin() + offset,
-                        data.begin() + offset + HTTP2_CONNECTION_PREFACE_LEN);
-    if (preface == HTTP2_CONNECTION_PREFACE) {
-        offset += HTTP2_CONNECTION_PREFACE_LEN;
+                        data.begin() + offset + CONNECTION_PREFACE_LEN);
+    if (preface == CONNECTION_PREFACE) {
+        offset += CONNECTION_PREFACE_LEN;
         return true;
     }
 
     return false;
 }
 
-HTTP2Parser::ParseResult HTTP2Parser::parse_frame(const std::vector<uint8_t>& data, size_t& offset,
-                                                  HTTP2Frame& frame) {
-    auto parsed = HTTP2Frame::parse(data, offset);
+Parser::ParseResult Parser::parse_frame(const std::vector<uint8_t>& data, size_t& offset,
+                                                  Frame& frame) {
+    auto parsed = Frame::parse(data, offset);
     if (!parsed) {
         return ParseResult::Incomplete;
     }
@@ -487,9 +588,9 @@ HTTP2Parser::ParseResult HTTP2Parser::parse_frame(const std::vector<uint8_t>& da
     return ParseResult::Success;
 }
 
-HTTP2Parser::ParseResult HTTP2Parser::parse_headers_frame(const HTTP2Frame& frame,
-                                                          HTTP2Request& request) {
-    if (frame.type != HTTP2FrameType::HEADERS) {
+Parser::ParseResult Parser::parse_headers_frame(const Frame& frame,
+                                                          Request& request) {
+    if (frame.type != FrameType::HEADERS) {
         return ParseResult::Error;
     }
 
@@ -513,9 +614,9 @@ HTTP2Parser::ParseResult HTTP2Parser::parse_headers_frame(const HTTP2Frame& fram
     return ParseResult::Success;
 }
 
-HTTP2Parser::ParseResult HTTP2Parser::parse_headers_frame(const HTTP2Frame& frame,
-                                                          HTTP2Response& response) {
-    if (frame.type != HTTP2FrameType::HEADERS) {
+Parser::ParseResult Parser::parse_headers_frame(const Frame& frame,
+                                                          Response& response) {
+    if (frame.type != FrameType::HEADERS) {
         return ParseResult::Error;
     }
 
@@ -590,15 +691,15 @@ sanitize_http2_headers(const std::unordered_map<std::string, std::string>& in) {
 
 } // namespace
 
-HTTP2Frame HTTP2Parser::build_headers_frame(const HTTP2Request& request, uint32_t stream_id,
+Frame Parser::build_headers_frame(const Request& request, uint32_t stream_id,
                                             bool end_headers, bool end_stream) {
-    HTTP2Frame frame;
-    frame.type = HTTP2FrameType::HEADERS;
+    Frame frame;
+    frame.type = FrameType::HEADERS;
     frame.flags = 0;
     if (end_headers)
-        frame.flags |= HTTP2Flags::END_HEADERS;
+        frame.flags |= Flags::END_HEADERS;
     if (end_stream)
-        frame.flags |= HTTP2Flags::END_STREAM;
+        frame.flags |= Flags::END_STREAM;
     frame.stream_id = stream_id;
 
     // Sanitize before HPACK encoding so a caller cannot smuggle CR/LF
@@ -610,15 +711,15 @@ HTTP2Frame HTTP2Parser::build_headers_frame(const HTTP2Request& request, uint32_
     return frame;
 }
 
-HTTP2Frame HTTP2Parser::build_headers_frame(const HTTP2Response& response, uint32_t stream_id,
+Frame Parser::build_headers_frame(const Response& response, uint32_t stream_id,
                                             bool end_headers, bool end_stream) {
-    HTTP2Frame frame;
-    frame.type = HTTP2FrameType::HEADERS;
+    Frame frame;
+    frame.type = FrameType::HEADERS;
     frame.flags = 0;
     if (end_headers)
-        frame.flags |= HTTP2Flags::END_HEADERS;
+        frame.flags |= Flags::END_HEADERS;
     if (end_stream)
-        frame.flags |= HTTP2Flags::END_STREAM;
+        frame.flags |= Flags::END_STREAM;
     frame.stream_id = stream_id;
 
     // Sanitize before adding the mandatory :status pseudo-header; status
@@ -634,11 +735,11 @@ HTTP2Frame HTTP2Parser::build_headers_frame(const HTTP2Response& response, uint3
     return frame;
 }
 
-HTTP2Frame HTTP2Parser::build_data_frame(uint32_t stream_id, const std::vector<uint8_t>& data,
+Frame Parser::build_data_frame(uint32_t stream_id, const std::vector<uint8_t>& data,
                                          bool end_stream) {
-    HTTP2Frame frame;
-    frame.type = HTTP2FrameType::DATA;
-    frame.flags = end_stream ? HTTP2Flags::END_STREAM : 0;
+    Frame frame;
+    frame.type = FrameType::DATA;
+    frame.flags = end_stream ? Flags::END_STREAM : 0;
     frame.stream_id = stream_id;
     frame.payload = data;
     frame.length = data.size();
@@ -646,10 +747,10 @@ HTTP2Frame HTTP2Parser::build_data_frame(uint32_t stream_id, const std::vector<u
     return frame;
 }
 
-HTTP2Frame HTTP2Parser::build_settings_frame(const HTTP2Settings& settings, bool ack) {
-    HTTP2Frame frame;
-    frame.type = HTTP2FrameType::SETTINGS;
-    frame.flags = ack ? HTTP2Flags::ACK : 0;
+Frame Parser::build_settings_frame(const Settings& settings, bool ack) {
+    Frame frame;
+    frame.type = FrameType::SETTINGS;
+    frame.flags = ack ? Flags::ACK : 0;
     frame.stream_id = 0; // Connection-level frame
     // ACK frames must have no payload per RFC 9113 Section 6.5
     if (ack) {
@@ -663,9 +764,9 @@ HTTP2Frame HTTP2Parser::build_settings_frame(const HTTP2Settings& settings, bool
     return frame;
 }
 
-HTTP2Frame HTTP2Parser::build_goaway_frame(uint32_t last_stream_id, uint32_t error_code) {
-    HTTP2Frame frame;
-    frame.type = HTTP2FrameType::GOAWAY;
+Frame Parser::build_goaway_frame(uint32_t last_stream_id, uint32_t error_code) {
+    Frame frame;
+    frame.type = FrameType::GOAWAY;
     frame.flags = 0;
     frame.stream_id = 0; // Connection-level frame
 
@@ -684,9 +785,9 @@ HTTP2Frame HTTP2Parser::build_goaway_frame(uint32_t last_stream_id, uint32_t err
     return frame;
 }
 
-HTTP2Frame HTTP2Parser::build_rst_stream_frame(uint32_t stream_id, uint32_t error_code) {
-    HTTP2Frame frame;
-    frame.type = HTTP2FrameType::RST_STREAM;
+Frame Parser::build_rst_stream_frame(uint32_t stream_id, uint32_t error_code) {
+    Frame frame;
+    frame.type = FrameType::RST_STREAM;
     frame.flags = 0;
     frame.stream_id = stream_id;
 
@@ -701,10 +802,10 @@ HTTP2Frame HTTP2Parser::build_rst_stream_frame(uint32_t stream_id, uint32_t erro
     return frame;
 }
 
-HTTP2Frame HTTP2Parser::build_window_update_frame(uint32_t stream_id,
+Frame Parser::build_window_update_frame(uint32_t stream_id,
                                                   uint32_t window_size_increment) {
-    HTTP2Frame frame;
-    frame.type = HTTP2FrameType::WINDOW_UPDATE;
+    Frame frame;
+    frame.type = FrameType::WINDOW_UPDATE;
     frame.flags = 0;
     frame.stream_id = stream_id;
 
@@ -719,10 +820,10 @@ HTTP2Frame HTTP2Parser::build_window_update_frame(uint32_t stream_id,
     return frame;
 }
 
-HTTP2Frame HTTP2Parser::build_ping_frame(const std::vector<uint8_t>& opaque_data, bool ack) {
-    HTTP2Frame frame;
-    frame.type = HTTP2FrameType::PING;
-    frame.flags = ack ? HTTP2Flags::ACK : 0;
+Frame Parser::build_ping_frame(const std::vector<uint8_t>& opaque_data, bool ack) {
+    Frame frame;
+    frame.type = FrameType::PING;
+    frame.flags = ack ? Flags::ACK : 0;
     frame.stream_id = 0; // Connection-level frame
 
     if (opaque_data.size() == 8) {
@@ -736,25 +837,25 @@ HTTP2Frame HTTP2Parser::build_ping_frame(const std::vector<uint8_t>& opaque_data
     return frame;
 }
 
-// HTTP2Connection implementation
-HTTP2Connection::HTTP2Connection() : next_stream_id_(1), client_preface_received_(false) {}
+// Connection implementation
+Connection::Connection() : next_stream_id_(1), client_preface_received_(false) {}
 
-HTTP2Parser::ParseResult HTTP2Connection::process_frame(const HTTP2Frame& frame) {
+Parser::ParseResult Connection::process_frame(const Frame& frame) {
     // Validate stream ID
     if (frame.stream_id != 0 && !is_valid_stream(frame.stream_id)) {
         // Invalid stream - should send RST_STREAM
-        return HTTP2Parser::ParseResult::Error;
+        return Parser::ParseResult::Error;
     }
 
     // Update stream state based on frame type
     if (frame.stream_id != 0) {
         switch (frame.type) {
-            case HTTP2FrameType::HEADERS:
-                if (get_stream_state(frame.stream_id) == HTTP2StreamState::IDLE) {
+            case FrameType::HEADERS:
+                if (get_stream_state(frame.stream_id) == StreamState::IDLE) {
                     initialize_stream(frame.stream_id);
                 }
                 break;
-            case HTTP2FrameType::DATA:
+            case FrameType::DATA:
                 // Stream must be OPEN or HALF_CLOSED_REMOTE
                 break;
             default:
@@ -762,27 +863,27 @@ HTTP2Parser::ParseResult HTTP2Connection::process_frame(const HTTP2Frame& frame)
         }
 
         // Check END_STREAM flag
-        if ((frame.flags & HTTP2Flags::END_STREAM) != 0) {
+        if ((frame.flags & Flags::END_STREAM) != 0) {
             close_stream(frame.stream_id);
         }
     }
 
-    return HTTP2Parser::ParseResult::Success;
+    return Parser::ParseResult::Success;
 }
 
-void HTTP2Connection::update_settings(const HTTP2Settings& settings) {
+void Connection::update_settings(const Settings& settings) {
     settings_ = settings;
 }
 
-HTTP2StreamState HTTP2Connection::get_stream_state(uint32_t stream_id) const {
+StreamState Connection::get_stream_state(uint32_t stream_id) const {
     auto it = streams_.find(stream_id);
     if (it != streams_.end()) {
         return it->second;
     }
-    return HTTP2StreamState::IDLE;
+    return StreamState::IDLE;
 }
 
-bool HTTP2Connection::is_valid_stream(uint32_t stream_id) const {
+bool Connection::is_valid_stream(uint32_t stream_id) const {
     if (stream_id == 0) {
         return false; // Stream 0 is reserved for connection-level frames
     }
@@ -793,12 +894,12 @@ bool HTTP2Connection::is_valid_stream(uint32_t stream_id) const {
     return true;
 }
 
-void HTTP2Connection::initialize_stream(uint32_t stream_id) {
-    streams_[stream_id] = HTTP2StreamState::OPEN;
+void Connection::initialize_stream(uint32_t stream_id) {
+    streams_[stream_id] = StreamState::OPEN;
 }
 
-void HTTP2Connection::close_stream(uint32_t stream_id) {
-    streams_[stream_id] = HTTP2StreamState::CLOSED;
+void Connection::close_stream(uint32_t stream_id) {
+    streams_[stream_id] = StreamState::CLOSED;
 }
 
 // NOLINTEND(
@@ -815,4 +916,4 @@ void HTTP2Connection::close_stream(uint32_t stream_id) {
 //   modernize-use-default-member-init
 // )
 
-} // namespace spaznet
+} // namespace spaznet::http2

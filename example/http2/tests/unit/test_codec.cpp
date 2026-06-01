@@ -1,25 +1,25 @@
 #include <gtest/gtest.h>
-#include <libspaznet/handlers/http2_handler.hpp>
+#include <libspaznet/http2/handler.hpp>
 
 using namespace spaznet;
 
-TEST(HTTP2FrameTest, FrameStructure) {
-    HTTP2Frame frame;
+TEST(Http2FrameTest, FrameStructure) {
+    spaznet::http2::Frame frame;
     frame.length = 100;
-    frame.type = HTTP2FrameType::HEADERS;
-    frame.flags = HTTP2Flags::END_HEADERS;
+    frame.type = spaznet::http2::FrameType::HEADERS;
+    frame.flags = spaznet::http2::Flags::END_HEADERS;
     frame.stream_id = 1;
     frame.payload.resize(100, 0x42);
 
     EXPECT_EQ(frame.length, 100);
-    EXPECT_EQ(frame.type, HTTP2FrameType::HEADERS);
-    EXPECT_EQ(frame.flags, HTTP2Flags::END_HEADERS);
+    EXPECT_EQ(frame.type, spaznet::http2::FrameType::HEADERS);
+    EXPECT_EQ(frame.flags, spaznet::http2::Flags::END_HEADERS);
     EXPECT_EQ(frame.stream_id, 1);
     EXPECT_EQ(frame.payload.size(), 100);
 }
 
-TEST(HTTP2RequestTest, RequestStructure) {
-    HTTP2Request request;
+TEST(Http2RequestTest, RequestStructure) {
+    spaznet::http2::Request request;
     request.stream_id = 1;
     request.method = "GET";
     request.path = "/index.html";
@@ -34,8 +34,8 @@ TEST(HTTP2RequestTest, RequestStructure) {
     EXPECT_EQ(request.body.size(), 4);
 }
 
-TEST(HTTP2ResponseTest, ToFrame) {
-    HTTP2Response response;
+TEST(Http2ResponseTest, ToFrame) {
+    spaznet::http2::Response response;
     response.stream_id = 1;
     response.set_status(200);
     response.headers["content-type"] = "text/html";
@@ -44,12 +44,12 @@ TEST(HTTP2ResponseTest, ToFrame) {
     auto frame = response.to_frame();
 
     EXPECT_EQ(frame.stream_id, 1);
-    EXPECT_EQ(frame.type, HTTP2FrameType::HEADERS);
+    EXPECT_EQ(frame.type, spaznet::http2::FrameType::HEADERS);
     EXPECT_GT(frame.length, 0);
 }
 
-TEST(HTTP2ResponseTest, ToFrameWithStatus) {
-    HTTP2Response response;
+TEST(Http2ResponseTest, ToFrameWithStatus) {
+    spaznet::http2::Response response;
     response.stream_id = 42;
     response.set_status(404);
     response.headers["content-type"] = "text/plain";
@@ -58,5 +58,5 @@ TEST(HTTP2ResponseTest, ToFrameWithStatus) {
     auto frames = response.to_frames();
     EXPECT_GT(frames.size(), 0);
     EXPECT_EQ(frames[0].stream_id, 42);
-    EXPECT_EQ(frames[0].type, HTTP2FrameType::HEADERS);
+    EXPECT_EQ(frames[0].type, spaznet::http2::FrameType::HEADERS);
 }

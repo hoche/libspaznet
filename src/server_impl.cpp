@@ -253,10 +253,6 @@ void Server::set_udp_handler(std::unique_ptr<UDPHandler> handler) {
     udp_handler_ = std::move(handler);
 }
 
-void Server::set_http2_handler(std::unique_ptr<HTTP2Handler> handler) {
-    http2_handler_ = std::move(handler);
-}
-
 #ifdef SPAZNET_HAS_QUIC
 void Server::set_quic_http3_service(std::unique_ptr<http3::QuicHttp3Service> service) {
     quic_http3_service_ = std::move(service);
