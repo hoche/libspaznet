@@ -308,12 +308,24 @@ Ordered by priority.
     and validates the GET round-trips would catch any plumbing bugs
     in the receive_udp coroutine.
 
-- [ ] Real curl `--http3` interop
-  - Neither CI host has an HTTP/3-enabled curl today. Build curl with
-    `--with-quiche` or `--with-ngtcp2` on meep (or pull a pre-built
-    container) and add a test that pipes through it. Almost certainly
-    finds at least one issue the in-memory test misses (cipher-suite
-    preference ordering, exact ACK timing, GREASE frame handling).
+- [x] Real curl `--http3` interop test scaffolding — landed 2026-05-31.
+  `QuicHttp3CurlInterop` (example/quic-http3/tests/integration/test_curl_http3_interop.cpp)
+  spins the server up on a real loopback UDP port, picks a free
+  port, generates a self-signed P-256 cert, and runs
+  `curl --http3-only -k -sS` against it. Self-skips when the host
+  curl lacks HTTP/3 (macOS system curl, stock Ubuntu 24.04 curl).
+  Service grows a self-routing constructor so callers don't have
+  to know the UDP fd before `listen_udp` picks one.  Honors
+  `SSLKEYLOGFILE` for Wireshark debugging.
+
+  Still open follow-up: actually running it against a real
+  HTTP/3-capable curl in CI. Both meep and the macOS dev box ship
+  curl without HTTP/3 today.  Easiest path: install
+  `libnghttp3-dev` + `libngtcp2-dev` (both on Ubuntu 24.04
+  universe) and build curl from source with `--with-nghttp3`
+  `--with-ngtcp2`.  Once that's wired the test will catch the
+  cipher-suite ordering / ACK timing / GREASE drift the in-memory
+  client glosses over.
 
 ### Features that round out the implementation
 
