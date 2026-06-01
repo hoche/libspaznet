@@ -83,7 +83,6 @@ endif()
 set(SOURCES
     src/platform/io_context.cpp
     src/platform/platform_io.cpp
-    src/handlers/udp_handler.cpp
     src/utils/string_utils.cpp
     src/utils/number_utils.cpp
     src/utils/binary_utils.cpp
@@ -120,7 +119,6 @@ set(HEADERS
     include/libspaznet/platform/io_context.hpp
     include/libspaznet/platform/platform_io.hpp
     include/libspaznet/logger.hpp
-    include/libspaznet/handlers/udp_handler.hpp
     include/libspaznet/quic/varint.hpp
     include/libspaznet/quic/crypto.hpp
     include/libspaznet/quic/packet.hpp
@@ -333,12 +331,9 @@ add_executable(test_unit ${SPAZNET_UNIT_TEST_SOURCES})
 target_link_libraries(test_unit PRIVATE spaznet GTest::gtest GTest::gmock)
 spaznet_apply_test_warnings(test_unit)
 
-add_executable(test_integration
-    tests/test_main.cpp
-    tests/integration/test_udp_server.cpp
-)
-target_link_libraries(test_integration PRIVATE spaznet GTest::gtest GTest::gmock)
-spaznet_apply_test_warnings(test_integration)
+# All core integration tests have moved to example/<protocol>/tests
+# alongside their handler implementations.  Re-add this when there's
+# truly transport-level integration code to test here.
 
 add_executable(test_performance
     tests/test_main.cpp
@@ -356,7 +351,6 @@ if(SPAZNET_BUILD_QUIC)
 endif()
 
 add_test(NAME UnitTests COMMAND test_unit)
-add_test(NAME IntegrationTests COMMAND test_integration)
 add_test(NAME PerformanceTests COMMAND test_performance)
 
 # ---- example/ subprojects ----
@@ -365,4 +359,5 @@ if(SPAZNET_BUILD_EXAMPLES)
     add_subdirectory(example/http)
     add_subdirectory(example/http-websocket)
     add_subdirectory(example/http2)
+    add_subdirectory(example/udp)
 endif()

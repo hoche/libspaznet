@@ -1,8 +1,9 @@
 #include <gtest/gtest.h>
 #include <atomic>
 #include <chrono>
-#include <libspaznet/handlers/udp_handler.hpp>
 #include <libspaznet/server.hpp>
+#include <libspaznet/udp/dispatcher.hpp>
+#include <libspaznet/udp/handler.hpp>
 #include <string>
 #include <thread>
 #include <vector>
@@ -21,12 +22,12 @@
 
 using namespace spaznet;
 
-class TestUDPHandler : public UDPHandler {
+class TestUDPHandler : public spaznet::udp::Handler {
   public:
     std::atomic<int> packet_count{0};
-    std::vector<UDPPacket> received_packets;
+    std::vector<spaznet::udp::Packet> received_packets;
 
-    Task handle_packet(const UDPPacket& packet, Socket& socket) override {
+    Task handle_packet(const spaznet::udp::Packet& packet) override {
         packet_count.fetch_add(1);
         received_packets.push_back(packet);
         co_return;
@@ -42,7 +43,8 @@ class UDPServerTest : public ::testing::Test {
         auto handler_unique = std::make_unique<TestUDPHandler>();
         handler = handler_unique.get();
         server = std::make_unique<Server>(2);
-        server->set_udp_handler(std::move(handler_unique));
+        server->set_datagram_handler(
+            spaznet::udp::make_dispatcher(std::move(handler_unique)));
         server->listen_udp(6666);
 
         server_thread = std::thread([this]() { server->run(); });

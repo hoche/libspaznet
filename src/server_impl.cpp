@@ -249,10 +249,6 @@ void Server::set_datagram_handler(DatagramHandler handler) {
     datagram_handler_ = std::move(handler);
 }
 
-void Server::set_udp_handler(std::unique_ptr<UDPHandler> handler) {
-    udp_handler_ = std::move(handler);
-}
-
 #ifdef SPAZNET_HAS_QUIC
 void Server::set_quic_http3_service(std::unique_ptr<http3::QuicHttp3Service> service) {
     quic_http3_service_ = std::move(service);
@@ -443,14 +439,6 @@ Task Server::receive_udp(int udp_fd) {
                 co_await datagram_handler_(std::move(dg));
             } catch (...) {
             }
-        }
-
-        if (udp_handler_) {
-            UDPPacket pkt;
-            pkt.data = buffer;
-            pkt.address = host;
-            pkt.port = port;
-            co_await udp_handler_->handle_packet(pkt, udp_socket);
         }
 
 #ifdef SPAZNET_HAS_QUIC
