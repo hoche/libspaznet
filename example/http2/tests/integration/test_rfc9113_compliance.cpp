@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <libspaznet/http2/dispatcher.hpp>
 #include <libspaznet/http2/handler.hpp>
 #include <libspaznet/server.hpp>
