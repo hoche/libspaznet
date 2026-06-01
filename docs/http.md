@@ -227,10 +227,22 @@ OpenSSL 3.5+.
 - PUSH_PROMISE / server push (disabled via SETTINGS).
 - Trailers, priority frames (priority frames are silently dropped
   per RFC 9113 §4.1).
-- Coroutine-per-stream multiplexing — request handlers run serially
-  per connection.  Correct for request/response but lower throughput
-  than a true multiplexed implementation.  Tracked in
-  [`api-status.md`](api-status.md).
+- True per-frame priority weighting.  We don't reorder pending
+  writes by stream priority; the queue is FIFO across all streams.
+  Frames are still allowed to interleave across streams because
+  every HEADERS we emit carries `END_HEADERS` (so RFC 9113 §6.10's
+  "no other frames between HEADERS and CONTINUATION" doesn't bind
+  us).  Tracked in [`api-status.md`](api-status.md).
+
+> Concurrent multiplexing **is** wired (2026-05-31): each fully-
+> arrived request dispatches as a detached coroutine, so a slow
+> handler on stream A no longer stalls PING-ACK, WINDOW_UPDATE, or
+> handlers for streams B / C / D.  Wire writes funnel through a
+> single per-connection writer coroutine to keep individual
+> frames atomic on the wire.  Handlers MUST NOT call
+> `socket.async_write` directly when running under the multiplexed
+> dispatcher — that bypasses the writer and races with other
+> handlers' frames.  Use the `Response` object instead.
 
 ## The `Socket&` parameter (both protocols)
 

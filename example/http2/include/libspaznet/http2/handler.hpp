@@ -245,8 +245,18 @@ class Handler {
 
     // Handle a single HTTP/2 request.  The dispatcher decodes HEADERS
     // + DATA frames into `request` (including reassembled body),
-    // dispatches concurrently per stream, and writes the populated
-    // `response` back as HEADERS + DATA frames on the same stream.
+    // dispatches each fully-arrived request as a detached coroutine
+    // so multiple handlers can run concurrently on a single
+    // connection, and writes the populated `response` back as
+    // HEADERS + DATA frames on the same stream.
+    //
+    // The `socket` reference is exposed for advisory inspection only
+    // (peer addr, file descriptor).  Under the multiplexed
+    // dispatcher every wire write funnels through a per-connection
+    // writer coroutine for per-frame atomicity, so handlers MUST NOT
+    // call `socket.async_write` directly — doing so races with other
+    // handlers' frames and may corrupt the wire.  Build the response
+    // by populating the `response` object instead.
     virtual auto handle_request(const Request& request, Response& response,
                                 Socket& socket) -> Task = 0;
 };
