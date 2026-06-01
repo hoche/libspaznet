@@ -10,7 +10,7 @@
 
 ## Active multi-session work
 
-- [ ] **Pull protocol handlers out of core into `example/<protocol>/`**
+- [x] **Pull protocol handlers out of core into `example/<protocol>/`** — landed 2026-05-31 across commits a7fab2d..2253437. All ten phases done; src/ and include/libspaznet/ now carry only the low-level server. Same 284 tests pass on Mac and meep.
   - Goal: `src/` and `include/` contain only the low-level server
     (`Server`, `Socket`, `IOContext`, `Task`, `PlatformIO`). Protocol
     code (HTTP/1.1, WebSocket, HTTP/2, UDP, QUIC + HTTP/3) lives under

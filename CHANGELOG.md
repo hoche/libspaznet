@@ -6,6 +6,91 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
+## 2026-05-31 — protocol handlers pulled out of core
+
+Across `a7fab2d`, `aefbd64`, `e8f372f`, `d812849`, `63da693`,
+`05f818f`, `2253437`.
+
+### Added
+- `Server::set_connection_handler(std::function<Task(Socket)>)` and
+  `Server::set_datagram_handler(std::function<Task(Datagram)>)` —
+  the low-level dispatch hooks every protocol example now plugs
+  into.
+- `spaznet::Datagram` struct (data + peer addr + raw sockaddr +
+  listen fd).
+- `spaznet::ConnectionHandler` / `spaznet::DatagramHandler`
+  typedefs.
+- `spaznet::codec::huffman_{encode,decode}` — shared RFC 7541 §B
+  Huffman codec used by both HPACK (HTTP/2) and QPACK (HTTP/3).
+- `example/http/` — HTTP/1.1, `spaznet::http::` namespace.
+  `make_dispatcher(unique_ptr<HTTPHandler>) -> ConnectionHandler`.
+- `example/http-websocket/` — combined HTTP/1.1 + WebSocket on the
+  same port.  `spaznet::websocket::` namespace, names stripped of
+  the `WebSocket` prefix (`Handler`, `Frame`, `Message`, `Opcode`).
+  `make_dispatcher(http_handler, ws_handler)`.
+  `spaznet::websocket::send_message()` replaces the old
+  `Socket::send_websocket_message` method.
+- `example/http2/` — HTTP/2 over h2c (RFC 9113 §3.4, prior-
+  knowledge cleartext).  **First version that actually serves
+  HTTP/2 requests** — pre-restructure `set_http2_handler` accepted
+  a handler but the dispatch never ran.  Full SETTINGS exchange,
+  multiplexed streams, HPACK with proper RFC 7541 varints +
+  Huffman decode, per-stream and connection-level flow control.
+  Verified against `curl --http2-prior-knowledge`.
+- `example/udp/` — handler-interface idiom over `set_datagram_handler`.
+  `spaznet::udp::Packet` carries `listen_fd` + raw `sockaddr_storage`
+  so handlers `sendto()` directly.
+- `example/quic-http3/` — full QUIC v1 + HTTP/3 + QPACK stack moved
+  out of core into its own library (`spaznet_quic_http3`).
+  Namespaces `spaznet::quic::` + `spaznet::http3::` unchanged.
+  New `spaznet::http3::make_dispatcher(unique_ptr<QuicHttp3Service>)
+  -> DatagramHandler` for symmetry with the other examples.
+- Working demos under `example/<protocol>/demo/`:
+  `http_hello`, `ws_echo`, `http2_hello`, `udp_echo`.
+
+### Removed — **BREAKING**
+- `Server::set_http_handler`, `set_websocket_handler`,
+  `set_http2_handler`, `set_udp_handler`,
+  `set_quic_http3_service` — all gone.  Replace with the
+  per-protocol `make_dispatcher(...)` factory + the new
+  low-level `set_connection_handler` / `set_datagram_handler`.
+- `Socket::send_websocket_message` method —
+  `spaznet::websocket::send_message(socket, ...)` free function
+  is the replacement.
+- All `<libspaznet/handlers/*.hpp>` headers (HTTP, WebSocket,
+  HTTP/2, UDP) — moved to `<libspaznet/<protocol>/...>` under the
+  example libraries.
+- `<libspaznet/http3/huffman.hpp>` — moved to
+  `<libspaznet/codec/huffman.hpp>` (and namespace shifted to
+  `spaznet::codec::`).  The HuffTree codec stays in core because
+  both HPACK and QPACK use it.
+
+Migration: see [`docs/migration.md`](docs/migration.md).
+
+### Changed
+- HPACK rewritten to actually conform to RFC 7541.  The pre-
+  restructure HPACK had broken varints, no Huffman decode, no
+  dynamic-table-size-update handling, and only round-tripped its
+  own (broken) output — it didn't interop with real HTTP/2
+  clients.  The new implementation handles all four
+  representations + prefix-N varints + Huffman decode via the
+  shared `spaznet::codec` codec.
+- Core builds with **no OpenSSL dependency**.  `SPAZNET_BUILD_QUIC`
+  at the top level now gates `example/quic-http3` (rather than
+  gating QUIC inside core).
+- New top-level option `SPAZNET_BUILD_EXAMPLES` (default ON)
+  controls whether the example libraries build.
+
+### Result
+- `src/handlers/` and `include/libspaznet/handlers/` directories
+  deleted.  Core's `src/` and `include/libspaznet/` carry only
+  `codec/`, `platform/`, `utils/`, `io_context.hpp`,
+  `platform_io.hpp`, `logger.hpp`, `server.hpp`, plus
+  `src/server_impl.cpp`.  The "only the low-level server should be
+  left in src and include" goal is reached.
+- 284 tests across core + 5 example libraries; same pass count on
+  Mac and meep.
+
 ## 2026-05-30
 
 ### Added
