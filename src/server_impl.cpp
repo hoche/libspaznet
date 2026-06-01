@@ -5,9 +5,6 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
-#ifdef SPAZNET_HAS_QUIC
-#include <libspaznet/http3/service.hpp>
-#endif
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/server.hpp>
 #include <map>
@@ -249,12 +246,6 @@ void Server::set_datagram_handler(DatagramHandler handler) {
     datagram_handler_ = std::move(handler);
 }
 
-#ifdef SPAZNET_HAS_QUIC
-void Server::set_quic_http3_service(std::unique_ptr<http3::QuicHttp3Service> service) {
-    quic_http3_service_ = std::move(service);
-}
-#endif
-
 void Server::listen_tcp(uint16_t port) {
     // Use getaddrinfo for IPv4/IPv6 compatibility
     struct addrinfo hints {
@@ -441,14 +432,6 @@ Task Server::receive_udp(int udp_fd) {
             }
         }
 
-#ifdef SPAZNET_HAS_QUIC
-        if (quic_http3_service_) {
-            spaznet::quic::PeerAddr peer{};
-            peer.length = addr_len;
-            std::memcpy(&peer.storage, &addr, addr_len);
-            quic_http3_service_->handle_datagram(peer, {buffer.data(), buffer.size()});
-        }
-#endif
     }
 
     co_return;

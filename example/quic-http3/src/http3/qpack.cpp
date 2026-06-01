@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
-#include <libspaznet/http3/huffman.hpp>
+#include <libspaznet/codec/huffman.hpp>
 
 namespace spaznet {
 namespace http3 {
@@ -155,7 +155,7 @@ auto read_int(std::span<const uint8_t> buf, std::size_t& off, int n, uint64_t& o
 auto write_string(std::vector<uint8_t>& out, std::string_view s, uint8_t prefix_bits,
                   int n) -> void {
     std::vector<uint8_t> huff;
-    huffman_encode(s, huff);
+    ::spaznet::codec::huffman_encode(s, huff);
     const uint8_t huff_bit = static_cast<uint8_t>(1U << n); // H=1 set
     write_int(out, huff.size(), prefix_bits | huff_bit, n);
     out.insert(out.end(), huff.begin(), huff.end());
@@ -171,7 +171,7 @@ auto read_string(std::span<const uint8_t> buf, std::size_t& off, int n, std::str
     std::span<const uint8_t> raw{buf.data() + off, static_cast<std::size_t>(len)};
     off += static_cast<std::size_t>(len);
     if (huff) {
-        return huffman_decode(raw, out);
+        return ::spaznet::codec::huffman_decode(raw, out);
     }
     out.assign(reinterpret_cast<const char*>(raw.data()), raw.size());
     return true;

@@ -14,8 +14,8 @@
 // truncation, on an EOS code embedded in the stream (which the RFC
 // forbids — §5.2), or on any pad longer than 7 bits.
 
-namespace spaznet {
-namespace http3 {
+namespace spaznet::codec {
+
 
 // Encode `input` into Huffman-compressed bytes; appends to `out`.
 auto huffman_encode(std::string_view input, std::vector<uint8_t>& out) -> void;
@@ -27,5 +27,5 @@ auto huffman_encoded_size(std::string_view input) -> std::size_t;
 // success.
 [[nodiscard]] auto huffman_decode(std::span<const uint8_t> input, std::string& out) -> bool;
 
-} // namespace http3
-} // namespace spaznet
+
+} // namespace spaznet::codec

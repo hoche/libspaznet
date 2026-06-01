@@ -2,7 +2,7 @@
 #include <cassert>
 #include <cstring>
 #include <libspaznet/http2/handler.hpp>
-#include <libspaznet/http3/huffman.hpp>
+#include <libspaznet/codec/huffman.hpp>
 #include <libspaznet/utils/binary_utils.hpp>
 #include <libspaznet/utils/number_utils.hpp>
 #include <sstream>
@@ -400,7 +400,7 @@ void encode_prefix_int(std::vector<uint8_t>& out, uint8_t high_bits, uint8_t pre
 }
 
 // Decode an HPACK string (RFC 7541 §5.2).  Sets `out` and advances
-// `offset`.  Handles Huffman strings via spaznet::http3::huffman_decode.
+// `offset`.  Handles Huffman strings via spaznet::codec::huffman_decode.
 bool decode_string(const std::vector<uint8_t>& data, size_t& offset, std::string& out) {
     if (offset >= data.size()) {
         return false;
@@ -415,7 +415,7 @@ bool decode_string(const std::vector<uint8_t>& data, size_t& offset, std::string
     }
     if (huffman) {
         std::string decoded;
-        if (!::spaznet::http3::huffman_decode(
+        if (!::spaznet::codec::huffman_decode(
                 std::span<const uint8_t>(data.data() + offset, length), decoded)) {
             return false;
         }

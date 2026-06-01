@@ -2,14 +2,14 @@
 
 #include <gtest/gtest.h>
 
-#include <libspaznet/http3/huffman.hpp>
+#include <libspaznet/codec/huffman.hpp>
 
 #include <algorithm>
 #include <cctype>
 #include <string>
 #include <vector>
 
-using namespace spaznet::http3;
+using namespace spaznet::codec;
 
 namespace {
 

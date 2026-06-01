@@ -40,19 +40,19 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
-# The QUIC v1 + HTTP/3 stack needs OpenSSL 3.5+ for the
-# SSL_set_quic_tls_cbs interface (RFC 9001). Linux distros / CI
-# runners commonly ship 3.0.x, which is too old; this option lets
-# those environments build the rest of the library (UDP / HTTP/1.1 /
-# HTTP/2 / WebSocket) without OpenSSL at all. Default ON because
-# the QUIC stack is the headline feature; turn OFF (or accept the
-# auto-disable below) when OpenSSL 3.5+ isn't available.
-option(SPAZNET_BUILD_QUIC "Build the QUIC v1 + HTTP/3 stack (requires OpenSSL 3.5+)" ON)
+# The QUIC v1 + HTTP/3 stack is now an example (example/quic-http3)
+# rather than part of the core library.  The option is preserved at
+# the top level because it controls whether that example is built;
+# the OpenSSL 3.5+ probe (required by RFC 9001's
+# SSL_set_quic_tls_cbs interface) auto-disables the example when
+# OpenSSL is missing or too old, so core builds with no OpenSSL
+# dependency.
+option(SPAZNET_BUILD_QUIC "Build example/quic-http3 (requires OpenSSL 3.5+)" ON)
 if(SPAZNET_BUILD_QUIC)
     find_package(OpenSSL 3.5 QUIET)
     if(NOT OpenSSL_FOUND)
         message(WARNING
-            "OpenSSL 3.5+ not found; disabling QUIC + HTTP/3 build. "
+            "OpenSSL 3.5+ not found; disabling example/quic-http3 build. "
             "Pass -DSPAZNET_BUILD_QUIC=OFF to silence this warning, "
             "or install OpenSSL 3.5+ and set OPENSSL_ROOT_DIR.")
         set(SPAZNET_BUILD_QUIC OFF CACHE BOOL "" FORCE)
@@ -83,6 +83,7 @@ endif()
 set(SOURCES
     src/platform/io_context.cpp
     src/platform/platform_io.cpp
+    src/codec/huffman.cpp
     src/utils/string_utils.cpp
     src/utils/number_utils.cpp
     src/utils/binary_utils.cpp
@@ -90,52 +91,13 @@ set(SOURCES
     src/server_impl.cpp
 )
 
-# QUIC v1 + HTTP/3 sources — conditionally built; require OpenSSL 3.5+.
-if(SPAZNET_BUILD_QUIC)
-    list(APPEND SOURCES
-        src/quic/varint.cpp
-        src/quic/crypto.cpp
-        src/quic/packet.cpp
-        src/quic/frame.cpp
-        src/quic/transport_params.cpp
-        src/quic/tls.cpp
-        src/quic/pn_space.cpp
-        src/quic/stream.cpp
-        src/quic/recovery.cpp
-        src/quic/congestion.cpp
-        src/quic/connection.cpp
-        src/quic/listener.cpp
-        src/http3/huffman.cpp
-        src/http3/qpack.cpp
-        src/http3/h3frame.cpp
-        src/http3/server.cpp
-        src/http3/service.cpp
-    )
-endif()
-
 set(HEADERS
     include/libspaznet/io_context.hpp
     include/libspaznet/platform_io.hpp
     include/libspaznet/platform/io_context.hpp
     include/libspaznet/platform/platform_io.hpp
     include/libspaznet/logger.hpp
-    include/libspaznet/quic/varint.hpp
-    include/libspaznet/quic/crypto.hpp
-    include/libspaznet/quic/packet.hpp
-    include/libspaznet/quic/frame.hpp
-    include/libspaznet/quic/transport_params.hpp
-    include/libspaznet/quic/tls.hpp
-    include/libspaznet/quic/pn_space.hpp
-    include/libspaznet/quic/stream.hpp
-    include/libspaznet/quic/recovery.hpp
-    include/libspaznet/quic/congestion.hpp
-    include/libspaznet/quic/connection.hpp
-    include/libspaznet/quic/listener.hpp
-    include/libspaznet/http3/huffman.hpp
-    include/libspaznet/http3/qpack.hpp
-    include/libspaznet/http3/h3frame.hpp
-    include/libspaznet/http3/server.hpp
-    include/libspaznet/http3/service.hpp
+    include/libspaznet/codec/huffman.hpp
     include/libspaznet/utils/string_utils.hpp
     include/libspaznet/utils/number_utils.hpp
     include/libspaznet/utils/binary_utils.hpp
@@ -313,20 +275,6 @@ set(SPAZNET_UNIT_TEST_SOURCES
     tests/unit/test_timer.cpp
     tests/unit/test_logger.cpp
 )
-if(SPAZNET_BUILD_QUIC)
-    list(APPEND SPAZNET_UNIT_TEST_SOURCES
-        tests/unit/test_quic_phase1.cpp
-        tests/unit/test_quic_frame.cpp
-        tests/unit/test_quic_tls.cpp
-        tests/unit/test_quic_phase4.cpp
-        tests/unit/test_quic_connection.cpp
-        tests/unit/test_quic_listener.cpp
-        tests/unit/test_http3_huffman.cpp
-        tests/unit/test_http3_qpack.cpp
-        tests/unit/test_http3_frame.cpp
-        tests/unit/test_http3_end_to_end.cpp
-    )
-endif()
 add_executable(test_unit ${SPAZNET_UNIT_TEST_SOURCES})
 target_link_libraries(test_unit PRIVATE spaznet GTest::gtest GTest::gmock)
 spaznet_apply_test_warnings(test_unit)
@@ -342,14 +290,6 @@ add_executable(test_performance
 target_link_libraries(test_performance PRIVATE spaznet GTest::gtest GTest::gmock)
 spaznet_apply_test_warnings(test_performance)
 
-if(SPAZNET_BUILD_QUIC)
-    add_executable(bench_quic_steady_state
-        tests/performance/bench_quic_steady_state.cpp
-    )
-    target_link_libraries(bench_quic_steady_state PRIVATE spaznet OpenSSL::SSL OpenSSL::Crypto)
-    spaznet_apply_test_warnings(bench_quic_steady_state)
-endif()
-
 add_test(NAME UnitTests COMMAND test_unit)
 add_test(NAME PerformanceTests COMMAND test_performance)
 
@@ -360,4 +300,7 @@ if(SPAZNET_BUILD_EXAMPLES)
     add_subdirectory(example/http-websocket)
     add_subdirectory(example/http2)
     add_subdirectory(example/udp)
+    if(SPAZNET_BUILD_QUIC)
+        add_subdirectory(example/quic-http3)
+    endif()
 endif()

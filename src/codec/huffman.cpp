@@ -1,10 +1,10 @@
-#include <libspaznet/http3/huffman.hpp>
+#include <libspaznet/codec/huffman.hpp>
 
 #include <array>
 #include <cstring>
 
-namespace spaznet {
-namespace http3 {
+namespace spaznet::codec {
+
 
 namespace {
 
@@ -228,5 +228,5 @@ auto huffman_decode(std::span<const uint8_t> input, std::string& out) -> bool {
     return true;
 }
 
-} // namespace http3
-} // namespace spaznet
+
+} // namespace spaznet::codec

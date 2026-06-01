@@ -21,12 +21,6 @@
 
 namespace spaznet {
 
-// Forward declarations
-#ifdef SPAZNET_HAS_QUIC
-namespace http3 {
-class QuicHttp3Service;
-}
-#endif
 
 // Socket wrapper
 class Socket {
@@ -121,10 +115,6 @@ class Server {
     std::unique_ptr<IOContext> io_context_;
     ConnectionHandler connection_handler_;
     DatagramHandler datagram_handler_;
-#ifdef SPAZNET_HAS_QUIC
-    std::unique_ptr<http3::QuicHttp3Service> quic_http3_service_;
-#endif
-
     std::unordered_map<int, std::coroutine_handle<>> socket_handles_;
     // Track active listening sockets so stop()/destructor can close them even if coroutines are
     // currently suspended on accept.
@@ -169,14 +159,6 @@ class Server {
     // protocol-specific handlers are moved out of the core library.
     // New code should depend on the example/<protocol> libraries
     // and use the low-level setters above instead.
-#ifdef SPAZNET_HAS_QUIC
-    // QUIC v1 + HTTP/3 entry point. The service object owns the
-    // Listener + per-connection Http3Server instances; the Server just
-    // routes UDP datagrams to it and drives its timer.  Only available
-    // when libspaznet was built with -DSPAZNET_BUILD_QUIC=ON (default;
-    // requires OpenSSL 3.5+).
-    void set_quic_http3_service(std::unique_ptr<http3::QuicHttp3Service> service);
-#endif
 
     // Run the server
     void run();
