@@ -645,3 +645,127 @@ TEST(QuicConnection, PtoRetransmitsDroppedStream) {
     EXPECT_GE(server_outbox.front().size(), payload.size())
         << "retransmit datagram is shorter than the original payload";
 }
+
+// RFC 9000 §10.2 — initiate_close emits a CONNECTION_CLOSE frame on
+// the next build_and_send pass and flips state_ to Closing.
+TEST(QuicConnection, InitiateCloseEmitsConnectionCloseFrame) {
+    auto [cert, key] = make_self_signed_p256();
+    TlsServerConfig cfg{cert, key, {"h3"}};
+    auto ctx = TlsContext::make_server(cfg);
+    ASSERT_NE(ctx, nullptr);
+
+    std::vector<uint8_t> client_dcid = {0xAB, 0xCD, 0xEF, 0x01};
+    std::vector<uint8_t> client_scid = {0x33, 0x44};
+    std::vector<uint8_t> server_scid = {0xE1, 0xE2, 0xE3, 0xE4};
+
+    std::deque<std::vector<uint8_t>> server_outbox;
+    TransportParameters server_tp;
+    server_tp.initial_max_data = 1 << 20;
+    server_tp.initial_max_stream_data_bidi_remote = 1 << 16;
+    server_tp.initial_max_stream_data_bidi_local = 1 << 16;
+    server_tp.initial_max_streams_bidi = 16;
+    server_tp.initial_max_streams_uni = 3;
+
+    auto clock_now = std::chrono::steady_clock::now();
+    Connection::ClockFn clock_fn = [&]() { return clock_now; };
+
+    Connection server(ctx, {client_dcid.data(), client_dcid.size()},
+                      {client_scid.data(), client_scid.size()},
+                      {server_scid.data(), server_scid.size()}, server_tp,
+                      [&](std::span<const uint8_t> dg) {
+                          server_outbox.emplace_back(dg.begin(), dg.end());
+                      },
+                      clock_fn);
+
+    // Drive the handshake to Established so Application keys are
+    // ready (CONNECTION_CLOSE wants to emit at the best level).
+    auto client = make_client(client_dcid, client_scid);
+    for (int round = 0; round < 30; ++round) {
+        int rc = SSL_do_handshake(client->ssl);
+        if (rc != 1) {
+            int err = SSL_get_error(client->ssl, rc);
+            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                FAIL() << "client SSL_do_handshake err=" << err;
+            }
+        }
+        client_emit(*client);
+        while (!client->outbox.empty()) {
+            auto dg = std::move(client->outbox.front());
+            client->outbox.pop_front();
+            server.on_datagram({dg.data(), dg.size()});
+        }
+        clock_now += std::chrono::milliseconds(1);
+        server.on_timer();
+        while (!server_outbox.empty()) {
+            auto dg = std::move(server_outbox.front());
+            server_outbox.pop_front();
+            client_receive(*client, std::move(dg));
+        }
+        if (!client->pending_dgs.empty()) {
+            auto pending = std::move(client->pending_dgs);
+            client->pending_dgs.clear();
+            for (auto& dg : pending) {
+                client_receive(*client, std::move(dg));
+            }
+        }
+        if (server.state() == Connection::State::Established) break;
+    }
+    ASSERT_EQ(server.state(), Connection::State::Established);
+    server_outbox.clear();
+
+    // Application calls close_with_error.  Next build pass (via
+    // on_timer) emits CONNECTION_CLOSE and the state flips to Closing.
+    constexpr uint64_t kAppError = 0x42;
+    server.close_with_error(kAppError, /*application=*/true, "shutting down");
+    EXPECT_EQ(server.state(), Connection::State::Closing);
+    server.on_timer();
+    ASSERT_FALSE(server_outbox.empty())
+        << "close_with_error did not put a datagram on the wire";
+    // Once drained, subsequent on_timer ticks emit nothing more.
+    auto first_size = server_outbox.size();
+    server.on_timer();
+    EXPECT_EQ(server_outbox.size(), first_size)
+        << "Closing-state Connection should be quiet after the close datagram";
+}
+
+// RFC 9000 §10.1 — idle timeout flips the connection to Draining
+// without sending CONNECTION_CLOSE.
+TEST(QuicConnection, IdleTimeoutFlipsToDraining) {
+    auto [cert, key] = make_self_signed_p256();
+    TlsServerConfig cfg{cert, key, {"h3"}};
+    auto ctx = TlsContext::make_server(cfg);
+    ASSERT_NE(ctx, nullptr);
+
+    std::vector<uint8_t> client_dcid = {0x11, 0x22, 0x33, 0x44};
+    std::vector<uint8_t> client_scid = {0x99, 0xAA};
+    std::vector<uint8_t> server_scid = {0xBB, 0xCC, 0xDD, 0xEE};
+
+    std::deque<std::vector<uint8_t>> server_outbox;
+    TransportParameters server_tp;
+    server_tp.initial_max_data = 1 << 20;
+    server_tp.initial_max_stream_data_bidi_remote = 1 << 16;
+    server_tp.initial_max_stream_data_bidi_local = 1 << 16;
+    server_tp.initial_max_streams_bidi = 16;
+    server_tp.initial_max_streams_uni = 3;
+    server_tp.max_idle_timeout_ms = 1000; // 1 s
+
+    auto clock_now = std::chrono::steady_clock::now();
+    Connection::ClockFn clock_fn = [&]() { return clock_now; };
+
+    Connection server(ctx, {client_dcid.data(), client_dcid.size()},
+                      {client_scid.data(), client_scid.size()},
+                      {server_scid.data(), server_scid.size()}, server_tp,
+                      [&](std::span<const uint8_t> dg) {
+                          server_outbox.emplace_back(dg.begin(), dg.end());
+                      },
+                      clock_fn);
+
+    // Just-after-construction the state is Handshaking and last_activity_
+    // is roughly clock_now.  Fast-forward past 1 s without delivering
+    // any datagrams.  on_timer should flip the state to Draining.
+    clock_now += std::chrono::milliseconds(1500);
+    server.on_timer();
+    EXPECT_EQ(server.state(), Connection::State::Draining);
+    // RFC 9000 §10.1: silent close — no CONNECTION_CLOSE on the wire.
+    EXPECT_TRUE(server_outbox.empty());
+}

@@ -103,6 +103,19 @@ class Connection {
     auto mark_peer_address_validated() -> void {
         peer_address_validated_ = true;
     }
+
+    // RFC 9000 §10.2 — proactively close the connection with a
+    // CONNECTION_CLOSE frame.  `application=true` selects the 0x1d
+    // (application-error) variant, otherwise 0x1c (transport).
+    // `frame_type` is the offending frame type for transport closes
+    // and ignored for application closes.  Subsequent send attempts
+    // become no-ops; the next on_timer (or on_datagram) will emit
+    // the close to the peer.  Safe to call from anywhere on the
+    // owning thread; first close wins, subsequent calls are no-ops.
+    auto close_with_error(uint64_t error_code, bool application,
+                          std::string reason = "", uint64_t frame_type = 0) -> void {
+        initiate_close(error_code, application, std::move(reason), frame_type);
+    }
     [[nodiscard]] auto peer_address_validated() const -> bool {
         return peer_address_validated_;
     }
@@ -224,6 +237,23 @@ class Connection {
     // build_and_send re-emits them as a probe.
     auto check_pto() -> void;
 
+    // RFC 9000 §10.2: queue a CONNECTION_CLOSE frame for emission
+    // and flip state_ to Closing.  The next build_and_send pass
+    // packs the frame into a single packet at the highest available
+    // encryption level and sends it.  `application` selects between
+    // 0x1c (transport error) and 0x1d (application error);
+    // `frame_type` is the offending wire-frame type for transport
+    // closes, ignored for application closes.  Subsequent attempts
+    // to send are silently dropped.
+    auto initiate_close(uint64_t error_code, bool application,
+                        std::string reason, uint64_t frame_type = 0) -> void;
+
+    // RFC 9000 §10.1: tear the connection down on inactivity.
+    // Called from on_timer; flips state_ to Draining when
+    // now - last_activity_ exceeds the negotiated idle timeout
+    // (the lesser of our and the peer's max_idle_timeout_ms).
+    auto check_idle_timeout() -> void;
+
     // ---- Members --------------------------------------------------------
     Role role_{Role::Server};
     State state_{State::Handshaking};
@@ -262,6 +292,11 @@ class Connection {
 
     // Have we sent HANDSHAKE_DONE yet?
     bool sent_handshake_done_{false};
+
+    // RFC 9000 §10.2 — pending CONNECTION_CLOSE.  Set by
+    // initiate_close, drained by build_and_send (emits in a single
+    // packet, then leaves state_ in Closing with no more sends).
+    std::optional<ConnectionCloseFrame> pending_close_{};
 
     // RFC 9000 §8.1.2 anti-amplification bookkeeping.  Until the peer's
     // address is validated (either by a Retry token round-trip handled

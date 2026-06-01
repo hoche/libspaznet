@@ -309,7 +309,10 @@ auto Connection::process_short_packet(std::vector<uint8_t>& dg) -> bool {
 auto Connection::deliver_frames(EncryptionLevel level, std::span<const uint8_t> payload) -> void {
     std::vector<Frame> frames;
     if (!parse_frames(payload, frames)) {
-        state_ = State::Closing;
+        // RFC 9000 §11.1: frame-encoding error.  Send a transport
+        // CONNECTION_CLOSE with FRAME_ENCODING_ERROR (0x07).
+        initiate_close(/*error_code=*/0x07, /*application=*/false,
+                       "frame parse failed");
         return;
     }
     for (auto& f : frames) {
@@ -549,6 +552,50 @@ auto Connection::check_pto() -> void {
     }
 }
 
+auto Connection::initiate_close(uint64_t error_code, bool application,
+                                std::string reason, uint64_t frame_type) -> void {
+    if (state_ == State::Closing || state_ == State::Draining ||
+        state_ == State::Closed) {
+        return; // first close wins
+    }
+    ConnectionCloseFrame f;
+    f.application = application;
+    f.error_code = error_code;
+    f.frame_type = frame_type;
+    f.reason.assign(reason.begin(), reason.end());
+    pending_close_ = std::move(f);
+    state_ = State::Closing;
+}
+
+auto Connection::check_idle_timeout() -> void {
+    if (state_ != State::Handshaking && state_ != State::Established) {
+        return;
+    }
+    // Negotiated timeout: the lesser of our and the peer's
+    // max_idle_timeout_ms (RFC 9000 §10.1.2).  Zero on either side
+    // means "no advisory" — only enforce if at least one side asked
+    // for a real value.
+    const uint64_t local_ms = local_tp_.max_idle_timeout_ms;
+    const uint64_t peer_ms = tls_.peer_transport_params().max_idle_timeout_ms;
+    uint64_t effective_ms = 0;
+    if (local_ms > 0 && peer_ms > 0) {
+        effective_ms = std::min(local_ms, peer_ms);
+    } else if (local_ms > 0) {
+        effective_ms = local_ms;
+    } else if (peer_ms > 0) {
+        effective_ms = peer_ms;
+    } else {
+        return; // neither side advertises one
+    }
+    const auto now = clock_fn_();
+    if (now - last_activity_ >= std::chrono::milliseconds(effective_ms)) {
+        // Per RFC 9000 §10.1: when the idle timeout expires, the
+        // connection is silently closed (no CONNECTION_CLOSE).
+        // Flip straight to Draining and stop sending.
+        state_ = State::Draining;
+    }
+}
+
 auto Connection::ensure_stream(uint64_t stream_id) -> Stream* {
     auto it = streams_.find(stream_id);
     if (it != streams_.end()) return it->second.get();
@@ -627,6 +674,121 @@ auto build_payload(std::span<const CryptoFrame> crypto_frames,
 auto Connection::build_and_send(EncryptionLevel level) -> bool {
     auto& sp = space(level);
     if (!sp.send_keys_ready) return false;
+    // Draining and Closed are quiet — don't emit anything more.  In
+    // the Closing state we still want to drain one CONNECTION_CLOSE
+    // (handled by the pending_close_ branch below), so we don't bail
+    // here on Closing.
+    if (state_ == State::Draining || state_ == State::Closed) {
+        return false;
+    }
+
+    // RFC 9000 §10.2 fast path: if there's a pending CONNECTION_CLOSE,
+    // emit it on the application level (or whichever level we have
+    // send keys for that's furthest along).  We restrict to one
+    // level to avoid emitting the close N times across spaces; the
+    // peer needs only one.  Only the level that holds the current
+    // application keys is interesting once we're past the handshake;
+    // earlier in the handshake, level == EncryptionLevel::Initial or
+    // Handshake is what's available.
+    if (pending_close_.has_value()) {
+        // Only emit at the "best" level we have — pick the highest
+        // level whose send keys are ready.  build_and_send is called
+        // per-level by callers; let only the topmost ready level
+        // emit, and let the lower-level calls skip.
+        auto& app = space(EncryptionLevel::Application);
+        auto& hs = space(EncryptionLevel::Handshake);
+        const auto best_level = app.send_keys_ready ? EncryptionLevel::Application
+                              : hs.send_keys_ready  ? EncryptionLevel::Handshake
+                                                    : EncryptionLevel::Initial;
+        if (level != best_level) return false;
+
+        std::vector<uint8_t> payload;
+        encode_frame(payload, Frame{*pending_close_});
+
+        // Build the packet just like a normal ack-only send (see
+        // §6.2/§6.3 helpers below); we just route through the same
+        // header-build + AEAD + HP code path.  The simplest reuse:
+        // synthesize a Frame variant list with only the close frame
+        // and let the existing "header + payload + AEAD" code run.
+        const uint64_t pn = sp.next_send_pn++;
+        if (level == EncryptionLevel::Initial) {
+            std::vector<uint8_t> datagram = build_initial_packet(
+                sp.aead, sp.send_keys, {dcid_.data(), dcid_.size()},
+                {scid_.data(), scid_.size()}, {}, {payload.data(), payload.size()}, pn);
+            if (!peer_address_validated_) {
+                sent_bytes_unvalidated_ += datagram.size();
+            }
+            send_fn_({datagram.data(), datagram.size()});
+        } else {
+            // Use the same in-place builder pattern that the
+            // Handshake/Application branch below uses for normal
+            // sends.  Rather than duplicating it here, fall through
+            // to the normal builder with a single
+            // ConnectionCloseFrame masquerading as a crypto-pending
+            // entry — but CryptoFrame and ConnectionCloseFrame are
+            // different types.  Inline the in-place builder
+            // explicitly: header → payload (already built) → tag
+            // space → AEAD seal → HP.
+            auto& buf = scratch_packet_;
+            buf.clear();
+            const std::size_t pn_len = 4;
+            const std::size_t tag_len = aead_tag_length(sp.aead);
+            std::size_t pn_offset = 0;
+            uint8_t hp_first_mask = 0;
+            if (level == EncryptionLevel::Handshake) {
+                const uint8_t first =
+                    static_cast<uint8_t>(0x80 | 0x40 |
+                                         (static_cast<uint8_t>(LongType::Handshake) << 4) |
+                                         static_cast<uint8_t>(pn_len - 1));
+                buf.push_back(first);
+                buf.push_back(static_cast<uint8_t>(kQuicV1 >> 24));
+                buf.push_back(static_cast<uint8_t>(kQuicV1 >> 16));
+                buf.push_back(static_cast<uint8_t>(kQuicV1 >> 8));
+                buf.push_back(static_cast<uint8_t>(kQuicV1));
+                buf.push_back(static_cast<uint8_t>(dcid_.size()));
+                buf.insert(buf.end(), dcid_.begin(), dcid_.end());
+                buf.push_back(static_cast<uint8_t>(scid_.size()));
+                buf.insert(buf.end(), scid_.begin(), scid_.end());
+                const uint64_t length = pn_len + payload.size() + tag_len;
+                VarInt::append(buf, length);
+                hp_first_mask = 0x0F;
+            } else {
+                const uint8_t first = static_cast<uint8_t>(0x40 | static_cast<uint8_t>(pn_len - 1));
+                buf.push_back(first);
+                buf.insert(buf.end(), dcid_.begin(), dcid_.end());
+                hp_first_mask = 0x1F;
+            }
+            pn_offset = buf.size();
+            for (std::size_t i = 0; i < pn_len; ++i) {
+                buf.push_back(static_cast<uint8_t>((pn >> (8 * (pn_len - 1 - i))) & 0xFF));
+            }
+            const std::size_t header_end = buf.size();
+            buf.insert(buf.end(), payload.begin(), payload.end());
+            const std::size_t body_end = buf.size();
+            buf.resize(body_end + tag_len);
+            auto nonce = make_aead_nonce({sp.send_keys.iv.data(), sp.send_keys.iv.size()}, pn);
+            if (!sp.send_ctx.seal_inplace({nonce.data(), nonce.size()},
+                                          {buf.data(), header_end},
+                                          {buf.data() + header_end, body_end - header_end},
+                                          {buf.data() + body_end, tag_len})) {
+                pending_close_.reset();
+                return false;
+            }
+            auto mask = header_protection_mask(
+                sp.aead, {sp.send_keys.hp.data(), sp.send_keys.hp.size()},
+                {buf.data() + pn_offset + 4, kSampleLen});
+            buf[0] ^= mask[0] & hp_first_mask;
+            for (std::size_t i = 0; i < pn_len; ++i) {
+                buf[pn_offset + i] ^= mask[1 + i];
+            }
+            if (!peer_address_validated_) {
+                sent_bytes_unvalidated_ += buf.size();
+            }
+            send_fn_({buf.data(), buf.size()});
+        }
+        pending_close_.reset();
+        return false; // one and done
+    }
 
     // RFC 9000 §8.1.2 anti-amplification: until the peer's address is
     // validated, total sent bytes MUST NOT exceed 3× total received
@@ -815,6 +977,13 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
 }
 
 auto Connection::on_timer() -> void {
+    // RFC 9000 §10.1: tear down on inactivity before doing any other
+    // work.  If we've idled past max_idle_timeout, flip to Draining
+    // and the rest of this tick becomes a no-op.
+    check_idle_timeout();
+    if (state_ == State::Draining || state_ == State::Closed) {
+        return;
+    }
     install_new_keys();
     tls_.advance();
     install_new_keys();

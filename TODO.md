@@ -259,17 +259,18 @@ Ordered by priority.
   losses re-queue via `Stream::on_lost` / `crypto_pending_`.
   Test: `QuicConnection.PtoRetransmitsDroppedStream`.
 
-- [ ] Idle timeout enforcement
-  - Connections honor the peer's `max_idle_timeout` transport
-    parameter at handshake but don't actually tear down stale
-    connections.  `Connection::on_timer` needs to check
-    `now - last_activity_` against the negotiated minimum.
+- [x] Idle timeout enforcement — landed 2026-05-31.
+  `Connection::on_timer` calls `check_idle_timeout()` which flips
+  state to Draining when `now - last_activity_` exceeds the lesser
+  of our and the peer's `max_idle_timeout_ms`.  Test:
+  `QuicConnection.IdleTimeoutFlipsToDraining`.
 
-- [ ] CONNECTION_CLOSE emission on protocol errors
-  - We parse incoming CONNECTION_CLOSE and flip to `Draining`, but on
-    our side we never emit one — on a parse error we just transition
-    to `Closing` silently. Build and ship a CONNECTION_CLOSE frame
-    with the appropriate transport / application error code.
+- [x] CONNECTION_CLOSE emission on protocol errors — landed
+  2026-05-31.  Frame-parse failure now triggers a transport
+  CONNECTION_CLOSE with FRAME_ENCODING_ERROR (0x07).  Application
+  code can drive a graceful close via
+  `Connection::close_with_error(code, application, reason)`.
+  Test: `QuicConnection.InitiateCloseEmitsConnectionCloseFrame`.
 
 ### Hardening
 
