@@ -149,20 +149,43 @@ zero crashers across all of `parse_frame`, `parse_long_header`,
 `decode_transport_params`, `VarInt::decode`, `qpack_decode`,
 `parse_h3_frame`, and `huffman_decode`.
 
-## Not in scope today
-
 ### Key update (RFC 9001 §6)
 
-Long-lived 1-RTT connections have AEAD usage limits — 2²³ packets
-at AES-128-GCM. Without key update, a chatty connection that runs
-for hours violates RFC 9001 §6.6 (`AEAD_LIMIT_REACHED`). We don't
-emit a `KEY_PHASE` bit toggle; if the peer toggles theirs, we drop
-their packet.
+1-RTT key updates work in both directions:
 
-**Mitigation today**: limit connection lifetime to <8M packets at
-peer's send rate. For typical request/response workloads this is
-not a near-term issue, but a sustained 1-Gbps connection at 1200-byte
-datagrams hits the limit in ~80 seconds.
+- **Peer-initiated**: the server detects a short-header packet
+  carrying the toggled `KEY_PHASE` bit, decrypts it with the
+  pre-derived next-phase keys, then ratchets both directions
+  forward and re-derives a fresh "phase + 1" set.
+- **Server-initiated**: `Connection::initiate_key_update()` rotates
+  the send-side packet keys to the next phase and toggles the bit
+  on subsequent outbound packets. The recv side waits for the
+  peer to echo the new phase before rotating in turn.
+
+The implementation precomputes "phase + 1" keys at handshake
+completion (`Connection::install_new_keys`) so the first update on
+each transition pays no derivation cost on the hot path. Per RFC
+9001 §6.1 the header-protection keys are not rotated — only the
+AEAD keys and IV are derived from the next traffic secret via the
+`quic ku` / `quic key` / `quic iv` labels.
+
+A second update cannot start until the prior one is confirmed
+(`send_key_phase == recv_key_phase` again), matching RFC 9001 §6.1's
+"don't pile updates on" guidance.
+
+**Operational note**: the library does not yet automate key updates
+on packet-count thresholds. Applications that hold long-lived
+connections approaching the AEAD usage limit (RFC 9001 §6.6 — 2²³
+packets at AES-128-GCM, much larger for AES-256-GCM and
+ChaCha20-Poly1305) should call `initiate_key_update()` themselves
+periodically. A 1-Gbps connection at 1200-byte datagrams reaches
+the AES-128-GCM ceiling in ~80 seconds; one update per minute is
+ample headroom.
+
+**Tests**: `QuicConnection.AcceptsPeerInitiatedKeyUpdate`,
+`QuicConnection.ServerInitiatedKeyUpdate`.
+
+## Partial / Not in scope today
 
 ### Connection migration (RFC 9000 §9) — limited
 

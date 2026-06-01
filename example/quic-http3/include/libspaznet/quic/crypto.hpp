@@ -70,6 +70,19 @@ struct PacketKeys {
 };
 auto derive_packet_keys(Aead aead, std::span<const uint8_t> secret) -> PacketKeys;
 
+// RFC 9001 §6.1 — derive the next-generation 1-RTT traffic secret
+// from the current one.  Used for QUIC key update:
+//   next_secret = HKDF-Expand-Label(current_secret, "quic ku", "",
+//                                   hash_length(hash))
+// The corresponding packet keys are derived from `next_secret` via
+// the usual `derive_packet_keys` (which uses the "quic key" / "quic
+// iv" / "quic hp" labels) — note however that RFC 9001 §6 leaves
+// the header-protection key unchanged across updates, so callers
+// should reuse the old `PacketKeys::hp` rather than the value
+// computed from the next secret.
+auto derive_next_application_secret(Hash hash, std::span<const uint8_t> current_secret)
+    -> std::vector<uint8_t>;
+
 // AEAD encrypt/decrypt. `nonce` must be aead_iv_length(aead) bytes long; in
 // QUIC this is the iv XOR packet-number, computed by the caller.
 //

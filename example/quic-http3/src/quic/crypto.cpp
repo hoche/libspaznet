@@ -210,6 +210,11 @@ auto derive_packet_keys(Aead aead, std::span<const uint8_t> secret) -> PacketKey
     return out;
 }
 
+auto derive_next_application_secret(Hash hash, std::span<const uint8_t> current_secret)
+    -> std::vector<uint8_t> {
+    return hkdf_expand_label(hash, current_secret, "quic ku", {}, hash_length(hash));
+}
+
 auto aead_seal(Aead aead, std::span<const uint8_t> key, std::span<const uint8_t> nonce,
                std::span<const uint8_t> aad, std::span<const uint8_t> plaintext,
                std::vector<uint8_t>& out) -> bool {

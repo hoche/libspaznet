@@ -120,6 +120,29 @@ class Connection {
         return peer_address_validated_;
     }
 
+    // RFC 9001 §6 — locally initiate a 1-RTT key update.  Rotates
+    // our send-side application keys to the next phase: subsequent
+    // outbound packets are encrypted with the newly-derived keys
+    // and carry KEY_PHASE = !current.  The receive side stays on
+    // the current phase until a packet from the peer arrives at
+    // the toggled KEY_PHASE — at which point we commit the recv-
+    // side update too.  No-op if Application keys aren't installed
+    // yet or if `next_keys_ready` is false (a previous update is
+    // still in flight).  Returns true if the update was started.
+    auto initiate_key_update() -> bool;
+
+    // Test / observability hook: which 1-RTT key phase is our
+    // current send direction on?  0 immediately after handshake;
+    // toggles to 1 after the first key update completes.
+    [[nodiscard]] auto send_key_phase() const -> uint8_t {
+        return spaces_[static_cast<std::size_t>(EncryptionLevel::Application)]
+            .send_key_phase;
+    }
+    [[nodiscard]] auto recv_key_phase() const -> uint8_t {
+        return spaces_[static_cast<std::size_t>(EncryptionLevel::Application)]
+            .recv_key_phase;
+    }
+
     // ---- Accessors -----------------------------------------------------
     [[nodiscard]] auto state() const -> State {
         return state_;
@@ -185,6 +208,24 @@ class Connection {
         bool any_ack_eliciting_sent_{false};
         uint64_t largest_acked_pn_{0};
         bool any_acked_{false};
+
+        // RFC 9001 §6 — 1-RTT key update.  Used at
+        // EncryptionLevel::Application only.  When `next_keys_ready`
+        // is true we hold the "phase + 1" keys precomputed so an
+        // inbound packet with the toggled KEY_PHASE bit can be
+        // decrypted in one pass; on success we install the new
+        // packet keys + secrets into the `send_*` / `recv_*` slots,
+        // ratchet the local phase, and derive a fresh `next_*` set
+        // for the cycle after that.
+        std::vector<uint8_t> send_secret{};
+        std::vector<uint8_t> recv_secret{};
+        PacketKeys next_send_keys{};
+        PacketKeys next_recv_keys{};
+        CipherCtx next_send_ctx{};
+        CipherCtx next_recv_ctx{};
+        uint8_t send_key_phase{0};
+        uint8_t recv_key_phase{0};
+        bool next_keys_ready{false};
     };
 
     auto space(EncryptionLevel l) -> Space& {

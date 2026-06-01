@@ -80,6 +80,12 @@ struct QuicTestClient {
     // Per-encryption-level QUIC packet-protection keys.
     std::array<PacketKeys, 4> send_keys{};
     std::array<PacketKeys, 4> recv_keys{};
+    // RFC 9001 §6 key-update bookkeeping for the 1-RTT space — we
+    // stash the raw traffic secret so the test can drive the "quic
+    // ku" derivation itself.  Mirrors what the production
+    // Connection does.
+    std::array<std::vector<uint8_t>, 4> send_secret{};
+    std::array<std::vector<uint8_t>, 4> recv_secret{};
     std::array<bool, 4> send_ready{false, false, false, false};
     std::array<bool, 4> recv_ready{false, false, false, false};
     std::array<Aead, 4> aead{Aead::Aes128Gcm, Aead::Aes128Gcm, Aead::Aes128Gcm,
@@ -152,10 +158,12 @@ static int qtc_yield(SSL*, uint32_t prot_level, int direction, const unsigned ch
         c->recv_keys[static_cast<std::size_t>(level)] = derive_packet_keys(
             c->aead[static_cast<std::size_t>(level)], {secret, secret_len});
         c->recv_ready[static_cast<std::size_t>(level)] = true;
+        c->recv_secret[static_cast<std::size_t>(level)].assign(secret, secret + secret_len);
     } else {
         c->send_keys[static_cast<std::size_t>(level)] = derive_packet_keys(
             c->aead[static_cast<std::size_t>(level)], {secret, secret_len});
         c->send_ready[static_cast<std::size_t>(level)] = true;
+        c->send_secret[static_cast<std::size_t>(level)].assign(secret, secret + secret_len);
     }
     return 1;
 }
@@ -940,6 +948,289 @@ TEST(QuicConnection, IdleTimeoutFlipsToDraining) {
     EXPECT_EQ(server.state(), Connection::State::Draining);
     // RFC 9000 §10.1: silent close — no CONNECTION_CLOSE on the wire.
     EXPECT_TRUE(server_outbox.empty());
+}
+
+// Helpers shared by the key-update tests below.  Drive the handshake
+// to Established and return the resulting `(server, client)` pair.
+struct HandshookPair {
+    std::unique_ptr<Connection> server;
+    std::unique_ptr<QuicTestClient> client;
+    std::vector<uint8_t> client_dcid;
+    std::vector<uint8_t> client_scid;
+    std::vector<uint8_t> server_scid;
+    std::deque<std::vector<uint8_t>> server_outbox;
+    std::chrono::steady_clock::time_point clock_now;
+};
+
+namespace {
+
+auto handshake_pair(std::vector<uint8_t> cdcid, std::vector<uint8_t> cscid,
+                    std::vector<uint8_t> sscid) -> std::unique_ptr<HandshookPair> {
+    auto hp = std::make_unique<HandshookPair>();
+    hp->client_dcid = std::move(cdcid);
+    hp->client_scid = std::move(cscid);
+    hp->server_scid = std::move(sscid);
+    hp->clock_now = std::chrono::steady_clock::now();
+
+    auto [cert, key] = make_self_signed_p256();
+    TlsServerConfig cfg{cert, key, {"h3"}};
+    auto ctx = TlsContext::make_server(cfg);
+    if (!ctx) return nullptr;
+
+    TransportParameters server_tp;
+    server_tp.initial_max_data = 1 << 20;
+    server_tp.initial_max_stream_data_bidi_remote = 1 << 16;
+    server_tp.initial_max_stream_data_bidi_local = 1 << 16;
+    server_tp.initial_max_streams_bidi = 16;
+    server_tp.initial_max_streams_uni = 3;
+
+    auto* hpp = hp.get();
+    Connection::ClockFn clock_fn = [hpp]() { return hpp->clock_now; };
+    hp->server = std::make_unique<Connection>(
+        ctx, std::span<const uint8_t>{hp->client_dcid.data(), hp->client_dcid.size()},
+        std::span<const uint8_t>{hp->client_scid.data(), hp->client_scid.size()},
+        std::span<const uint8_t>{hp->server_scid.data(), hp->server_scid.size()}, server_tp,
+        [hpp](std::span<const uint8_t> dg) {
+            hpp->server_outbox.emplace_back(dg.begin(), dg.end());
+        },
+        clock_fn);
+
+    hp->client = make_client(hp->client_dcid, hp->client_scid);
+    for (int round = 0; round < 30; ++round) {
+        int rc = SSL_do_handshake(hp->client->ssl);
+        if (rc != 1) {
+            int err = SSL_get_error(hp->client->ssl, rc);
+            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) return nullptr;
+        }
+        client_emit(*hp->client);
+        while (!hp->client->outbox.empty()) {
+            auto dg = std::move(hp->client->outbox.front());
+            hp->client->outbox.pop_front();
+            hp->server->on_datagram({dg.data(), dg.size()});
+        }
+        hp->clock_now += std::chrono::milliseconds(1);
+        hp->server->on_timer();
+        while (!hp->server_outbox.empty()) {
+            auto dg = std::move(hp->server_outbox.front());
+            hp->server_outbox.pop_front();
+            client_receive(*hp->client, std::move(dg));
+        }
+        if (!hp->client->pending_dgs.empty()) {
+            auto pending = std::move(hp->client->pending_dgs);
+            hp->client->pending_dgs.clear();
+            for (auto& dg : pending) {
+                client_receive(*hp->client, std::move(dg));
+            }
+        }
+        if (hp->server->state() == Connection::State::Established &&
+            SSL_is_init_finished(hp->client->ssl)) {
+            hp->server->on_timer();
+            while (!hp->server_outbox.empty()) {
+                auto dg = std::move(hp->server_outbox.front());
+                hp->server_outbox.pop_front();
+                client_receive(*hp->client, std::move(dg));
+            }
+            // After Established, all subsequent 1-RTT packets the
+            // client builds must put the server's chosen SCID as DCID.
+            hp->client->dcid = hp->server_scid;
+            return hp;
+        }
+    }
+    return nullptr;
+}
+
+// Build a 1-RTT short-header packet from the client side with a given
+// payload, KEY_PHASE bit, and packet-protection keys.  Mirrors the
+// internals of `client_emit`'s 1-RTT branch.
+auto client_build_short_with_keys(QuicTestClient& c, const PacketKeys& keys,
+                                  const PacketKeys& hp_keys, Aead a, uint8_t key_phase,
+                                  std::span<const uint8_t> payload) -> std::vector<uint8_t> {
+    const auto i = static_cast<std::size_t>(EncryptionLevel::Application);
+    const std::size_t pn_len = 4;
+    std::vector<uint8_t> pkt;
+    pkt.push_back(
+        static_cast<uint8_t>(0x40 | (static_cast<uint8_t>(key_phase) << 2) | (pn_len - 1)));
+    pkt.insert(pkt.end(), c.dcid.begin(), c.dcid.end());
+    const std::size_t pn_offset = pkt.size();
+    const uint64_t pn = c.next_pn[i]++;
+    for (std::size_t k = 0; k < pn_len; ++k) {
+        pkt.push_back(static_cast<uint8_t>((pn >> (8 * (pn_len - 1 - k))) & 0xFF));
+    }
+    const std::size_t payload_off = pkt.size();
+    pkt.insert(pkt.end(), payload.begin(), payload.end());
+    std::vector<uint8_t> aad(pkt.begin(), pkt.begin() + payload_off);
+    std::vector<uint8_t> plain(pkt.begin() + payload_off, pkt.end());
+    auto nonce = make_aead_nonce({keys.iv.data(), keys.iv.size()}, pn);
+    std::vector<uint8_t> sealed;
+    aead_seal(a, {keys.key.data(), keys.key.size()}, {nonce.data(), nonce.size()},
+              {aad.data(), aad.size()}, {plain.data(), plain.size()}, sealed);
+    pkt.resize(payload_off);
+    pkt.insert(pkt.end(), sealed.begin(), sealed.end());
+    auto mask = header_protection_mask(a, {hp_keys.hp.data(), hp_keys.hp.size()},
+                                       {pkt.data() + pn_offset + 4, kSampleLen});
+    pkt[0] ^= mask[0] & 0x1F;
+    for (std::size_t k = 0; k < pn_len; ++k) {
+        pkt[pn_offset + k] ^= mask[1 + k];
+    }
+    return pkt;
+}
+
+// Decrypt a server-emitted 1-RTT short-header datagram using the
+// supplied keys.  Returns true on AEAD success and sets `key_phase_out`
+// to the KP bit and `plaintext_out` to the unprotected payload.
+auto client_decrypt_short_with_keys(QuicTestClient& c, std::vector<uint8_t> dg,
+                                    const PacketKeys& keys, const PacketKeys& hp_keys, Aead a,
+                                    uint8_t& key_phase_out,
+                                    std::vector<uint8_t>& plaintext_out) -> bool {
+    const auto i = static_cast<std::size_t>(EncryptionLevel::Application);
+    if (dg.empty() || (dg[0] & 0x80U) != 0) return false;
+    const std::size_t pn_offset = 1 + c.scid.size();
+    if (pn_offset + 4 + kSampleLen > dg.size()) return false;
+    auto mask = header_protection_mask(a, {hp_keys.hp.data(), hp_keys.hp.size()},
+                                       {dg.data() + pn_offset + 4, kSampleLen});
+    dg[0] ^= mask[0] & 0x1F;
+    const std::size_t pn_len = (dg[0] & 0x03U) + 1;
+    for (std::size_t k = 0; k < pn_len; ++k) {
+        dg[pn_offset + k] ^= mask[1 + k];
+    }
+    key_phase_out = static_cast<uint8_t>((dg[0] >> 2) & 0x01U);
+    uint64_t trunc = 0;
+    for (std::size_t k = 0; k < pn_len; ++k) {
+        trunc = (trunc << 8) | dg[pn_offset + k];
+    }
+    uint64_t pn = decode_packet_number(c.any_recv[i] ? c.largest_recv_pn[i] : 0, trunc,
+                                       pn_len * 8);
+    const std::size_t header_len = pn_offset + pn_len;
+    std::span<const uint8_t> aad{dg.data(), header_len};
+    std::span<const uint8_t> ct{dg.data() + header_len, dg.size() - header_len};
+    auto nonce = make_aead_nonce({keys.iv.data(), keys.iv.size()}, pn);
+    if (!aead_open(a, {keys.key.data(), keys.key.size()}, {nonce.data(), nonce.size()}, aad,
+                   ct, plaintext_out)) {
+        return false;
+    }
+    if (!c.any_recv[i] || pn > c.largest_recv_pn[i]) c.largest_recv_pn[i] = pn;
+    c.any_recv[i] = true;
+    return true;
+}
+
+} // namespace
+
+// RFC 9001 §6 — server accepts a peer-initiated 1-RTT key update.
+// Build a short-header packet on the client side using the toggled
+// KEY_PHASE bit and next-generation keys derived from "quic ku"; the
+// server should decrypt it, commit the recv-side update, and rotate
+// its own send keys so the next outbound packet carries KEY_PHASE=1.
+TEST(QuicConnection, AcceptsPeerInitiatedKeyUpdate) {
+    auto hp = handshake_pair({0x6B, 0x65, 0x79, 0x21, 0x00, 0x00, 0x00, 0x00},
+                             {0x55, 0x56},
+                             {0xAB, 0xAB, 0xAB, 0xAB});
+    ASSERT_NE(hp, nullptr);
+    auto& server = *hp->server;
+    auto& client = *hp->client;
+    hp->server_outbox.clear();
+    EXPECT_EQ(server.send_key_phase(), 0U);
+    EXPECT_EQ(server.recv_key_phase(), 0U);
+
+    // Derive the client's next-generation 1-RTT send keys from its
+    // current send secret.  Header-protection key does NOT rotate
+    // (RFC 9001 §6.1), so reuse the existing hp value.
+    const auto app = static_cast<std::size_t>(EncryptionLevel::Application);
+    const Aead a = client.aead[app];
+    const Hash h = aead_hash(a);
+    auto next_send_secret = derive_next_application_secret(
+        h, {client.send_secret[app].data(), client.send_secret[app].size()});
+    PacketKeys next_keys = derive_packet_keys(a, next_send_secret);
+    next_keys.hp = client.send_keys[app].hp;
+
+    // Build a 1-RTT short-header packet with KP=1 carrying a single
+    // PING frame (cheapest ack-eliciting payload).
+    std::vector<uint8_t> payload;
+    encode_frame(payload, Frame{PingFrame{}});
+    auto pkt = client_build_short_with_keys(client, next_keys, client.send_keys[app], a,
+                                            /*key_phase=*/1, {payload.data(), payload.size()});
+
+    server.on_datagram({pkt.data(), pkt.size()});
+    server.on_timer();
+
+    EXPECT_EQ(server.recv_key_phase(), 1U)
+        << "server didn't commit recv-side key update after accepting peer KP=1";
+    EXPECT_EQ(server.send_key_phase(), 1U)
+        << "server didn't rotate send keys after accepting peer-initiated update";
+    ASSERT_FALSE(hp->server_outbox.empty()) << "server sent nothing in response";
+
+    // Decrypt the server's reply using OUR next-generation recv keys
+    // (server's new send secret was derived from its prior send
+    // secret == client's prior recv secret).
+    auto next_recv_secret = derive_next_application_secret(
+        h, {client.recv_secret[app].data(), client.recv_secret[app].size()});
+    PacketKeys next_recv_keys = derive_packet_keys(a, next_recv_secret);
+    next_recv_keys.hp = client.recv_keys[app].hp;
+    bool decoded_in_new_phase = false;
+    while (!hp->server_outbox.empty()) {
+        auto dg = std::move(hp->server_outbox.front());
+        hp->server_outbox.pop_front();
+        uint8_t kp = 0xFFU;
+        std::vector<uint8_t> plain;
+        if (client_decrypt_short_with_keys(client, std::move(dg), next_recv_keys,
+                                           client.recv_keys[app], a, kp, plain)) {
+            EXPECT_EQ(kp, 1U) << "server's response not carrying KEY_PHASE=1";
+            decoded_in_new_phase = true;
+        }
+    }
+    EXPECT_TRUE(decoded_in_new_phase)
+        << "server's post-update reply could not be decrypted with next-gen recv keys";
+}
+
+// RFC 9001 §6 — server-initiated 1-RTT key update via
+// `Connection::initiate_key_update()`.  After the call the server's
+// send side ratchets to phase 1 (recv stays at 0 until the peer
+// acks).  When the client then sends KP=1 with its own next-gen keys
+// the recv side also commits.
+TEST(QuicConnection, ServerInitiatedKeyUpdate) {
+    auto hp = handshake_pair({0x6B, 0x75, 0x21, 0x21, 0x00, 0x00, 0x00, 0x00},
+                             {0x77, 0x78},
+                             {0xC0, 0xC1, 0xC2, 0xC3});
+    ASSERT_NE(hp, nullptr);
+    auto& server = *hp->server;
+    auto& client = *hp->client;
+    hp->server_outbox.clear();
+
+    ASSERT_TRUE(server.initiate_key_update());
+    EXPECT_EQ(server.send_key_phase(), 1U);
+    EXPECT_EQ(server.recv_key_phase(), 0U) << "recv side must wait for peer ack";
+
+    // The server should now emit subsequent 1-RTT packets with KP=1.
+    // Trigger a send by writing on a stream.
+    const std::string body = "post-update";
+    std::vector<uint8_t> body_bytes(body.begin(), body.end());
+    server.write_stream(0, body_bytes, /*fin=*/false);
+    server.on_timer();
+    ASSERT_FALSE(hp->server_outbox.empty());
+
+    // Client's next-gen recv keys (server's new send secret derives
+    // from client's prior recv secret).
+    const auto app = static_cast<std::size_t>(EncryptionLevel::Application);
+    const Aead a = client.aead[app];
+    const Hash h = aead_hash(a);
+    auto next_recv_secret = derive_next_application_secret(
+        h, {client.recv_secret[app].data(), client.recv_secret[app].size()});
+    PacketKeys next_recv_keys = derive_packet_keys(a, next_recv_secret);
+    next_recv_keys.hp = client.recv_keys[app].hp;
+
+    bool saw_new_phase = false;
+    while (!hp->server_outbox.empty()) {
+        auto dg = std::move(hp->server_outbox.front());
+        hp->server_outbox.pop_front();
+        uint8_t kp = 0xFFU;
+        std::vector<uint8_t> plain;
+        if (client_decrypt_short_with_keys(client, std::move(dg), next_recv_keys,
+                                           client.recv_keys[app], a, kp, plain)) {
+            EXPECT_EQ(kp, 1U) << "server emit after initiate_key_update without KP=1";
+            saw_new_phase = true;
+        }
+    }
+    EXPECT_TRUE(saw_new_phase)
+        << "no server-emitted datagram decrypted with the next-gen recv keys";
 }
 
 // RFC 9000 §9 — limited connection-migration support: the Listener

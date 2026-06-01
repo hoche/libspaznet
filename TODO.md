@@ -241,10 +241,19 @@ Ordered by priority.
 
 ### Spec MUSTs we deferred
 
-- [ ] Key update (RFC 9001 §6)
-  - AEAD usage limits (RFC 9001 §6.6) require key rotation before
-    2^23 packets at AES-128-GCM. A long-lived 1-RTT connection without
-    key update is a MUST violation.
+- [x] Key update (RFC 9001 §6) — landed 2026-05-31.
+  Both directions of 1-RTT key updates are wired:
+  `Connection::install_new_keys` pre-derives "phase + 1" packet
+  keys from the Application traffic secrets via `quic ku`;
+  `process_short_packet` detects the toggled `KEY_PHASE` bit and
+  ratchets recv (and, per §6.1, send) on a successful decrypt;
+  `Connection::initiate_key_update()` exposes the server-initiated
+  path. Header-protection keys deliberately don't rotate. Tests:
+  `QuicConnection.AcceptsPeerInitiatedKeyUpdate`,
+  `QuicConnection.ServerInitiatedKeyUpdate`. Open follow-up:
+  automatic update once a per-direction packet count approaches the
+  AEAD usage ceiling (RFC 9001 §6.6); applications must currently
+  call `initiate_key_update()` themselves.
 
 - [x] Connection migration / path validation, partial — landed 2026-05-31.
   `Listener::on_datagram` now freezes `state.last_peer` once

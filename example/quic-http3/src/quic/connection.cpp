@@ -83,6 +83,11 @@ auto Connection::install_new_keys() -> void {
                 aead, {sp.recv_keys.key.data(), sp.recv_keys.key.size()},
                 CipherCtx::Direction::Decrypt);
             sp.recv_keys_ready = true;
+            if (lvl == EncryptionLevel::Application) {
+                // Stash the 1-RTT recv traffic secret so we can derive
+                // its successor for RFC 9001 §6 key updates.
+                sp.recv_secret.assign(rs.begin(), rs.end());
+            }
         }
         if (!sp.send_keys_ready && !ws.empty()) {
             sp.aead = aead;
@@ -91,6 +96,34 @@ auto Connection::install_new_keys() -> void {
                 aead, {sp.send_keys.key.data(), sp.send_keys.key.size()},
                 CipherCtx::Direction::Encrypt);
             sp.send_keys_ready = true;
+            if (lvl == EncryptionLevel::Application) {
+                sp.send_secret.assign(ws.begin(), ws.end());
+            }
+        }
+        // Once both directions of the Application space are installed,
+        // pre-derive the "phase + 1" keys so a peer-initiated key
+        // update can be applied in a single pass on the recv path.
+        // RFC 9001 §6.1: the header-protection key DOES NOT rotate,
+        // so the new PacketKeys carries the existing `hp` value
+        // unchanged.
+        if (lvl == EncryptionLevel::Application && sp.send_keys_ready &&
+            sp.recv_keys_ready && !sp.next_keys_ready) {
+            const Hash h = aead_hash(sp.aead);
+            auto next_send_secret = derive_next_application_secret(
+                h, {sp.send_secret.data(), sp.send_secret.size()});
+            auto next_recv_secret = derive_next_application_secret(
+                h, {sp.recv_secret.data(), sp.recv_secret.size()});
+            sp.next_send_keys = derive_packet_keys(sp.aead, next_send_secret);
+            sp.next_recv_keys = derive_packet_keys(sp.aead, next_recv_secret);
+            sp.next_send_keys.hp = sp.send_keys.hp;
+            sp.next_recv_keys.hp = sp.recv_keys.hp;
+            (void)sp.next_send_ctx.init(
+                sp.aead, {sp.next_send_keys.key.data(), sp.next_send_keys.key.size()},
+                CipherCtx::Direction::Encrypt);
+            (void)sp.next_recv_ctx.init(
+                sp.aead, {sp.next_recv_keys.key.data(), sp.next_recv_keys.key.size()},
+                CipherCtx::Direction::Decrypt);
+            sp.next_keys_ready = true;
         }
     }
 }
@@ -268,6 +301,8 @@ auto Connection::process_short_packet(std::vector<uint8_t>& dg) -> bool {
     if (pn_offset + 4 + kSampleLen > dg.size()) {
         return false;
     }
+    // RFC 9001 §6.1: header-protection keys are unchanged across key
+    // updates, so the same hp key removes HP for any key phase.
     auto mask = header_protection_mask(sp.aead, {sp.recv_keys.hp.data(), sp.recv_keys.hp.size()},
                                        {dg.data() + pn_offset + 4, kSampleLen});
     dg[0] ^= mask[0] & 0x1F; // short-header HP affects low 5 bits
@@ -275,6 +310,9 @@ auto Connection::process_short_packet(std::vector<uint8_t>& dg) -> bool {
     for (std::size_t i = 0; i < pn_len; ++i) {
         dg[pn_offset + i] ^= mask[1 + i];
     }
+    // KEY_PHASE bit lives at position 2 (0x04) of the short-header
+    // first byte (RFC 9000 §17.3).  Extract before AEAD.
+    const uint8_t peer_kp = static_cast<uint8_t>((dg[0] >> 2) & 0x01U);
     uint64_t truncated = 0;
     for (std::size_t i = 0; i < pn_len; ++i) {
         truncated = (truncated << 8) | dg[pn_offset + i];
@@ -290,11 +328,65 @@ auto Connection::process_short_packet(std::vector<uint8_t>& dg) -> bool {
     }
     const std::size_t pt_len = ct_len - tag_len;
     auto nonce = make_aead_nonce({sp.recv_keys.iv.data(), sp.recv_keys.iv.size()}, pn);
-    if (!sp.recv_ctx.open_inplace({nonce.data(), nonce.size()},
-                                  {dg.data(), header_len},
-                                  {dg.data() + header_len, pt_len},
-                                  {dg.data() + header_len + pt_len, tag_len})) {
-        return false;
+    // Same-phase fast path: decrypt with the current keys.
+    if (peer_kp == sp.recv_key_phase) {
+        if (!sp.recv_ctx.open_inplace({nonce.data(), nonce.size()},
+                                      {dg.data(), header_len},
+                                      {dg.data() + header_len, pt_len},
+                                      {dg.data() + header_len + pt_len, tag_len})) {
+            return false;
+        }
+    } else {
+        // RFC 9001 §6.1: KEY_PHASE flipped — peer has initiated a key
+        // update.  Try the next-generation recv keys; on failure
+        // drop silently (could be a glitch or an attacker).
+        if (!sp.next_keys_ready) {
+            return false;
+        }
+        auto next_nonce =
+            make_aead_nonce({sp.next_recv_keys.iv.data(), sp.next_recv_keys.iv.size()}, pn);
+        if (!sp.next_recv_ctx.open_inplace({next_nonce.data(), next_nonce.size()},
+                                           {dg.data(), header_len},
+                                           {dg.data() + header_len, pt_len},
+                                           {dg.data() + header_len + pt_len, tag_len})) {
+            return false;
+        }
+        // Commit the recv side of the update: move next → current
+        // and re-derive a fresh next from the new current secret.
+        const Hash h = aead_hash(sp.aead);
+        sp.recv_secret = derive_next_application_secret(
+            h, {sp.recv_secret.data(), sp.recv_secret.size()});
+        sp.recv_keys = std::move(sp.next_recv_keys);
+        sp.recv_ctx = std::move(sp.next_recv_ctx);
+        sp.next_recv_keys = derive_packet_keys(
+            sp.aead,
+            derive_next_application_secret(h, {sp.recv_secret.data(), sp.recv_secret.size()}));
+        sp.next_recv_keys.hp = sp.recv_keys.hp;
+        sp.next_recv_ctx = CipherCtx{};
+        (void)sp.next_recv_ctx.init(
+            sp.aead, {sp.next_recv_keys.key.data(), sp.next_recv_keys.key.size()},
+            CipherCtx::Direction::Decrypt);
+        sp.recv_key_phase ^= 1U;
+        // RFC 9001 §6.1: after a successful peer-initiated update we
+        // MUST also rotate our send side so future outbound packets
+        // carry the new KEY_PHASE.  Skip if our send side already
+        // ratcheted (we initiated first and the peer is just
+        // catching up).
+        if (sp.send_key_phase != sp.recv_key_phase) {
+            sp.send_secret = derive_next_application_secret(
+                h, {sp.send_secret.data(), sp.send_secret.size()});
+            sp.send_keys = std::move(sp.next_send_keys);
+            sp.send_ctx = std::move(sp.next_send_ctx);
+            sp.next_send_keys = derive_packet_keys(
+                sp.aead, derive_next_application_secret(
+                             h, {sp.send_secret.data(), sp.send_secret.size()}));
+            sp.next_send_keys.hp = sp.send_keys.hp;
+            sp.next_send_ctx = CipherCtx{};
+            (void)sp.next_send_ctx.init(
+                sp.aead, {sp.next_send_keys.key.data(), sp.next_send_keys.key.size()},
+                CipherCtx::Direction::Encrypt);
+            sp.send_key_phase ^= 1U;
+        }
     }
     if (!sp.any_recv || pn > sp.largest_recv_pn) {
         sp.largest_recv_pn = pn;
@@ -564,6 +656,37 @@ auto Connection::check_pto() -> void {
     }
 }
 
+auto Connection::initiate_key_update() -> bool {
+    auto& sp = space(EncryptionLevel::Application);
+    if (!sp.next_keys_ready) {
+        return false;
+    }
+    if (sp.send_key_phase != sp.recv_key_phase) {
+        // Previous update still in flight: peer hasn't echoed the new
+        // KEY_PHASE yet.  RFC 9001 §6.1 says don't pile updates on.
+        return false;
+    }
+    // RFC 9001 §6.1 — move send keys forward by one phase.  Recv
+    // side stays at the current phase until the peer's response
+    // arrives at the new KEY_PHASE; process_short_packet will commit
+    // that transition.
+    const Hash h = aead_hash(sp.aead);
+    sp.send_secret = derive_next_application_secret(
+        h, {sp.send_secret.data(), sp.send_secret.size()});
+    sp.send_keys = std::move(sp.next_send_keys);
+    sp.send_ctx = std::move(sp.next_send_ctx);
+    sp.next_send_keys = derive_packet_keys(
+        sp.aead,
+        derive_next_application_secret(h, {sp.send_secret.data(), sp.send_secret.size()}));
+    sp.next_send_keys.hp = sp.send_keys.hp;
+    sp.next_send_ctx = CipherCtx{};
+    (void)sp.next_send_ctx.init(
+        sp.aead, {sp.next_send_keys.key.data(), sp.next_send_keys.key.size()},
+        CipherCtx::Direction::Encrypt);
+    sp.send_key_phase ^= 1U;
+    return true;
+}
+
 auto Connection::initiate_close(uint64_t error_code, bool application,
                                 std::string reason, uint64_t frame_type) -> void {
     if (state_ == State::Closing || state_ == State::Draining ||
@@ -771,7 +894,11 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
                 VarInt::append(buf, length);
                 hp_first_mask = 0x0F;
             } else {
-                const uint8_t first = static_cast<uint8_t>(0x40 | static_cast<uint8_t>(pn_len - 1));
+                // Application — short header.  Mix in the current
+                // send KEY_PHASE bit (RFC 9000 §17.3 / RFC 9001 §6).
+                const uint8_t first = static_cast<uint8_t>(
+                    0x40 | (sp.send_key_phase << 2) |
+                    static_cast<uint8_t>(pn_len - 1));
                 buf.push_back(first);
                 buf.insert(buf.end(), dcid_.begin(), dcid_.end());
                 hp_first_mask = 0x1F;
@@ -950,8 +1077,10 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
         VarInt::append(buf, length);
         hp_first_mask = 0x0F;
     } else {
-        // Application — short header.
-        const uint8_t first = static_cast<uint8_t>(0x40 | static_cast<uint8_t>(pn_len - 1));
+        // Application — short header.  Mix in the current send
+        // KEY_PHASE bit (RFC 9000 §17.3 / RFC 9001 §6).
+        const uint8_t first = static_cast<uint8_t>(0x40 | (sp.send_key_phase << 2) |
+                                                   static_cast<uint8_t>(pn_len - 1));
         buf.push_back(first);
         buf.insert(buf.end(), dcid_.begin(), dcid_.end());
         hp_first_mask = 0x1F;

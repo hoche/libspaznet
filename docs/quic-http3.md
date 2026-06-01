@@ -216,6 +216,12 @@ the full list.
 - **No key update** (RFC 9001 §6). Long-lived 1-RTT connections will
   eventually exceed the AES-128-GCM 2²³ packet limit and lose protocol
   compliance.
+- **Key updates are implemented** but not automated. Long-lived
+  connections that approach the AEAD usage ceiling (RFC 9001 §6.6 —
+  2²³ packets at AES-128-GCM) must call
+  `Connection::initiate_key_update()` themselves periodically. The
+  server also accepts peer-initiated updates without intervention.
+  See [`quic-security.md`](quic-security.md#key-update-rfc-9001-6).
 - **No PTO retransmission.** Recovery does the math but
   `Connection::on_timer` doesn't act on it. **Loss recovery does
   not work.** Loopback tests pass because there's no loss; on a real
