@@ -1,0 +1,71 @@
+name: Linux x64
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    name: Build and Test - Linux x64
+    runs-on: ubuntu-latest
+
+    env:
+      OPENSSL_VERSION: 3.5.4
+      OPENSSL_PREFIX: ${{ github.workspace }}/.openssl
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up CMake
+        uses: jwlawson/actions-setup-cmake@v1.14
+        with:
+          cmake-version: '3.30'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # Need gcc 13.1+ for <format>; noble (24.04) has g++-13 available.
+          sudo apt-get install -y build-essential g++-13 iperf3
+          echo "CC=gcc-13"  >> "$GITHUB_ENV"
+          echo "CXX=g++-13" >> "$GITHUB_ENV"
+
+      - name: Cache OpenSSL ${{ env.OPENSSL_VERSION }}
+        id: openssl-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OPENSSL_PREFIX }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-linux-x64
+
+      - name: Build OpenSSL ${{ env.OPENSSL_VERSION }}
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          cd /tmp
+          curl -sSL -O "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          tar xzf "openssl-${OPENSSL_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL_VERSION}"
+          ./Configure --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}" no-tests shared
+          make -j$(nproc)
+          make install_sw
+
+      - name: Configure CMake
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DOPENSSL_ROOT_DIR="${OPENSSL_PREFIX}"
+
+      - name: Build
+        run: |
+          cd build
+          cmake --build . --config Release -j$(nproc)
+
+      - name: Run Tests
+        env:
+          LD_LIBRARY_PATH: ${{ env.OPENSSL_PREFIX }}/lib64:${{ env.OPENSSL_PREFIX }}/lib
+        run: |
+          cd build
+          ctest --output-on-failure

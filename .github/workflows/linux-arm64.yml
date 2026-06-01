@@ -1,0 +1,54 @@
+name: Linux ARM64
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    name: Build and Test - Linux ARM64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and test in ARM64 container
+        run: |
+          # ubuntu:24.04 ships g++-13 in apt; we still build OpenSSL 3.5
+          # from source because no Ubuntu release through 25.10 has it
+          # packaged. Building under QEMU is slow (~10 min); the rest of
+          # the test suite runs in another few minutes.
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/workspace -w /workspace \
+            ubuntu:24.04 bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y build-essential g++-13 cmake git curl ca-certificates iperf3
+            export CC=gcc-13 CXX=g++-13
+            cd /tmp
+            curl -sSL -O https://github.com/openssl/openssl/releases/download/openssl-3.5.4/openssl-3.5.4.tar.gz
+            tar xzf openssl-3.5.4.tar.gz
+            cd openssl-3.5.4
+            ./Configure --prefix=/opt/openssl-3.5 --openssldir=/opt/openssl-3.5 no-tests shared
+            make -j$(nproc)
+            make install_sw
+            cd /workspace
+            mkdir -p build && cd build
+            cmake .. -DOPENSSL_ROOT_DIR=/opt/openssl-3.5
+            cmake --build . --config Release -j$(nproc)
+            export LD_LIBRARY_PATH=/opt/openssl-3.5/lib64:/opt/openssl-3.5/lib
+            ctest --output-on-failure
+          '
