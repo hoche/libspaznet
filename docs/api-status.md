@@ -52,6 +52,7 @@ PlatformIO.
 | Build | `find_package(spaznet)` | **Stable** | Install target ships `spaznetConfig.cmake`. See `docs/integration.md`. |
 | Build | `SPAZNET_BUILD_QUIC` CMake option | **Stable** | Gates `example/quic-http3`. Defaults `ON` if OpenSSL 3.5+ is detected; warns + disables otherwise. Core builds with no OpenSSL dependency when this is `OFF`. |
 | Build | `SPAZNET_BUILD_EXAMPLES` CMake option | **Stable** | Defaults `ON`. Pulls in `example/http`, `example/http-websocket`, `example/http2`, `example/udp`, and (gated on `SPAZNET_BUILD_QUIC`) `example/quic-http3`. |
+| Build | `SPAZNET_BUILD_FUZZ` CMake option | **Stable** | Defaults `OFF`. Requires Clang. When on, applies `-fsanitize=fuzzer,address,undefined` globally and builds 11 libFuzzer harnesses (HTTP/1.1 request + chunked-body; HPACK + HTTP/2 frame; QUIC frame + long-header + transport-params + varint; QPACK + HTTP/3 frame; shared Huffman). Each is a self-driving binary — run with `-max_total_time=N`. |
 
 ## Reading the status column
 

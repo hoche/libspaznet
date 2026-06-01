@@ -274,12 +274,17 @@ Ordered by priority.
 
 ### Hardening
 
-- [ ] Fuzz the parsers
-  - `parse_frame`, `parse_long_header`, `parse_h3_frame`, `qpack_decode`,
-    `decode_transport_params` all take attacker-controlled bytes. Even
-    a 10-second libFuzzer pass per parser would find any obvious
-    crashers. Wire under `tests/fuzz/` behind `-DBUILD_FUZZERS=ON`.
-
+- [x] Fuzz the parsers — landed 2026-05-31.  11 libFuzzer harnesses
+  cover every untrusted-byte parser (HTTP/1.1 request + chunked-body;
+  HPACK + HTTP/2 frame; QUIC frame + long-header + transport-params +
+  varint; QPACK + HTTP/3 frame; shared RFC 7541 Huffman).  Gated by
+  `-DSPAZNET_BUILD_FUZZ=ON` (requires Clang); applies
+  `-fsanitize=fuzzer,address,undefined` to every target globally so
+  fuzzer binaries link cleanly.  5-second pass per harness on meep
+  (clang 18, Linux x86_64) found zero crashers and accumulates
+  coverage continuously — good baseline for longer-running CI runs.
+  Run with e.g. `./build-fuzz/example/quic-http3/fuzz_quic_frame
+  -max_total_time=10 -print_final_stats=1`.
 - [ ] UDP-socket integration test for `Server::set_quic_http3_service`
   - We have the wiring (`server_impl.cpp` calls
     `quic_http3_service_->handle_datagram`) but no test actually opens

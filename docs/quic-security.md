@@ -138,11 +138,16 @@ The frame, packet, and varint parsers reject:
 - Packets shorter than the minimum framed Initial (1200 bytes per
   RFC 9000 §14.1) — handled at Listener level.
 
-**These parsers have not been fuzzed.** That's a known gap; see
-[TODO.md](../TODO.md). A 10-second libFuzzer run per parser
-(`parse_frame`, `parse_long_header`, `parse_h3_frame`,
-`qpack_decode`, `decode_transport_params`) would find any obvious
-crashers.
+Every parser surface has a libFuzzer harness under
+`example/quic-http3/fuzz/` (and the shared
+`spaznet::codec::huffman_decode` under
+`example/quic-http3/fuzz/fuzz_huffman_decode.cpp`).  Enable with
+`-DSPAZNET_BUILD_FUZZ=ON -DCMAKE_CXX_COMPILER=clang++`; the
+harnesses build with `-fsanitize=fuzzer,address,undefined` and run
+self-driven.  Five-second baseline pass on meep (clang 18) finds
+zero crashers across all of `parse_frame`, `parse_long_header`,
+`decode_transport_params`, `VarInt::decode`, `qpack_decode`,
+`parse_h3_frame`, and `huffman_decode`.
 
 ## Not in scope today
 
@@ -195,7 +200,9 @@ can replay forever from the same source.
 
 ### Fuzz coverage
 
-No libFuzzer harness exists for the parsers. Tracked in
+Fuzz harnesses now exist (see above).  CI doesn't run them on every
+PR yet; a periodic longer-running campaign would catch deeper bugs
+than the 5-second baseline.  Tracked in
 [TODO.md](../TODO.md).
 
 ### qlog tracing
