@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
@@ -27,8 +28,19 @@ namespace http3 {
 // HTTP/3 request has arrived on a request stream.
 class QuicHttp3Service {
   public:
+    // Explicit-SendFn constructor — useful for tests that route
+    // outbound bytes through an in-memory queue.
     QuicHttp3Service(quic::Listener::Config listener_cfg,
                      quic::Listener::SendFn send_fn, Http3Server::RequestFn on_request);
+
+    // Self-routing constructor — the service installs its own
+    // `SendFn` that calls `::sendto(fd, ...)` on the listening UDP
+    // socket.  The fd is supplied later via `bind_fd()` (typically
+    // by `make_dispatcher`, which pulls it out of the first
+    // incoming `Datagram`).  Until `bind_fd` runs the SendFn is a
+    // no-op, which is fine: the very first datagram from a peer
+    // triggers the bind before any outbound packet is built.
+    QuicHttp3Service(quic::Listener::Config listener_cfg, Http3Server::RequestFn on_request);
 
     QuicHttp3Service(const QuicHttp3Service&) = delete;
     auto operator=(const QuicHttp3Service&) -> QuicHttp3Service& = delete;
@@ -41,11 +53,20 @@ class QuicHttp3Service {
     // Drive every connection's timers + HTTP/3 layer once.
     auto pump_all() -> void;
 
+    // Late-binding for the listening UDP fd.  Required when the
+    // self-routing constructor was used.  No-op for the explicit
+    // SendFn variant.  Subsequent calls overwrite the prior value
+    // (which lets a fresh `listen_udp` after `stop()` rebind).
+    auto bind_fd(int fd) -> void {
+        fd_.store(fd, std::memory_order_relaxed);
+    }
+
     [[nodiscard]] auto listener() -> quic::Listener& {
         return listener_;
     }
 
   private:
+    std::atomic<int> fd_{-1};
     quic::Listener listener_;
     Http3Server::RequestFn on_request_;
     // Per-connection Http3Server instances, keyed by the server-chosen

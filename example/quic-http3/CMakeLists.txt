@@ -53,6 +53,18 @@ if(BUILD_TESTING OR TARGET test_unit)
         PRIVATE spaznet_quic_http3 GTest::gtest GTest::gmock)
     spaznet_apply_test_warnings(test_quic_http3_unit)
     add_test(NAME QuicHttp3UnitTests COMMAND test_quic_http3_unit)
+
+    # Real-network interop tests — spin up a server on a UDP port and
+    # exec system `curl --http3` against it.  The test itself
+    # GTEST_SKIPs when the host curl lacks HTTP/3, so the binary is
+    # safe to run anywhere.
+    add_executable(test_quic_http3_integration
+        ${PROJECT_SOURCE_DIR}/tests/test_main.cpp
+        tests/integration/test_curl_http3_interop.cpp)
+    target_link_libraries(test_quic_http3_integration
+        PRIVATE spaznet_quic_http3 GTest::gtest GTest::gmock)
+    spaznet_apply_test_warnings(test_quic_http3_integration)
+    add_test(NAME QuicHttp3CurlInterop COMMAND test_quic_http3_integration)
 endif()
 
 add_executable(bench_quic_steady_state tests/performance/bench_quic_steady_state.cpp)
