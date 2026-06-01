@@ -21,8 +21,11 @@
 namespace spaznet {
 
 // Forward declarations
+struct TaskPromiseBase;
 struct TaskPromise;
 struct Task;
+template <typename T> struct ValueTaskPromise;
+template <typename T> struct ValueTask;
 class IOContext;
 struct CoroutineControlBlock;
 void add_ref_coroutine_control_block(CoroutineControlBlock* cb) noexcept;
@@ -118,18 +121,37 @@ inline std::atomic<StatisticsInternal*> g_statistics{nullptr};
 
 // Per-coroutine control block (one per coroutine frame).
 // Stored in the coroutine's promise and referenced by CoroutineHandle/Task/IOContext.
-// NOTE: TaskPromise is forward-declared here; std::coroutine_handle<TaskPromise> is OK as a member.
+//
+// `handle` is type-erased: the runtime only ever needs resume()/done()/
+// destroy() on it, none of which require the promise type. `promise`
+// holds the same coroutine's promise viewed as TaskPromiseBase, so the
+// continuation machinery can reach the base fields without reinterpreting
+// one promise type as another (Task vs ValueTask<T> have distinct
+// promise types but share the base).
 struct CoroutineControlBlock {
-    std::coroutine_handle<TaskPromise> handle;
+    std::coroutine_handle<> handle;
+    TaskPromiseBase* promise{nullptr};
     std::atomic<std::size_t> ref_count{1};
 };
 
-// Coroutine task handle
-struct TaskPromise {
+// Awaiter returned from final_suspend (defined just below, once
+// TaskPromiseBase is complete). Defined at namespace scope rather than as
+// a local class because its await_suspend is a member template, and local
+// classes can't have member templates.
+struct TaskFinalAwaiter;
+
+// Shared promise machinery for both the void `Task` and the value-
+// carrying `ValueTask<T>`. Holds continuation + control-block state and
+// the suspend/resume hooks; the return-channel (return_void vs
+// return_value) lives in the derived promises so each coroutine declares
+// exactly one of them (declaring both — even via inheritance — is
+// ill-formed).
+struct TaskPromiseBase {
     // Continuation support:
-    // If a coroutine (TaskPromise) awaits another Task, the awaited Task stores a ref-counted
-    // pointer to the awaiter's control block here. That keeps the awaiter coroutine alive even
-    // if the scheduler drops its Task wrapper while it is suspended.
+    // If a coroutine awaits a Task/ValueTask, the awaited coroutine stores
+    // a ref-counted pointer to the awaiter's control block here. That keeps
+    // the awaiter coroutine alive even if the scheduler drops its Task
+    // wrapper while it is suspended.
     CoroutineControlBlock* continuation_cb{nullptr};
     // Fallback continuation for non-Task awaiters.
     std::coroutine_handle<> continuation_raw{std::noop_coroutine()};
@@ -138,48 +160,74 @@ struct TaskPromise {
     // This is the single source of truth for coroutine lifetime management.
     CoroutineControlBlock* control_block{nullptr};
 
-    // Declaration - implementation after Task is defined
-    auto get_return_object() -> Task;
-
     auto initial_suspend() noexcept {
         return std::suspend_always{};
     }
 
-    auto final_suspend() noexcept {
-        struct FinalAwaiter {
-            [[nodiscard]] auto await_ready() const noexcept -> bool {
-                return false;
-            }
-            void await_suspend(std::coroutine_handle<TaskPromise> handle) noexcept {
-                auto& promise = handle.promise();
-
-                if (promise.continuation_cb != nullptr) {
-                    CoroutineControlBlock* cb = promise.continuation_cb;
-                    promise.continuation_cb = nullptr;
-                    // Helper handles the resume + release_cb-after-resume
-                    // sequence, bouncing through the thread-local queue
-                    // if the synchronous chain depth would otherwise
-                    // overflow the stack. cb's ref is consumed by the
-                    // helper (released after resume() returns, or in
-                    // the drain loop for deferred entries).
-                    resume_with_depth_bound(cb->handle, cb);
-                    return;
-                }
-
-                auto cont = promise.continuation_raw;
-                promise.continuation_raw = std::noop_coroutine();
-                resume_with_depth_bound(cont, nullptr);
-            }
-            void await_resume() noexcept {}
-        };
-        return FinalAwaiter{};
-    }
+    // Defined out of line below: the body needs TaskFinalAwaiter complete.
+    auto final_suspend() noexcept -> TaskFinalAwaiter;
 
     void unhandled_exception() {
         std::terminate();
     }
+};
 
+// Templated over the concrete promise type P so `handle.promise()` binds
+// to the TaskPromiseBase of whichever coroutine (Task or ValueTask<T>) is
+// finishing.
+struct TaskFinalAwaiter {
+    [[nodiscard]] auto await_ready() const noexcept -> bool {
+        return false;
+    }
+    template <typename P> void await_suspend(std::coroutine_handle<P> handle) noexcept {
+        TaskPromiseBase& promise = handle.promise();
+
+        if (promise.continuation_cb != nullptr) {
+            CoroutineControlBlock* cb = promise.continuation_cb;
+            promise.continuation_cb = nullptr;
+            // Helper handles the resume + release_cb-after-resume sequence,
+            // bouncing through the thread-local queue if the synchronous
+            // chain depth would otherwise overflow the stack. cb's ref is
+            // consumed by the helper (released after resume() returns, or
+            // in the drain loop for deferred entries).
+            resume_with_depth_bound(cb->handle, cb);
+            return;
+        }
+
+        auto cont = promise.continuation_raw;
+        promise.continuation_raw = std::noop_coroutine();
+        resume_with_depth_bound(cont, nullptr);
+    }
+    void await_resume() noexcept {}
+};
+
+inline auto TaskPromiseBase::final_suspend() noexcept -> TaskFinalAwaiter {
+    return TaskFinalAwaiter{};
+}
+
+// Allocate + wire up a control block for a freshly-created coroutine.
+// Shared by both promises' get_return_object. Defined out of line once
+// CoroutineControlBlock and Statistics are complete.
+template <typename P> auto make_coroutine_control_block(P& promise) -> CoroutineControlBlock*;
+
+// Void coroutine task.
+struct TaskPromise : TaskPromiseBase {
+    // Declaration - implementation after Task is defined
+    auto get_return_object() -> Task;
     void return_void() {}
+};
+
+// Value-carrying coroutine task: co_return yields a T that the awaiter
+// observes via `co_await`'s result. Used by Socket::async_read so callers
+// can tell bytes-read (>0) from EOF (0) from error (<0) instead of
+// inferring it from the output buffer's size.
+template <typename T> struct ValueTaskPromise : TaskPromiseBase {
+    T value{};
+    // Declaration - implementation after ValueTask is defined
+    auto get_return_object() -> ValueTask<T>;
+    void return_value(T result) {
+        value = std::move(result);
+    }
 };
 
 // Intrusive reference-counted coroutine handle wrapper.
@@ -212,7 +260,9 @@ class CoroutineHandle {
     }
 
     // Obtain a CoroutineHandle from an existing coroutine handle (adds a ref).
-    static auto from_handle(std::coroutine_handle<TaskPromise> h) -> CoroutineHandle {
+    // Templated over the promise type so it works for any coroutine whose
+    // promise derives from TaskPromiseBase (Task, ValueTask<T>).
+    template <typename P> static auto from_handle(std::coroutine_handle<P> h) -> CoroutineHandle {
         if (!h) {
             return {};
         }
@@ -264,8 +314,15 @@ class CoroutineHandle {
         release();
     }
 
-    [[nodiscard]] auto get() const -> std::coroutine_handle<TaskPromise> {
-        return cb_ ? cb_->handle : std::coroutine_handle<TaskPromise>{};
+    [[nodiscard]] auto get() const -> std::coroutine_handle<> {
+        return cb_ ? cb_->handle : std::coroutine_handle<>{};
+    }
+
+    // The owning coroutine's promise, viewed as the shared base. Used by
+    // the Task/ValueTask awaiters to wire up continuations without
+    // knowing the concrete promise type.
+    [[nodiscard]] auto promise_base() const -> TaskPromiseBase* {
+        return cb_ ? cb_->promise : nullptr;
     }
 
     [[nodiscard]] auto address() const -> void* {
@@ -295,7 +352,7 @@ class CoroutineHandle {
 
     [[nodiscard]] auto operator==(const std::coroutine_handle<TaskPromise>& other) const noexcept
         -> bool {
-        return get() == other;
+        return get().address() == other.address();
     }
 
     [[nodiscard]] auto operator!=(const std::coroutine_handle<TaskPromise>& other) const noexcept
@@ -322,6 +379,58 @@ class CoroutineHandle {
                                      const CoroutineHandle& rhs) noexcept -> bool {
     return rhs != lhs;
 }
+
+// Shared suspend logic for the Task/ValueTask awaiters. `awaited` is the
+// coroutine being co_awaited; `awaiter_cb` is the awaiting coroutine's
+// control block (or nullptr for a non-Task awaiter, in which case
+// `cont_raw` is used as a bare continuation). Resuming the awaited
+// coroutine here drives it forward; when it finishes, its
+// TaskFinalAwaiter resumes whichever continuation we stored.
+inline void io_task_suspend(const CoroutineHandle& awaited, CoroutineControlBlock* awaiter_cb,
+                            std::coroutine_handle<> cont_raw) noexcept {
+    TaskPromiseBase* p = awaited.promise_base();
+    if (p == nullptr) {
+        resume_with_depth_bound(cont_raw, nullptr);
+        return;
+    }
+    // Clear any previous continuation (shouldn't happen, but be safe).
+    if (p->continuation_cb != nullptr) {
+        release_coroutine_control_block(p->continuation_cb);
+        p->continuation_cb = nullptr;
+    }
+    p->continuation_raw = std::noop_coroutine();
+
+    if (awaiter_cb != nullptr) {
+        // Hold a ref to the awaiting coroutine while we are suspended.
+        add_ref_coroutine_control_block(awaiter_cb);
+        p->continuation_cb = awaiter_cb;
+    } else {
+        p->continuation_raw = cont_raw;
+    }
+
+    if (!awaited.done()) {
+        resume_with_depth_bound(awaited.get(), nullptr);
+    } else {
+        resume_with_depth_bound(cont_raw, nullptr);
+    }
+}
+
+// Awaiter for `co_await someTask`. Namespace scope (not a local class)
+// because await_suspend is a member template. The void Task yields
+// nothing; ValueTaskAwaiter<T> below mirrors it but yields the result.
+struct TaskAwaiter {
+    CoroutineHandle handle;
+    [[nodiscard]] auto await_ready() const noexcept -> bool {
+        return !handle || handle.done();
+    }
+    template <typename P> void await_suspend(std::coroutine_handle<P> cont) const noexcept {
+        io_task_suspend(handle, cont.promise().control_block, cont);
+    }
+    void await_suspend(std::coroutine_handle<> cont) const noexcept {
+        io_task_suspend(handle, nullptr, cont);
+    }
+    void await_resume() const noexcept {}
+};
 
 struct Task {
     using promise_type = TaskPromise;
@@ -377,72 +486,67 @@ struct Task {
 
     // Make Task awaitable
     auto operator co_await() const noexcept {
-        struct Awaiter {
-            CoroutineHandle handle;
-            [[nodiscard]] auto await_ready() const noexcept -> bool {
-                return !handle || handle.done();
-            }
-            // Awaiting from a Task coroutine: store a ref-counted continuation to keep the awaiter
-            // alive.
-            void await_suspend(std::coroutine_handle<TaskPromise> cont) const noexcept {
-                auto task_handle = handle.get();
-                if (!task_handle) {
-                    resume_with_depth_bound(cont, nullptr);
-                    return;
-                }
-
-                auto& p = task_handle.promise();
-                // Clear any previous continuation (shouldn't happen, but be safe)
-                if (p.continuation_cb != nullptr) {
-                    release_coroutine_control_block(p.continuation_cb);
-                    p.continuation_cb = nullptr;
-                }
-                p.continuation_raw = std::noop_coroutine();
-
-                // Hold a ref to the awaiting coroutine while we are suspended.
-                CoroutineControlBlock* awaiter_cb = cont.promise().control_block;
-                p.continuation_cb = awaiter_cb;
-                add_ref_coroutine_control_block(awaiter_cb);
-
-                if (!handle.done()) {
-                    resume_with_depth_bound(task_handle, nullptr);
-                } else {
-                    resume_with_depth_bound(cont, nullptr);
-                }
-            }
-
-            // Fallback for non-Task awaiters.
-            void await_suspend(std::coroutine_handle<> cont) const noexcept {
-                auto task_handle = handle.get();
-                if (!task_handle) {
-                    resume_with_depth_bound(cont, nullptr);
-                    return;
-                }
-
-                auto& p = task_handle.promise();
-                if (p.continuation_cb != nullptr) {
-                    release_coroutine_control_block(p.continuation_cb);
-                    p.continuation_cb = nullptr;
-                }
-                p.continuation_raw = cont;
-
-                if (!handle.done()) {
-                    resume_with_depth_bound(task_handle, nullptr);
-                } else {
-                    resume_with_depth_bound(cont, nullptr);
-                }
-            }
-            void await_resume() const noexcept {}
-        };
-        return Awaiter{handle};
+        return TaskAwaiter{handle};
     }
 };
 
-// Implement TaskPromise::get_return_object after Task is defined
-inline auto TaskPromise::get_return_object() -> Task {
-    auto handle = std::coroutine_handle<TaskPromise>::from_promise(*this);
-    auto* cb = new CoroutineControlBlock{handle};
-    control_block = cb;
+// Awaiter for `co_await someValueTask`. Same suspend logic as TaskAwaiter,
+// but await_resume hands back the value the coroutine co_return'd. The
+// awaited frame is kept alive by `handle`'s ref while we read it.
+template <typename T> struct ValueTaskAwaiter {
+    CoroutineHandle handle;
+    [[nodiscard]] auto await_ready() const noexcept -> bool {
+        return !handle || handle.done();
+    }
+    template <typename P> void await_suspend(std::coroutine_handle<P> cont) const noexcept {
+        io_task_suspend(handle, cont.promise().control_block, cont);
+    }
+    void await_suspend(std::coroutine_handle<> cont) const noexcept {
+        io_task_suspend(handle, nullptr, cont);
+    }
+    auto await_resume() const noexcept -> T {
+        if (!handle) {
+            return T{};
+        }
+        // The frame's promise is exactly ValueTaskPromise<T> here, so this
+        // recovers the correct type (no cross-type reinterpretation).
+        auto h = std::coroutine_handle<ValueTaskPromise<T>>::from_address(handle.address());
+        return std::move(h.promise().value);
+    }
+};
+
+// Value-carrying coroutine task. Mirrors Task but co_await yields a T.
+template <typename T> struct ValueTask {
+    using promise_type = ValueTaskPromise<T>;
+    CoroutineHandle handle;
+
+    ValueTask() = default;
+    explicit ValueTask(CoroutineHandle handle_param) : handle(std::move(handle_param)) {}
+
+    ValueTask(const ValueTask&) = default;
+    auto operator=(const ValueTask&) -> ValueTask& = default;
+    ValueTask(ValueTask&&) noexcept = default;
+    auto operator=(ValueTask&&) noexcept -> ValueTask& = default;
+    ~ValueTask() = default;
+
+    [[nodiscard]] auto done() const -> bool {
+        return !handle || handle.done();
+    }
+
+    auto operator co_await() const noexcept {
+        return ValueTaskAwaiter<T>{handle};
+    }
+};
+
+// Allocate + wire up a control block for a freshly-created coroutine and
+// record creation in the statistics. Shared by both promises'
+// get_return_object.
+template <typename P> inline auto make_coroutine_control_block(P& promise) -> CoroutineControlBlock* {
+    auto handle = std::coroutine_handle<P>::from_promise(promise);
+    auto* cb = new CoroutineControlBlock{};
+    cb->handle = handle;
+    cb->promise = &promise; // P derives from TaskPromiseBase
+    promise.control_block = cb;
 
     // Track coroutine creation (lock-free)
     StatisticsInternal* stats = g_statistics.load(std::memory_order_acquire);
@@ -452,8 +556,16 @@ inline auto TaskPromise::get_return_object() -> Task {
         stats->total_memory_bytes.fetch_add(Statistics::ESTIMATED_COROUTINE_FRAME_SIZE,
                                             std::memory_order_relaxed);
     }
+    return cb;
+}
 
-    return Task{CoroutineHandle::adopt(cb)};
+// Implement get_return_object after Task / ValueTask are defined.
+inline auto TaskPromise::get_return_object() -> Task {
+    return Task{CoroutineHandle::adopt(make_coroutine_control_block(*this))};
+}
+
+template <typename T> inline auto ValueTaskPromise<T>::get_return_object() -> ValueTask<T> {
+    return ValueTask<T>{CoroutineHandle::adopt(make_coroutine_control_block(*this))};
 }
 
 // Intrusive ref-count helpers (used by TaskPromise/Task awaiter).
@@ -469,7 +581,8 @@ inline void release_coroutine_control_block(CoroutineControlBlock* cb) noexcept 
     }
     if (cb->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         auto h = cb->handle;
-        cb->handle = std::coroutine_handle<TaskPromise>{};
+        cb->handle = std::coroutine_handle<>{};
+        cb->promise = nullptr;
 
         // Track coroutine destruction (lock-free)
         StatisticsInternal* stats = g_statistics.load(std::memory_order_acquire);
@@ -625,8 +738,12 @@ class IOContext {
         PendingIO() = default;
     };
     std::unordered_map<int, PendingIO> pending_io_;
-    mutable std::atomic_flag map_lock_ = ATOMIC_FLAG_INIT; // Spinlock for map structure only
-    std::atomic<uint32_t> next_generation_{1};             // 0 reserved for the wakeup pipe
+    // Guards pending_io_ and the platform-IO side-table mutation done
+    // under it (add_fd/modify_fd/remove_fd). Was an atomic_flag spinlock;
+    // switched to a mutex so threads waiting on a blocked add_fd/modify_fd
+    // syscall park instead of burning CPU spinning.
+    mutable std::mutex map_lock_;
+    std::atomic<uint32_t> next_generation_{1}; // 0 reserved for the wakeup pipe
 
     // The user_data we hand to the platform layer is an opaque token,
     // not a pointer to anything dereferenceable. It packs (generation,
@@ -679,8 +796,11 @@ class IOContext {
     // Schedule a coroutine task
     auto schedule(Task task) -> void;
 
-    // Register I/O operation
-    auto register_io(int file_descriptor, uint32_t events, std::coroutine_handle<> handle) -> void;
+    // Register I/O operation. The handle is the awaiting coroutine,
+    // already wrapped in a ref-counted CoroutineHandle by the awaiter
+    // (which knows its concrete promise type); register_io keeps it alive
+    // until the matching event fires.
+    auto register_io(int file_descriptor, uint32_t events, CoroutineHandle handle) -> void;
 
     // Remove I/O registration for a file descriptor
     auto remove_io(int file_descriptor) -> void;

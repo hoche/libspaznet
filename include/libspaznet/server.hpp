@@ -71,8 +71,11 @@ class Socket {
         return io_context_;
     }
 
-    // Async read
-    Task async_read(std::vector<uint8_t>& buffer, std::size_t size);
+    // Async read. Resizes `buffer` to the bytes received and returns that
+    // count; returns 0 on orderly EOF (buffer cleared) and -1 on a hard
+    // error (buffer cleared). Callers that only need the data can ignore
+    // the result and inspect buffer.size() as before.
+    ValueTask<ssize_t> async_read(std::vector<uint8_t>& buffer, std::size_t size);
 
     // Async write
     Task async_write(std::vector<uint8_t> data);

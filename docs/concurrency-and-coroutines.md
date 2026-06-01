@@ -31,7 +31,7 @@ This document explains how `libspaznet` schedules work, how coroutines move betw
 
 - `IOContext::run` spins the main loop and also starts N worker threads; all share the same `IOContext`.
 - Coroutines may start on the main loop, be resumed on a worker, and bounce between workers as they `co_await` I/O or timers. Handles are portable because the continuation is stored in the promise, not the stack.
-- `register_io` places coroutine handles into `pending_io_` under a short spinlock, bumps the entry's generation counter, and hands the packed `(generation, fd)` token to the platform demultiplexer. When the OS reports readiness the token comes back unchanged; `process_io_events` re-acquires the spinlock, looks up the entry, and only resumes the coroutine if the generation still matches.
+- `register_io` places coroutine handles into `pending_io_` under `map_lock_`, bumps the entry's generation counter, and hands the packed `(generation, fd)` token to the platform demultiplexer. When the OS reports readiness the token comes back unchanged; `process_io_events` re-acquires the lock, looks up the entry, and only resumes the coroutine if the generation still matches.
 - Timers are placed in a min-heap and, when due, their coroutine handles are also rescheduled.
 - Workers and the main loop both drain queues: every resume that yields again must be resubmitted via `schedule`.
 - `wait()` retries internally on `EINTR`, and a peer half-close (`EPOLLHUP` / `EV_EOF` / `POLLHUP`) wakes the read-waiter so `recv()` returns 0 instead of hanging.
@@ -57,7 +57,7 @@ The rest of the cross-thread state lives in `std::atomic<…>`.
 |---|---|---|
 | `TaskQueue::mutex_` (`io_context.hpp`) | `std::mutex` | Held briefly on enqueue and dequeue; the only correctness guarantee for the singly-linked task list. |
 | `IOContext::timer_mutex_` (`io_context.hpp`) | `std::mutex` | Protects the timer min-heap, the cancelled-id set, and the suspended-task map as a single transaction. |
-| `IOContext::map_lock_` (`io_context.hpp`) | `std::atomic_flag` spinlock | Brief structural guard for the `pending_io_` map (insert / find / erase). Held across the `add_fd` / `modify_fd` call into the platform layer so a rehash can't invalidate the entry mid-update. |
+| `IOContext::map_lock_` (`io_context.hpp`) | `std::mutex` | Structural guard for the `pending_io_` map (insert / find / erase). Held across the `add_fd` / `modify_fd` / `remove_fd` call into the platform layer so a rehash can't invalidate the entry mid-update and side-table mutations stay serialized. A mutex, not a spinlock, so waiters park rather than spin while the holder is blocked in that syscall. |
 | `Server::listen_fds_mutex_` (`server.hpp`) | `std::mutex` | Guards the listening-socket vector across `listen_tcp()` and `stop()`. |
 | `Server::client_fds_mutex_` (`server.hpp`) | `std::mutex` | Guards the active-client-fd set that `Server::stop()` walks to `shutdown(2)` every in-flight client and drain its coroutine. |
 
@@ -114,7 +114,7 @@ void on_external_ready(IOContext& ctx, ExternalEvent ev) {
 
 ## Failure Modes When Mixing
 
-- Coroutines resume on arbitrary threads, causing races against the `pending_io_` map or timer heap mutex (the map's spinlock is taken on every register / process step; an out-of-band resume sidesteps it).
+- Coroutines resume on arbitrary threads, causing races against the `pending_io_` map or timer heap mutex (`map_lock_` is taken on every register / process step; an out-of-band resume sidesteps it).
 - Continuations are dropped; `co_await` never resumes, appearing as a hang.
 - A `Task` gets destroyed while a lambda still holds its raw handle, leading to `resume` on a destroyed frame (undefined behavior).
 - Handler vtables are violated, so HTTP/WebSocket/TCP dispatch cannot call your handler at all.

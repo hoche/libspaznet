@@ -240,11 +240,16 @@ void IOContext::worker_thread(std::size_t queue_index) {
     }
 }
 
-void IOContext::register_io(int file_descriptor, uint32_t events, std::coroutine_handle<> handle) {
-    // Spinlock for map structure access only
-    while (map_lock_.test_and_set(std::memory_order_acquire)) {
-        // Spin - this is brief, just map access
-    }
+void IOContext::register_io(int file_descriptor, uint32_t events, CoroutineHandle handle) {
+    // Guard the pending-io map AND the platform-IO side-table mutation
+    // below. This was an atomic_flag spinlock, but add_fd / modify_fd
+    // issue a syscall while the lock is held, and a blocked syscall under
+    // a spinlock burns CPU on every other thread that needs the map. A
+    // std::mutex parks waiters instead. We keep the syscall inside the
+    // critical section on purpose: it must stay mutually exclusive with
+    // remove_io's remove_fd, which shares this lock to close the
+    // platform-layer side-table fd-reuse race (see remove_io).
+    std::lock_guard<std::mutex> lock(map_lock_);
 
     // Determine whether this fd was already registered before storing new handles.
     auto pending_it = pending_io_.find(file_descriptor);
@@ -255,22 +260,29 @@ void IOContext::register_io(int file_descriptor, uint32_t events, std::coroutine
     // any event still in the kernel's queue (or already returned to
     // userspace but not yet dispatched) for the previous instance carries
     // the old generation and will be filtered out by process_io_events.
-    pending.generation = next_generation_.fetch_add(1, std::memory_order_relaxed);
+    //
+    // generation 0 is the wakeup-pipe sentinel (delivered as a null
+    // token). If the counter wraps back to 0 after 2^32-1 registrations,
+    // re-roll so a real fd never gets the sentinel generation and has its
+    // events silently dropped as wakeup-pipe traffic.
+    uint32_t generation = next_generation_.fetch_add(1, std::memory_order_relaxed);
+    if (generation == 0) {
+        generation = next_generation_.fetch_add(1, std::memory_order_relaxed);
+    }
+    pending.generation = generation;
 
 
-    // Convert to our TaskPromise coroutine handle and keep it alive while registered.
-    // NOTE: Storing only the raw address is not enough; the coroutine frame may be destroyed
-    // while suspended. We must retain a strong reference here.
+    // Keep the awaiting coroutine alive while it is registered. The handle
+    // arrives already ref-counted (the awaiter built it from its concrete
+    // promise type), so storing it here retains a strong reference — the
+    // coroutine frame would otherwise be destroyed while suspended.
     uint32_t new_events = 0;
     if (handle) {
-        auto task_handle = std::coroutine_handle<TaskPromise>::from_address(handle.address());
-        if (task_handle) {
-            if ((events & PlatformIO::EVENT_READ) != 0) {
-                pending.read = CoroutineHandle::from_handle(task_handle);
-            }
-            if ((events & PlatformIO::EVENT_WRITE) != 0) {
-                pending.write = CoroutineHandle::from_handle(task_handle);
-            }
+        if ((events & PlatformIO::EVENT_READ) != 0) {
+            pending.read = handle;
+        }
+        if ((events & PlatformIO::EVENT_WRITE) != 0) {
+            pending.write = handle;
         }
     }
 
@@ -291,14 +303,10 @@ void IOContext::register_io(int file_descriptor, uint32_t events, std::coroutine
     } else {
         platform_io_->add_fd(file_descriptor, new_events, token);
     }
-
-    map_lock_.clear(std::memory_order_release);
 }
 
 void IOContext::remove_io(int file_descriptor) {
-    while (map_lock_.test_and_set(std::memory_order_acquire)) {
-        // Spin
-    }
+    std::lock_guard<std::mutex> lock(map_lock_);
     pending_io_.erase(file_descriptor);
     // Drop the kernel-side registration too while holding the spinlock.
     // Pre-fix this was the caller's responsibility (Socket::close +
@@ -311,7 +319,6 @@ void IOContext::remove_io(int file_descriptor) {
     // suite; keep the platform-layer mutation under the same lock as
     // the pending-io map.
     platform_io_->remove_fd(file_descriptor);
-    map_lock_.clear(std::memory_order_release);
 }
 
 void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) {
@@ -319,10 +326,7 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
     std::vector<Task> tasks_to_schedule;
 
     {
-        // Spinlock for map access
-        while (map_lock_.test_and_set(std::memory_order_acquire)) {
-            // Spin
-        }
+        std::lock_guard<std::mutex> lock(map_lock_);
 
         for (const auto& evt : events) {
             // A null token identifies the wakeup pipe (registered with
@@ -378,8 +382,6 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
                                         encode_token(pending.generation, token_fd));
             }
         }
-
-        map_lock_.clear(std::memory_order_release);
     }
     // Lock released here
 
@@ -500,9 +502,8 @@ void IOContext::process_timers() {
         // Create new Task from the handle - reference counting handles ownership
         // The handle from task_ptr is already reference-counted, so we can safely
         // create a new Task from it
-        auto task_handle = handle.get();
-        if (task_handle) {
-            Task task_to_schedule{task_handle};
+        if (handle) {
+            Task task_to_schedule{handle};
             // Schedule the task - Task::resume() will check if handle is done
             schedule(std::move(task_to_schedule));
         }

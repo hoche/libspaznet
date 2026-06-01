@@ -11,7 +11,7 @@ remain. This is the rationale for each.
 |---|---|---|
 | `TaskQueue::mutex_` | `std::mutex` | Linked-list node lifetime: a lock-free queue would require hazard pointers or epoch-based reclamation to free dequeued nodes safely. |
 | `IOContext::timer_mutex_` | `std::mutex` | A min-heap plus two associative containers that must be mutated as a single transaction. |
-| `IOContext::map_lock_` | `std::atomic_flag` spinlock | Brief structural guard for the `pending_io_` map; held across an `add_fd` / `modify_fd` call so a rehash can't invalidate the in-use entry. |
+| `IOContext::map_lock_` | `std::mutex` | Structural guard for the `pending_io_` map; held across an `add_fd` / `modify_fd` / `remove_fd` call so a rehash can't invalidate the in-use entry and the platform side-table mutations stay mutually exclusive. A mutex (not a spinlock) so threads don't spin while the holder is blocked in that syscall. |
 | `Server::listen_fds_mutex_` | `std::mutex` | `std::vector` is not thread-safe; iterate-and-close on `stop()` must serialize with `listen_tcp()` appends. |
 | `Server::client_fds_mutex_` | `std::mutex` | `std::unordered_set` is not thread-safe; concurrent insert/erase by `handle_connection` coroutines must serialize with `Server::stop()`'s walk-and-shutdown sweep. |
 
@@ -103,11 +103,11 @@ complexity than the timer path's traffic justifies. The mutex is held
 for the bounded duration of those container ops, on a path that fires
 once per timer expiry rather than per I/O event.
 
-## 3. `pending_io_` spinlock
+## 3. `pending_io_` map lock
 
 ```cpp
 std::unordered_map<int, PendingIO> pending_io_;
-mutable std::atomic_flag map_lock_ = ATOMIC_FLAG_INIT;
+mutable std::mutex map_lock_;
 ```
 
 The hottest of the five locks. Held for:
@@ -118,17 +118,23 @@ The hottest of the five locks. Held for:
   packed `(generation, fd)` token. Held across the platform call so
   a rehash cannot invalidate the entry while the kernel is reading
   its `user_data` pointer.
-* `remove_io`: drop the entry.
+* `remove_io`: drop the entry and call `remove_fd`. The platform call
+  stays under this lock so it can't race `register_io`'s `add_fd` /
+  `modify_fd` over the platform layer's side-table (the fd-reuse UAF
+  fixed in d64bce1).
 * `process_io_events`: per-event, decode the token's generation,
   look up the entry, check the generation, transfer the suspended
   handle into the local schedule list, and (if interest changed)
   re-issue a `modify_fd` with the same token.
 
-A spinlock rather than a `std::mutex` because every critical section
-is bounded by a handful of map operations and (sometimes) one syscall;
-sleeping for that would be more expensive than spinning, and the
-contention domain is "one event-loop thread plus the schedulers that
-just woke up on workers", not "every coroutine in the process".
+This was an `std::atomic_flag` spinlock, on the reasoning that each
+critical section is a handful of map ops. But the critical section
+also spans a platform syscall (`add_fd` / `modify_fd` / `remove_fd`),
+and a thread that blocks in that syscall while holding a spinlock
+makes every other thread that needs the map burn CPU spinning behind
+it. A `std::mutex` parks waiters instead, so it's the better fit here;
+the syscall deliberately stays inside the critical section to preserve
+the fd-reuse mutual exclusion above.
 
 ## 4. & 5. Server's two fd containers
 

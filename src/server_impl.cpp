@@ -90,7 +90,7 @@ bool is_retryable_errno(int e) {
 
 } // namespace
 
-Task Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
+ValueTask<ssize_t> Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
     buffer.resize(size);
 
     while (true) {
@@ -117,8 +117,12 @@ Task Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
                 return true;
             }
 
-            void await_suspend(std::coroutine_handle<> h) {
-                socket->context()->register_io(socket->fd(), PlatformIO::EVENT_READ, h);
+            // The enclosing coroutine's promise is ValueTaskPromise<ssize_t>;
+            // naming it lets us hand register_io a ref-counted handle
+            // without reinterpreting the promise type.
+            void await_suspend(std::coroutine_handle<ValueTaskPromise<ssize_t>> h) {
+                socket->context()->register_io(socket->fd(), PlatformIO::EVENT_READ,
+                                               CoroutineHandle::from_handle(h));
             }
 
             ssize_t await_resume() noexcept {
@@ -135,12 +139,12 @@ Task Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
 
         if (result > 0) {
             buffer.resize(static_cast<std::size_t>(result));
-            co_return;
+            co_return result;
         }
         if (result == 0) {
             // Peer closed the connection (orderly EOF).
             buffer.clear();
-            co_return;
+            co_return 0;
         }
         // result < 0
         if (is_retryable_errno(awaiter.saved_errno)) {
@@ -149,9 +153,11 @@ Task Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
             // available.
             continue;
         }
-        // Hard error.
+        // Hard error. Report it as a negative result so callers can tell
+        // an error apart from an orderly EOF (which co_returns 0); the
+        // buffer is cleared in both cases.
         buffer.clear();
-        co_return;
+        co_return -1;
     }
 }
 
@@ -182,8 +188,9 @@ Task Socket::async_write(std::vector<uint8_t> data) {
                 return true;
             }
 
-            void await_suspend(std::coroutine_handle<> h) {
-                socket->context()->register_io(socket->fd(), PlatformIO::EVENT_WRITE, h);
+            void await_suspend(std::coroutine_handle<TaskPromise> h) {
+                socket->context()->register_io(socket->fd(), PlatformIO::EVENT_WRITE,
+                                               CoroutineHandle::from_handle(h));
             }
 
             ssize_t await_resume() noexcept {
@@ -370,8 +377,8 @@ Task Server::receive_udp(int udp_fd) {
         [[nodiscard]] bool await_ready() const noexcept {
             return false;
         }
-        void await_suspend(std::coroutine_handle<> h) const {
-            ctx->register_io(fd, PlatformIO::EVENT_READ, h);
+        void await_suspend(std::coroutine_handle<TaskPromise> h) const {
+            ctx->register_io(fd, PlatformIO::EVENT_READ, CoroutineHandle::from_handle(h));
         }
         void await_resume() const noexcept {}
     };
@@ -444,8 +451,8 @@ Task Server::accept_connections(int listen_fd) {
         [[nodiscard]] bool await_ready() const noexcept {
             return false;
         }
-        void await_suspend(std::coroutine_handle<> h) const {
-            ctx->register_io(fd, PlatformIO::EVENT_READ, h);
+        void await_suspend(std::coroutine_handle<TaskPromise> h) const {
+            ctx->register_io(fd, PlatformIO::EVENT_READ, CoroutineHandle::from_handle(h));
         }
         void await_resume() const noexcept {}
     };

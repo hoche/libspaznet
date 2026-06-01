@@ -177,23 +177,30 @@ items from the same re-audit, none critical:
 - [x] Bump the chunk-size line max — landed 2026-05-31;
   chunk_line_max is now 4 KiB (was 64).
 
-- [ ] Don't hold the pending_io_ spinlock across add_fd / modify_fd
-  - register_io and process_io_events hold map_lock_ (an atomic_flag
-    spinlock) across the platform-IO syscall. A blocked syscall under
-    a spinlock can starve every other thread that needs the map.
-    Either switch to std::mutex (other call sites already do) or
-    drop the syscall outside the critical section.
+- [x] Don't hold the pending_io_ spinlock across add_fd / modify_fd
+  - map_lock_ is now a std::mutex instead of an atomic_flag spinlock
+    (register_io / remove_io / process_io_events). The platform-IO
+    syscall stays inside the critical section on purpose — it must
+    remain mutually exclusive with remove_io's remove_fd to keep the
+    side-table fd-reuse fix (d64bce1) intact — but waiters now park on
+    the mutex instead of burning CPU spinning behind a blocked syscall.
 
-- [ ] Skip generation 0 on register_io counter wrap
-  - PendingIO::generation is uint32_t incremented via fetch_add. 0 is
-    reserved as the wakeup-pipe sentinel; after 2^32 - 1 registrations
-    the counter wraps back to 0 and collides. Realistic concern only
-    on decades-long uptime under extreme churn, but the fix is one
-    line: re-roll on wrap.
+- [x] Skip generation 0 on register_io counter wrap
+  - register_io re-rolls when fetch_add returns 0 (the wakeup-pipe
+    sentinel), so a real fd never inherits generation 0 and has its
+    events dropped as wakeup-pipe traffic after the counter wraps.
 
-- [ ] async_read return type → Task<ssize_t>
-  - Deferred follow-up from #3 of the original audit. Requires the
-    Task<T> template that doesn't exist yet.
+- [x] async_read return type → Task<ssize_t>
+  - Landed as ValueTask<ssize_t>: async_read co_returns the byte count
+    (>0), 0 on orderly EOF, or -1 on hard error, so callers can tell
+    EOF from error instead of inferring from buffer.size(). Named
+    ValueTask<T> rather than Task<T> to avoid renaming the 100+ void
+    Task callsites. The coroutine runtime was refactored so Task and
+    ValueTask<T> share a TaskPromiseBase; the control block carries a
+    base-promise pointer so the I/O layer never reinterpret-casts
+    between promise types. Existing `co_await socket.async_read(...)`
+    callsites are unchanged (the ssize_t is simply discarded). ASan +
+    TSan suites stay clean.
 
 ## QUIC + HTTP/3 follow-ups (2026-05-29)
 
