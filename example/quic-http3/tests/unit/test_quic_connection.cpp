@@ -8,7 +8,11 @@
 #include <gtest/gtest.h>
 
 #include <libspaznet/quic/connection.hpp>
+#include <libspaznet/quic/listener.hpp>
 #include <libspaznet/quic/varint.hpp>
+
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include <cstring>
 #include <deque>
@@ -728,6 +732,174 @@ TEST(QuicConnection, InitiateCloseEmitsConnectionCloseFrame) {
         << "Closing-state Connection should be quiet after the close datagram";
 }
 
+// RFC 9000 §8.2 — server echoes a PATH_RESPONSE in reply to an
+// inbound PATH_CHALLENGE on the existing path.  Drives the handshake
+// to Established, then injects a 1-RTT packet from the client
+// carrying a PATH_CHALLENGE frame, and confirms the next server
+// datagram contains a PATH_RESPONSE with the matching 8-byte data.
+TEST(QuicConnection, RespondsToPathChallenge) {
+    auto [cert, key] = make_self_signed_p256();
+    TlsServerConfig cfg{cert, key, {"h3"}};
+    auto ctx = TlsContext::make_server(cfg);
+    ASSERT_NE(ctx, nullptr);
+
+    std::vector<uint8_t> client_dcid = {0x70, 0x61, 0x74, 0x68, 0x21, 0x21, 0x21, 0x21};
+    std::vector<uint8_t> client_scid = {0x42, 0x42};
+    std::vector<uint8_t> server_scid = {0xF0, 0xF1, 0xF2, 0xF3};
+
+    std::deque<std::vector<uint8_t>> server_outbox;
+    TransportParameters server_tp;
+    server_tp.initial_max_data = 1 << 20;
+    server_tp.initial_max_stream_data_bidi_remote = 1 << 16;
+    server_tp.initial_max_stream_data_bidi_local = 1 << 16;
+    server_tp.initial_max_streams_bidi = 16;
+    server_tp.initial_max_streams_uni = 3;
+
+    auto clock_now = std::chrono::steady_clock::now();
+    Connection::ClockFn clock_fn = [&]() { return clock_now; };
+
+    Connection server(ctx, {client_dcid.data(), client_dcid.size()},
+                      {client_scid.data(), client_scid.size()},
+                      {server_scid.data(), server_scid.size()}, server_tp,
+                      [&](std::span<const uint8_t> dg) {
+                          server_outbox.emplace_back(dg.begin(), dg.end());
+                      },
+                      clock_fn);
+
+    auto client = make_client(client_dcid, client_scid);
+    for (int round = 0; round < 30; ++round) {
+        int rc = SSL_do_handshake(client->ssl);
+        if (rc != 1) {
+            int err = SSL_get_error(client->ssl, rc);
+            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                FAIL() << "client SSL_do_handshake err=" << err;
+            }
+        }
+        client_emit(*client);
+        while (!client->outbox.empty()) {
+            auto dg = std::move(client->outbox.front());
+            client->outbox.pop_front();
+            server.on_datagram({dg.data(), dg.size()});
+        }
+        clock_now += std::chrono::milliseconds(1);
+        server.on_timer();
+        while (!server_outbox.empty()) {
+            auto dg = std::move(server_outbox.front());
+            server_outbox.pop_front();
+            client_receive(*client, std::move(dg));
+        }
+        if (!client->pending_dgs.empty()) {
+            auto pending = std::move(client->pending_dgs);
+            client->pending_dgs.clear();
+            for (auto& dg : pending) {
+                client_receive(*client, std::move(dg));
+            }
+        }
+        if (server.state() == Connection::State::Established) break;
+    }
+    ASSERT_EQ(server.state(), Connection::State::Established);
+    server_outbox.clear();
+
+    // For 1-RTT packets, DCID is the server's chosen SCID (which is
+    // known to the server's process_short_packet via scid_.size()).
+    // The existing client scaffold doesn't track that automatically;
+    // the test does so explicitly.
+    client->dcid = server_scid;
+
+    // Build a 1-RTT short-header packet containing only a
+    // PATH_CHALLENGE frame.  We assemble it the same way client_emit
+    // does for its 1-RTT branch, but with our own payload.
+    const std::array<uint8_t, 8> challenge_data = {
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+    std::vector<uint8_t> payload;
+    {
+        PathChallengeFrame pc;
+        pc.data = challenge_data;
+        encode_frame(payload, Frame{pc});
+    }
+
+    const auto app = static_cast<std::size_t>(EncryptionLevel::Application);
+    auto& keys = client->send_keys[app];
+    const Aead a = client->aead[app];
+    const std::size_t pn_len = 4;
+    std::vector<uint8_t> pkt;
+    pkt.push_back(static_cast<uint8_t>(0x40 | (pn_len - 1)));
+    pkt.insert(pkt.end(), client->dcid.begin(), client->dcid.end());
+    const std::size_t pn_offset = pkt.size();
+    const uint64_t pn = client->next_pn[app]++;
+    for (std::size_t k = 0; k < pn_len; ++k) {
+        pkt.push_back(static_cast<uint8_t>((pn >> (8 * (pn_len - 1 - k))) & 0xFF));
+    }
+    const std::size_t payload_off = pkt.size();
+    pkt.insert(pkt.end(), payload.begin(), payload.end());
+    std::vector<uint8_t> aad(pkt.begin(), pkt.begin() + payload_off);
+    std::vector<uint8_t> plain(pkt.begin() + payload_off, pkt.end());
+    auto nonce = make_aead_nonce({keys.iv.data(), keys.iv.size()}, pn);
+    std::vector<uint8_t> sealed;
+    ASSERT_TRUE(aead_seal(a, {keys.key.data(), keys.key.size()}, {nonce.data(), nonce.size()},
+                          {aad.data(), aad.size()}, {plain.data(), plain.size()}, sealed));
+    pkt.resize(payload_off);
+    pkt.insert(pkt.end(), sealed.begin(), sealed.end());
+    auto mask = header_protection_mask(
+        a, {keys.hp.data(), keys.hp.size()}, {pkt.data() + pn_offset + 4, kSampleLen});
+    pkt[0] ^= mask[0] & 0x1F;
+    for (std::size_t k = 0; k < pn_len; ++k) {
+        pkt[pn_offset + k] ^= mask[1 + k];
+    }
+
+    server.on_datagram({pkt.data(), pkt.size()});
+    server.on_timer();
+    ASSERT_FALSE(server_outbox.empty()) << "server did not respond to PATH_CHALLENGE";
+
+    // Decrypt the server's 1-RTT response and look for the matching
+    // PATH_RESPONSE.  Reuse client_receive's short-header decryption.
+    bool found_response = false;
+    while (!server_outbox.empty()) {
+        auto dg = std::move(server_outbox.front());
+        server_outbox.pop_front();
+        if (dg.empty() || (dg[0] & 0x80U) != 0) continue;
+        const std::size_t hdr_pn_offset = 1 + client->scid.size();
+        if (hdr_pn_offset + 4 + kSampleLen > dg.size()) continue;
+        auto rmask = header_protection_mask(
+            client->aead[app],
+            {client->recv_keys[app].hp.data(), client->recv_keys[app].hp.size()},
+            {dg.data() + hdr_pn_offset + 4, kSampleLen});
+        dg[0] ^= rmask[0] & 0x1F;
+        const std::size_t rpn_len = (dg[0] & 0x03U) + 1;
+        for (std::size_t k = 0; k < rpn_len; ++k) {
+            dg[hdr_pn_offset + k] ^= rmask[1 + k];
+        }
+        uint64_t trunc = 0;
+        for (std::size_t k = 0; k < rpn_len; ++k) {
+            trunc = (trunc << 8) | dg[hdr_pn_offset + k];
+        }
+        uint64_t rpn = decode_packet_number(
+            client->any_recv[app] ? client->largest_recv_pn[app] : 0, trunc, rpn_len * 8);
+        const std::size_t header_len = hdr_pn_offset + rpn_len;
+        std::span<const uint8_t> ad{dg.data(), header_len};
+        std::span<const uint8_t> ct{dg.data() + header_len, dg.size() - header_len};
+        auto rnonce = make_aead_nonce(
+            {client->recv_keys[app].iv.data(), client->recv_keys[app].iv.size()}, rpn);
+        std::vector<uint8_t> rplain;
+        if (!aead_open(client->aead[app],
+                       {client->recv_keys[app].key.data(), client->recv_keys[app].key.size()},
+                       {rnonce.data(), rnonce.size()}, ad, ct, rplain)) {
+            continue;
+        }
+        std::vector<Frame> frames;
+        if (!parse_frames({rplain.data(), rplain.size()}, frames)) continue;
+        for (auto& f : frames) {
+            if (auto* pr = std::get_if<PathResponseFrame>(&f); pr != nullptr) {
+                if (pr->data == challenge_data) {
+                    found_response = true;
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(found_response)
+        << "server's 1-RTT reply did not carry PATH_RESPONSE with matching data";
+}
+
 // RFC 9000 §10.1 — idle timeout flips the connection to Draining
 // without sending CONNECTION_CLOSE.
 TEST(QuicConnection, IdleTimeoutFlipsToDraining) {
@@ -768,4 +940,157 @@ TEST(QuicConnection, IdleTimeoutFlipsToDraining) {
     EXPECT_EQ(server.state(), Connection::State::Draining);
     // RFC 9000 §10.1: silent close — no CONNECTION_CLOSE on the wire.
     EXPECT_TRUE(server_outbox.empty());
+}
+
+// RFC 9000 §9 — limited connection-migration support: the Listener
+// freezes the per-connection routing address once the handshake
+// completes.  A forged short-header datagram arriving from a spoofed
+// source MUST NOT redirect our outbound traffic.  This is the
+// security fix for the open hole called out in docs/quic-security.md.
+TEST(QuicListener, FreezesPathPostHandshake) {
+    auto [cert, key] = make_self_signed_p256();
+    TlsServerConfig tcfg{cert, key, {"h3"}};
+    auto tls_ctx = TlsContext::make_server(tcfg);
+    ASSERT_NE(tls_ctx, nullptr);
+
+    Listener::Config cfg;
+    cfg.tls_ctx = tls_ctx;
+    cfg.server_tp.initial_max_data = 1 << 20;
+    cfg.server_tp.initial_max_stream_data_bidi_remote = 1 << 16;
+    cfg.server_tp.initial_max_stream_data_bidi_local = 1 << 16;
+    cfg.server_tp.initial_max_streams_bidi = 16;
+    cfg.server_tp.initial_max_streams_uni = 3;
+    cfg.random_seed = 0xC0FFEEULL;
+    cfg.server_cid_length = 4;
+
+    // Track every datagram + the peer it was routed to.
+    std::deque<std::pair<PeerAddr, std::vector<uint8_t>>> listener_outbox;
+    Listener listener(cfg,
+                      [&](const PeerAddr& p, std::span<const uint8_t> dg) {
+                          listener_outbox.emplace_back(p, std::vector<uint8_t>(dg.begin(), dg.end()));
+                      });
+
+    // Legitimate peer at 10.0.0.1:5555.
+    PeerAddr legit{};
+    legit.length = sizeof(sockaddr_in);
+    {
+        auto* sin = reinterpret_cast<sockaddr_in*>(&legit.storage);
+        sin->sin_family = AF_INET;
+        sin->sin_port = htons(5555);
+        const uint8_t bytes[4] = {10, 0, 0, 1};
+        std::memcpy(&sin->sin_addr, bytes, 4);
+    }
+    // Off-path attacker at 192.0.2.99:31337.
+    PeerAddr attacker{};
+    attacker.length = sizeof(sockaddr_in);
+    {
+        auto* sin = reinterpret_cast<sockaddr_in*>(&attacker.storage);
+        sin->sin_family = AF_INET;
+        sin->sin_port = htons(31337);
+        const uint8_t bytes[4] = {192, 0, 2, 99};
+        std::memcpy(&sin->sin_addr, bytes, 4);
+    }
+
+    std::vector<uint8_t> client_dcid = {0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F, 0xA0, 0xA1};
+    std::vector<uint8_t> client_scid = {0x10, 0x11};
+    auto client = make_client(client_dcid, client_scid);
+
+    // Drive the handshake through the Listener.  The Listener
+    // allocates a server SCID on first Initial; we recover it from
+    // listener_outbox after the first emit so we can later look up
+    // the connection.
+    std::vector<uint8_t> server_scid;
+    for (int round = 0; round < 30; ++round) {
+        int rc = SSL_do_handshake(client->ssl);
+        if (rc != 1) {
+            int err = SSL_get_error(client->ssl, rc);
+            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                FAIL() << "client SSL_do_handshake err=" << err;
+            }
+        }
+        client_emit(*client);
+        while (!client->outbox.empty()) {
+            auto dg = std::move(client->outbox.front());
+            client->outbox.pop_front();
+            listener.on_datagram(legit, {dg.data(), dg.size()});
+        }
+        while (!listener_outbox.empty()) {
+            auto [_peer, dg] = std::move(listener_outbox.front());
+            listener_outbox.pop_front();
+            client_receive(*client, std::move(dg));
+        }
+        if (!client->pending_dgs.empty()) {
+            auto pending = std::move(client->pending_dgs);
+            client->pending_dgs.clear();
+            for (auto& dg : pending) {
+                client_receive(*client, std::move(dg));
+            }
+        }
+        // On round 0 the listener creates the Connection — capture
+        // its server SCID so we can also poke a forged short-header
+        // packet at the right DCID later.
+        if (server_scid.empty() && listener.connection_count() == 1) {
+            listener.for_each_connection([&](const std::vector<uint8_t>& scid, Connection&) {
+                server_scid = scid;
+            });
+        }
+        Connection* conn = nullptr;
+        if (!server_scid.empty()) {
+            conn = listener.find_connection({server_scid.data(), server_scid.size()});
+        }
+        if (conn && conn->state() == Connection::State::Established &&
+            SSL_is_init_finished(client->ssl)) {
+            break;
+        }
+    }
+    ASSERT_FALSE(server_scid.empty());
+    auto* conn = listener.find_connection({server_scid.data(), server_scid.size()});
+    ASSERT_NE(conn, nullptr);
+    ASSERT_TRUE(conn->handshake_complete());
+
+    // The current routing address is the legitimate peer.
+    const PeerAddr* current = listener.peer_for({server_scid.data(), server_scid.size()});
+    ASSERT_NE(current, nullptr);
+    EXPECT_TRUE(peer_addr_equal(*current, legit));
+
+    // Forged short-header datagram from the attacker's address,
+    // carrying our server SCID as DCID (so it routes to the right
+    // Connection).  The bytes after the DCID are random noise —
+    // header protection won't unmask correctly so decryption will
+    // fail, but that's fine; the Listener's path-freeze decision is
+    // made before decrypt.
+    std::vector<uint8_t> forged;
+    forged.push_back(0x43); // short header, 4-byte PN length marker
+    forged.insert(forged.end(), server_scid.begin(), server_scid.end());
+    for (int i = 0; i < 64; ++i) forged.push_back(static_cast<uint8_t>(i ^ 0xA5));
+    listener.on_datagram(attacker, {forged.data(), forged.size()});
+
+    current = listener.peer_for({server_scid.data(), server_scid.size()});
+    ASSERT_NE(current, nullptr);
+    EXPECT_TRUE(peer_addr_equal(*current, legit))
+        << "forged short-header datagram from attacker addr redirected last_peer";
+    EXPECT_FALSE(peer_addr_equal(*current, attacker));
+
+    // Same check for a forged long-header (Initial) datagram from the
+    // attacker.  Post-handshake there's no legitimate reason for a
+    // peer to send an Initial; the freeze still applies.
+    std::vector<uint8_t> forged_long;
+    forged_long.push_back(static_cast<uint8_t>(0x80 | 0x40 |
+                                               (static_cast<uint8_t>(LongType::Initial) << 4)));
+    forged_long.push_back(0x00);
+    forged_long.push_back(0x00);
+    forged_long.push_back(0x00);
+    forged_long.push_back(0x01);
+    forged_long.push_back(static_cast<uint8_t>(server_scid.size()));
+    forged_long.insert(forged_long.end(), server_scid.begin(), server_scid.end());
+    forged_long.push_back(0x00); // empty SCID
+    VarInt::append(forged_long, 0);    // token length
+    VarInt::append(forged_long, 32);   // payload length
+    for (int i = 0; i < 32; ++i) forged_long.push_back(static_cast<uint8_t>(i ^ 0x5A));
+    listener.on_datagram(attacker, {forged_long.data(), forged_long.size()});
+
+    current = listener.peer_for({server_scid.data(), server_scid.size()});
+    ASSERT_NE(current, nullptr);
+    EXPECT_TRUE(peer_addr_equal(*current, legit))
+        << "forged Initial from attacker addr redirected last_peer";
 }

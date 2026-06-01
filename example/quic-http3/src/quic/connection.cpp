@@ -327,9 +327,21 @@ auto Connection::deliver_frames(EncryptionLevel level, std::span<const uint8_t> 
                     on_ack_frame(level, x);
                 } else if constexpr (std::is_same_v<T, ConnectionCloseFrame>) {
                     state_ = State::Draining;
+                } else if constexpr (std::is_same_v<T, PathChallengeFrame>) {
+                    // RFC 9000 §8.2.2: echo the 8-byte data verbatim in
+                    // a PATH_RESPONSE.  PATH_CHALLENGE outside the
+                    // 1-RTT space is invalid per §12.5 (frame is only
+                    // permitted in 1-RTT) but we tolerate-and-respond
+                    // rather than tearing the connection down on the
+                    // off-chance of a misbehaving peer.
+                    if (level == EncryptionLevel::Application) {
+                        pending_path_responses_.push_back(x.data);
+                    }
                 }
-                // PADDING, PING, HANDSHAKE_DONE, MAX_*, etc. — no-op for
-                // this minimal first pass.
+                // PADDING, PING, HANDSHAKE_DONE, MAX_*, PATH_RESPONSE,
+                // RETIRE_CONNECTION_ID, etc. — no-op for this minimal
+                // first pass.  We don't initiate connection migration
+                // ourselves, so PATH_RESPONSE has nothing to match.
             },
             f);
     }
@@ -649,7 +661,8 @@ namespace {
 // Build the inside-protection plaintext payload for an outgoing packet.
 auto build_payload(std::span<const CryptoFrame> crypto_frames,
                    std::span<const StreamFrame> stream_frames, bool include_ack,
-                   const AckFrame& ack, bool include_hs_done, bool pad_to,
+                   const AckFrame& ack, bool include_hs_done,
+                   std::span<const std::array<uint8_t, 8>> path_responses, bool pad_to,
                    std::vector<uint8_t>& out) -> void {
     out.clear();
     if (include_ack) {
@@ -660,6 +673,11 @@ auto build_payload(std::span<const CryptoFrame> crypto_frames,
     }
     for (const auto& sf : stream_frames) {
         encode_frame(out, Frame{sf});
+    }
+    for (const auto& pr : path_responses) {
+        PathResponseFrame f;
+        f.data = pr;
+        encode_frame(out, Frame{f});
     }
     if (include_hs_done) {
         encode_frame(out, Frame{HandshakeDoneFrame{}});
@@ -844,14 +862,27 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
                             tls_.state() == TlsConnection::State::Established &&
                             !sent_handshake_done_);
 
-    if (crypto_pending.empty() && stream_pending.empty() && !include_ack && !include_hs_done) {
+    // 5. PATH_RESPONSE — RFC 9000 §8.2.  Only valid in 1-RTT; we
+    // accumulate them when the peer sends PATH_CHALLENGE and flush
+    // them here in one go.  Drain into a local vector so the
+    // SentRecord can take ownership (a retransmit will be redundant —
+    // a fresh peer challenge would be a new probe — so we don't
+    // re-queue path responses on loss).
+    std::vector<std::array<uint8_t, 8>> path_responses;
+    if (level == EncryptionLevel::Application) {
+        path_responses.swap(pending_path_responses_);
+    }
+
+    if (crypto_pending.empty() && stream_pending.empty() && !include_ack &&
+        !include_hs_done && path_responses.empty()) {
         return false;
     }
 
     std::vector<uint8_t> payload;
     build_payload({crypto_pending.data(), crypto_pending.size()},
                   {stream_pending.data(), stream_pending.size()}, include_ack, ack,
-                  include_hs_done, false, payload);
+                  include_hs_done, {path_responses.data(), path_responses.size()}, false,
+                  payload);
 
     const uint64_t pn = sp.next_send_pn++;
     // Initial path keeps the original `build_initial_packet` helper
@@ -866,6 +897,8 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
         // Track + send.
         SentRecord rec;
         rec.level = level;
+        // PATH_RESPONSE doesn't flow at Initial level, so the
+        // path_responses vector is always empty here.
         rec.ack_eliciting =
             !crypto_pending.empty() || !stream_pending.empty() || include_hs_done;
         rec.bytes = datagram.size();
@@ -952,7 +985,12 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
     // Handshake datagram from the scratch buffer.
     SentRecord rec;
     rec.level = level;
-    rec.ack_eliciting = !crypto_pending.empty() || !stream_pending.empty() || include_hs_done;
+    // RFC 9000 §13.2.1: a packet is ack-eliciting if it carries any
+    // frame other than ACK / PADDING / CONNECTION_CLOSE.  PATH_RESPONSE
+    // counts; we don't retransmit it on loss (the peer will re-probe
+    // if it cares).
+    rec.ack_eliciting = !crypto_pending.empty() || !stream_pending.empty() ||
+                        include_hs_done || !path_responses.empty();
     rec.bytes = buf.size();
     rec.sent_at = clock_fn_();
     rec.crypto = std::move(crypto_pending);

@@ -220,11 +220,14 @@ the full list.
   `Connection::on_timer` doesn't act on it. **Loss recovery does
   not work.** Loopback tests pass because there's no loss; on a real
   network, expect protocol stalls.
-- **No connection migration.** The Listener happily updates the
-  per-connection peer address on every datagram, which technically
-  violates RFC 9000 §9 (server MUST validate the new path via
-  PATH_CHALLENGE / PATH_RESPONSE before sending non-probing data
-  there).
+- **Connection migration is limited.** The Listener freezes the
+  per-connection peer address once the handshake completes; forged
+  short-header datagrams from spoofed sources can no longer redirect
+  our responses. Inbound `PATH_CHALLENGE` is echoed back as
+  `PATH_RESPONSE` on the validated path. We do not validate or
+  migrate to alternate paths ourselves, so legitimate NAT rebinding
+  after the handshake will strand the connection until the idle
+  timeout fires. See [`quic-security.md`](quic-security.md#connection-migration-rfc-9000-9--limited).
 - **No CONNECTION_CLOSE emission on protocol errors.** We parse
   incoming CONNECTION_CLOSE; we don't send one when our own parser
   hits a protocol error — we just `Closing` silently.

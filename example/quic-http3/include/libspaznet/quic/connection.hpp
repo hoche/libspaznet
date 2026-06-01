@@ -254,6 +254,18 @@ class Connection {
     // (the lesser of our and the peer's max_idle_timeout_ms).
     auto check_idle_timeout() -> void;
 
+    // RFC 9000 §8.2: handle an inbound PATH_CHALLENGE by queuing a
+    // matching PATH_RESPONSE for the next 1-RTT send.  We respond on
+    // the existing (validated) path — the Listener freezes the peer
+    // address post-handshake, so PATH_CHALLENGE arriving from a forged
+    // off-path source still gets its response routed to the legitimate
+    // peer.  That's RFC-conformant: §8.2.2 says PATH_RESPONSE goes on
+    // the path PATH_CHALLENGE arrived on, but we don't currently
+    // support multiple paths, so all responses go on the one path we
+    // know.  Cheap liveness probes from the real peer continue to
+    // work; forged challenges from off-path attackers waste 30-ish
+    // bytes on the legitimate path.
+
     // ---- Members --------------------------------------------------------
     Role role_{Role::Server};
     State state_{State::Handshaking};
@@ -297,6 +309,10 @@ class Connection {
     // initiate_close, drained by build_and_send (emits in a single
     // packet, then leaves state_ in Closing with no more sends).
     std::optional<ConnectionCloseFrame> pending_close_{};
+
+    // RFC 9000 §8.2.2 — PATH_RESPONSE frames we owe in reply to
+    // inbound PATH_CHALLENGE.  Drained into the next 1-RTT packet.
+    std::vector<std::array<uint8_t, 8>> pending_path_responses_{};
 
     // RFC 9000 §8.1.2 anti-amplification bookkeeping.  Until the peer's
     // address is validated (either by a Retry token round-trip handled

@@ -164,18 +164,32 @@ peer's send rate. For typical request/response workloads this is
 not a near-term issue, but a sustained 1-Gbps connection at 1200-byte
 datagrams hits the limit in ~80 seconds.
 
-### Connection migration (RFC 9000 §9)
+### Connection migration (RFC 9000 §9) — limited
 
-`Listener::on_datagram` updates the per-connection `last_peer` to
-whatever address the most recent datagram came from. There's no
-PATH_CHALLENGE / PATH_RESPONSE before we send non-probing data to a
-new path. An attacker who can inject a single forged datagram from a
-spoofed address can redirect our response traffic.
+`Listener::on_datagram` freezes `last_peer` once
+`Connection::handshake_complete()` returns true. From the moment the
+handshake finishes, every outbound datagram for that connection is
+routed to the address the legitimate peer used to complete the
+handshake; subsequent datagrams from any other address are still
+delivered to the engine for processing, but they cannot redirect our
+response traffic. This closes the off-path-injection redirection
+hole.
 
-**Mitigation today**: don't expose the server on networks where
-attackers can inject from arbitrary source addresses. For an internal
-service that's typical; for a public-internet-facing service, this
-is an open hole.
+In-bound `PATH_CHALLENGE` is honored: the engine echoes a
+`PATH_RESPONSE` carrying the same 8-byte data in a 1-RTT packet on
+the validated path, so peers using `PATH_CHALLENGE` for liveness or
+PMTU probes continue to work.
+
+We do **not** initiate path validation for candidate paths
+(`PATH_CHALLENGE` from us to a new peer address), and we do not
+migrate the validated path even after a successful round-trip on a
+new one. A legitimate peer whose NAT rebinds mid-connection (e.g. a
+mobile client changing networks) will see its responses keep flowing
+to the old address until the idle timeout closes the connection;
+that client must re-handshake.
+
+**Tests**: `QuicConnection.RespondsToPathChallenge`,
+`QuicListener.FreezesPathPostHandshake`.
 
 ### 0-RTT
 

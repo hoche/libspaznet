@@ -106,6 +106,13 @@ class Listener {
     // Test hook: look up a connection by its server-chosen SCID.
     [[nodiscard]] auto find_connection(std::span<const uint8_t> scid) -> Connection*;
 
+    // Test hook: look up the current routing address for a connection.
+    // Returns nullptr if the SCID is unknown.  Mirrors the address the
+    // listener will hand to its SendFn on the next outgoing datagram
+    // for this connection (the "validated path" semantics from RFC
+    // 9000 §9 — post-handshake this stops being updated on receive).
+    [[nodiscard]] auto peer_for(std::span<const uint8_t> scid) -> const PeerAddr*;
+
     // Iterate every (scid, Connection) the listener currently owns. The
     // callback receives the server-chosen SCID as a const ref to the
     // exact key stored in the map.

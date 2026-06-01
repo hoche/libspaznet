@@ -246,11 +246,16 @@ Ordered by priority.
     2^23 packets at AES-128-GCM. A long-lived 1-RTT connection without
     key update is a MUST violation.
 
-- [ ] Connection migration / path validation past first datagram
-  - Today `Listener::on_datagram` updates `state.last_peer = peer`
-    on every received datagram and the response goes wherever the
-    most recent inbound came from. RFC 9000 §9 requires PATH_CHALLENGE
-    / PATH_RESPONSE on a new path before sending non-probing data.
+- [x] Connection migration / path validation, partial — landed 2026-05-31.
+  `Listener::on_datagram` now freezes `state.last_peer` once
+  `conn->handshake_complete()` returns true, so a forged short-header
+  datagram from a spoofed source can't redirect our outbound traffic.
+  Inbound `PATH_CHALLENGE` is echoed as `PATH_RESPONSE` on the
+  validated path. We do not initiate path validation toward
+  alternate paths ourselves; legitimate NAT rebinding mid-connection
+  is unsupported and the peer must re-handshake. Tests:
+  `QuicConnection.RespondsToPathChallenge`,
+  `QuicListener.FreezesPathPostHandshake`.
 
 - [x] PTO retransmission — landed 2026-05-31.
   `Connection::on_timer` now calls `check_pto()`, ACK

@@ -401,7 +401,21 @@ auto Listener::on_datagram(const PeerAddr& peer, std::span<const uint8_t> dg) ->
             raw->on_timer();
             return;
         }
-        it->second.last_peer = peer;
+        // RFC 9000 §9 (connection migration) — limited support: we
+        // don't run PATH_CHALLENGE / PATH_RESPONSE probes on candidate
+        // paths.  An attacker who can inject a forged datagram from a
+        // spoofed source could otherwise redirect our response traffic
+        // to that address.  We close the hole by freezing the routing
+        // address once the connection's handshake completes: from then
+        // on, all replies keep flowing to the path the client used to
+        // finish the handshake, regardless of where subsequent
+        // datagrams *appear* to come from.  Pre-handshake, the path is
+        // still permitted to drift because legitimate NAT rebinding
+        // during connection setup is unblockable; anti-amplification
+        // (§8.1.2) limits the damage.
+        if (!it->second.conn->handshake_complete()) {
+            it->second.last_peer = peer;
+        }
         it->second.conn->on_datagram(dg);
         it->second.conn->on_timer();
         return;
@@ -415,7 +429,15 @@ auto Listener::on_datagram(const PeerAddr& peer, std::span<const uint8_t> dg) ->
     if (it == connections_.end()) {
         return; // unknown SCID → drop
     }
-    it->second.last_peer = peer;
+    // Short-header packets only fly post-handshake, so the
+    // freeze-after-handshake rule above applies in full here: never
+    // update last_peer on the strength of a short-header datagram
+    // alone.  A peer that's legitimately migrated would need
+    // PATH_CHALLENGE / PATH_RESPONSE support, which we don't
+    // implement.
+    if (!it->second.conn->handshake_complete()) {
+        it->second.last_peer = peer;
+    }
     it->second.conn->on_datagram(dg);
     it->second.conn->on_timer();
 }
@@ -429,6 +451,11 @@ auto Listener::on_timer() -> void {
 auto Listener::find_connection(std::span<const uint8_t> scid) -> Connection* {
     auto it = connections_.find(std::vector<uint8_t>(scid.begin(), scid.end()));
     return it == connections_.end() ? nullptr : it->second.conn.get();
+}
+
+auto Listener::peer_for(std::span<const uint8_t> scid) -> const PeerAddr* {
+    auto it = connections_.find(std::vector<uint8_t>(scid.begin(), scid.end()));
+    return it == connections_.end() ? nullptr : &it->second.last_peer;
 }
 
 } // namespace quic
