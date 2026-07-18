@@ -167,7 +167,11 @@ auto read_string(std::span<const uint8_t> buf, std::size_t& off, int n, std::str
     const bool huff = (buf[off] & (1U << n)) != 0;
     uint64_t len = 0;
     if (!read_int(buf, off, n, len)) return false;
-    if (off + len > buf.size()) return false;
+    // Overflow-safe bounds check: `off + len` can wrap past 2^64 for an
+    // attacker-chosen `len` (read_int is not varint-capped), which would
+    // bypass a naive `off + len > buf.size()` guard and let the span below
+    // over-read the heap. `off <= buf.size()` is guaranteed by read_int.
+    if (len > buf.size() - off) return false;
     std::span<const uint8_t> raw{buf.data() + off, static_cast<std::size_t>(len)};
     off += static_cast<std::size_t>(len);
     if (huff) {
