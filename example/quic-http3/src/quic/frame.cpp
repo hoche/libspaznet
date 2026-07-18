@@ -72,7 +72,17 @@ auto parse_frame(std::span<const uint8_t> buf, std::size_t& offset, Frame& out) 
             offset = start;
             return false;
         }
-        f.ranges.reserve(ack_range_count);
+        // `ack_range_count` is an attacker-controlled varint (up to 2^62-1).
+        // Reserving on it directly would attempt a multi-terabyte allocation
+        // and throw bad_alloc/length_error (a remote crash). Each range needs
+        // at least two bytes (gap + length varints, one byte minimum each),
+        // so a count larger than half the remaining buffer cannot be
+        // satisfied — reject it before reserving.
+        if (ack_range_count > (buf.size() - offset) / 2) {
+            offset = start;
+            return false;
+        }
+        f.ranges.reserve(static_cast<std::size_t>(ack_range_count));
         for (uint64_t i = 0; i < ack_range_count; ++i) {
             AckRange r;
             if (!read_varint(buf, offset, r.gap) || !read_varint(buf, offset, r.length)) {
