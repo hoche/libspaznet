@@ -384,6 +384,14 @@ auto serve_websocket(::spaznet::Socket socket, Handler& handler,
                     co_await fail_close(1002);
                     break;
                 }
+                // Bound the reassembled message. Frame::kMaxPayloadBytes only
+                // caps a single frame; without this a peer can stream
+                // unlimited fin=0 continuation frames and grow message_buffer
+                // without limit (remote OOM). 1009 = Message Too Big.
+                if (message_buffer.size() + payload.size() > Frame::kMaxPayloadBytes) {
+                    co_await fail_close(1009);
+                    break;
+                }
                 message_buffer.insert(message_buffer.end(), payload.begin(), payload.end());
             }
             if (fin) {
