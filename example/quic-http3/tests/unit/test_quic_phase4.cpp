@@ -159,6 +159,33 @@ TEST(QuicStream, SendPullsBytesRespectingFlowControl) {
     EXPECT_TRUE(fin);
 }
 
+TEST(QuicStream, SendRespectsConnectionLevelFreshBudget) {
+    // Per-stream window is wide open; the connection-level budget
+    // (max_fresh) is what limits fresh bytes here.
+    Stream s(0, 1000, /*send_limit=*/1000);
+    s.write({1, 2, 3, 4, 5, 6, 7, 8}, false);
+    uint64_t off = 0;
+    std::vector<uint8_t> data;
+    bool fin = false;
+    // Only 3 fresh bytes allowed by the connection budget.
+    EXPECT_EQ(s.pull_send(100, off, data, fin, /*max_fresh=*/3), 3U);
+    EXPECT_EQ(off, 0U);
+    EXPECT_EQ(data, (std::vector<uint8_t>{1, 2, 3}));
+    EXPECT_EQ(s.send_next_offset(), 3U);
+    // Budget exhausted: no fresh bytes come out.
+    EXPECT_EQ(s.pull_send(100, off, data, fin, /*max_fresh=*/0), 0U);
+    // Budget reopens; the rest flows.
+    EXPECT_EQ(s.pull_send(100, off, data, fin, /*max_fresh=*/100), 5U);
+    EXPECT_EQ(off, 3U);
+    EXPECT_EQ(data, (std::vector<uint8_t>{4, 5, 6, 7, 8}));
+
+    // Retransmissions ignore the connection budget entirely.
+    s.on_lost(0, 3);
+    EXPECT_EQ(s.pull_send(100, off, data, fin, /*max_fresh=*/0), 3U);
+    EXPECT_EQ(off, 0U);
+    EXPECT_EQ(data, (std::vector<uint8_t>{1, 2, 3}));
+}
+
 TEST(QuicStream, AckAdvancesSendStateToDataRecvd) {
     Stream s(0, 1000, 100);
     s.write({1, 2, 3}, true);

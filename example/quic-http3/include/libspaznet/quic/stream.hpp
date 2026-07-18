@@ -102,6 +102,12 @@ class Stream {
     [[nodiscard]] auto recv_high_water() const -> uint64_t {
         return recv_high_water_;
     }
+    // Absolute offset up to which the application has consumed bytes.
+    // The connection sums this across streams to drive connection-level
+    // MAX_DATA window updates regardless of which read path was used.
+    [[nodiscard]] auto recv_read_offset() const -> uint64_t {
+        return recv_read_offset_;
+    }
 
     // Reset (peer sent RESET_STREAM). Returns false on protocol error.
     [[nodiscard]] auto reset_recvd(uint64_t final_size, uint64_t app_error) -> bool;
@@ -114,8 +120,14 @@ class Stream {
     auto write(const std::vector<uint8_t>& bytes, bool fin) -> void;
 
     // Pull bytes ready to send. Returns 0 if nothing to send.
+    // `max_fresh` caps how many *new* (never-before-sent) bytes may be
+    // emitted; retransmissions ignore it. The connection uses this to
+    // enforce the connection-level send data limit (RFC 9000 §4.1)
+    // across all streams. The default leaves the stream governed only
+    // by its own per-stream flow-control window.
     auto pull_send(std::size_t max_bytes, uint64_t& offset_out,
-                   std::vector<uint8_t>& data_out, bool& fin_out) -> std::size_t;
+                   std::vector<uint8_t>& data_out, bool& fin_out,
+                   uint64_t max_fresh = UINT64_MAX) -> std::size_t;
 
     auto on_acked(uint64_t offset, std::size_t length) -> void;
     auto on_lost(uint64_t offset, std::size_t length) -> void;
@@ -127,6 +139,12 @@ class Stream {
     }
     [[nodiscard]] auto send_high_water() const -> uint64_t {
         return send_high_water_;
+    }
+    // Highest fresh offset handed to the wire so far (advances only on
+    // fresh sends, not retransmits). The connection sums this across
+    // streams to track connection-level send flow control.
+    [[nodiscard]] auto send_next_offset() const -> uint64_t {
+        return send_next_offset_;
     }
     [[nodiscard]] auto send_buffer_size() const -> std::size_t {
         return send_buf_.size() - send_buf_head_;

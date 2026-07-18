@@ -459,6 +459,134 @@ auto client_receive(QuicTestClient& c, std::vector<uint8_t> dg) -> void {
     }
 }
 
+// ---- Shared scaffolding for the flow-control / stream-limit tests ----
+
+// Run the server<->client exchange until the server reaches Established.
+auto drive_to_established(Connection& server, QuicTestClient& client,
+                          std::deque<std::vector<uint8_t>>& server_outbox,
+                          std::chrono::steady_clock::time_point& clock_now) -> void {
+    for (int round = 0; round < 30; ++round) {
+        int rc = SSL_do_handshake(client.ssl);
+        if (rc != 1) {
+            int err = SSL_get_error(client.ssl, rc);
+            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
+                ADD_FAILURE() << "client SSL_do_handshake err=" << err;
+                return;
+            }
+        }
+        client_emit(client);
+        while (!client.outbox.empty()) {
+            auto dg = std::move(client.outbox.front());
+            client.outbox.pop_front();
+            server.on_datagram({dg.data(), dg.size()});
+        }
+        clock_now += std::chrono::milliseconds(1);
+        server.on_timer();
+        while (!server_outbox.empty()) {
+            auto dg = std::move(server_outbox.front());
+            server_outbox.pop_front();
+            client_receive(client, std::move(dg));
+        }
+        if (!client.pending_dgs.empty()) {
+            auto pending = std::move(client.pending_dgs);
+            client.pending_dgs.clear();
+            for (auto& dg : pending) {
+                client_receive(client, std::move(dg));
+            }
+        }
+        if (server.state() == Connection::State::Established) break;
+    }
+}
+
+// Seal `payload` (already-encoded frame bytes) into a 1-RTT short-header
+// packet from the client and feed it to the server.  Caller must have
+// pointed client.dcid at the server's SCID first.
+auto client_inject_1rtt(QuicTestClient& client, Connection& server,
+                        const std::vector<uint8_t>& payload) -> void {
+    const auto app = static_cast<std::size_t>(EncryptionLevel::Application);
+    auto& keys = client.send_keys[app];
+    const Aead a = client.aead[app];
+    const std::size_t pn_len = 4;
+    std::vector<uint8_t> pkt;
+    pkt.push_back(static_cast<uint8_t>(0x40 | (pn_len - 1)));
+    pkt.insert(pkt.end(), client.dcid.begin(), client.dcid.end());
+    const std::size_t pn_offset = pkt.size();
+    const uint64_t pn = client.next_pn[app]++;
+    for (std::size_t k = 0; k < pn_len; ++k) {
+        pkt.push_back(static_cast<uint8_t>((pn >> (8 * (pn_len - 1 - k))) & 0xFF));
+    }
+    const std::size_t payload_off = pkt.size();
+    pkt.insert(pkt.end(), payload.begin(), payload.end());
+    std::vector<uint8_t> aad(pkt.begin(), pkt.begin() + payload_off);
+    std::vector<uint8_t> plain(pkt.begin() + payload_off, pkt.end());
+    auto nonce = make_aead_nonce({keys.iv.data(), keys.iv.size()}, pn);
+    std::vector<uint8_t> sealed;
+    if (!aead_seal(a, {keys.key.data(), keys.key.size()}, {nonce.data(), nonce.size()},
+                   {aad.data(), aad.size()}, {plain.data(), plain.size()}, sealed)) {
+        ADD_FAILURE() << "client failed to seal 1-RTT packet";
+        return;
+    }
+    pkt.resize(payload_off);
+    pkt.insert(pkt.end(), sealed.begin(), sealed.end());
+    auto mask = header_protection_mask(a, {keys.hp.data(), keys.hp.size()},
+                                       {pkt.data() + pn_offset + 4, kSampleLen});
+    pkt[0] ^= mask[0] & 0x1F;
+    for (std::size_t k = 0; k < pn_len; ++k) {
+        pkt[pn_offset + k] ^= mask[1 + k];
+    }
+    server.on_datagram({pkt.data(), pkt.size()});
+}
+
+// Decrypt every server 1-RTT datagram in `server_outbox` and return all
+// frames they carry.
+auto collect_server_1rtt_frames(QuicTestClient& client,
+                                std::deque<std::vector<uint8_t>>& server_outbox)
+    -> std::vector<Frame> {
+    const auto app = static_cast<std::size_t>(EncryptionLevel::Application);
+    std::vector<Frame> all;
+    while (!server_outbox.empty()) {
+        auto dg = std::move(server_outbox.front());
+        server_outbox.pop_front();
+        if (dg.empty() || (dg[0] & 0x80U) != 0) continue;
+        const std::size_t hdr_pn_offset = 1 + client.scid.size();
+        if (hdr_pn_offset + 4 + kSampleLen > dg.size()) continue;
+        auto rmask = header_protection_mask(
+            client.aead[app],
+            {client.recv_keys[app].hp.data(), client.recv_keys[app].hp.size()},
+            {dg.data() + hdr_pn_offset + 4, kSampleLen});
+        dg[0] ^= rmask[0] & 0x1F;
+        const std::size_t rpn_len = (dg[0] & 0x03U) + 1;
+        for (std::size_t k = 0; k < rpn_len; ++k) {
+            dg[hdr_pn_offset + k] ^= rmask[1 + k];
+        }
+        uint64_t trunc = 0;
+        for (std::size_t k = 0; k < rpn_len; ++k) {
+            trunc = (trunc << 8) | dg[hdr_pn_offset + k];
+        }
+        uint64_t rpn = decode_packet_number(
+            client.any_recv[app] ? client.largest_recv_pn[app] : 0, trunc, rpn_len * 8);
+        const std::size_t header_len = hdr_pn_offset + rpn_len;
+        std::span<const uint8_t> ad{dg.data(), header_len};
+        std::span<const uint8_t> ct{dg.data() + header_len, dg.size() - header_len};
+        auto rnonce = make_aead_nonce(
+            {client.recv_keys[app].iv.data(), client.recv_keys[app].iv.size()}, rpn);
+        std::vector<uint8_t> rplain;
+        if (!aead_open(client.aead[app],
+                       {client.recv_keys[app].key.data(), client.recv_keys[app].key.size()},
+                       {rnonce.data(), rnonce.size()}, ad, ct, rplain)) {
+            continue;
+        }
+        client.any_recv[app] = true;
+        client.largest_recv_pn[app] = std::max(client.largest_recv_pn[app], rpn);
+        std::vector<Frame> frames;
+        if (!parse_frames({rplain.data(), rplain.size()}, frames)) continue;
+        for (auto& f : frames) {
+            all.push_back(std::move(f));
+        }
+    }
+    return all;
+}
+
 } // namespace
 
 TEST(QuicConnection, EndToEndHandshakeViaProtectedDatagrams) {
@@ -1384,4 +1512,206 @@ TEST(QuicListener, FreezesPathPostHandshake) {
     ASSERT_NE(current, nullptr);
     EXPECT_TRUE(peer_addr_equal(*current, legit))
         << "forged Initial from attacker addr redirected last_peer";
+}
+
+// RFC 9000 §4.6 — a peer STREAM frame for a stream index beyond the
+// advertised MAX_STREAMS closes the connection with STREAM_LIMIT_ERROR.
+TEST(QuicConnection, RejectsStreamBeyondMaxStreams) {
+    auto [cert, key] = make_self_signed_p256();
+    TlsServerConfig cfg{cert, key, {"h3"}};
+    auto ctx = TlsContext::make_server(cfg);
+    ASSERT_NE(ctx, nullptr);
+
+    std::vector<uint8_t> client_dcid = {0x51, 0x52, 0x53, 0x54};
+    std::vector<uint8_t> client_scid = {0x61, 0x62};
+    std::vector<uint8_t> server_scid = {0x71, 0x72, 0x73, 0x74};
+
+    std::deque<std::vector<uint8_t>> server_outbox;
+    TransportParameters server_tp;
+    server_tp.initial_max_data = 1 << 20;
+    server_tp.initial_max_stream_data_bidi_remote = 1 << 16;
+    server_tp.initial_max_stream_data_bidi_local = 1 << 16;
+    server_tp.initial_max_streams_bidi = 2; // indices 0,1 allowed; 2+ rejected
+    server_tp.initial_max_streams_uni = 3;
+
+    auto clock_now = std::chrono::steady_clock::now();
+    Connection::ClockFn clock_fn = [&]() { return clock_now; };
+    Connection server(ctx, {client_dcid.data(), client_dcid.size()},
+                      {client_scid.data(), client_scid.size()},
+                      {server_scid.data(), server_scid.size()}, server_tp,
+                      [&](std::span<const uint8_t> dg) {
+                          server_outbox.emplace_back(dg.begin(), dg.end());
+                      },
+                      clock_fn);
+
+    auto client = make_client(client_dcid, client_scid);
+    drive_to_established(server, *client, server_outbox, clock_now);
+    ASSERT_EQ(server.state(), Connection::State::Established);
+    server_outbox.clear();
+    client->dcid = server_scid;
+
+    // Stream ID 8 → client-initiated bidi, index 2, which is at the
+    // limit (2) and therefore forbidden.
+    std::vector<uint8_t> payload;
+    {
+        StreamFrame sf;
+        sf.stream_id = 8;
+        sf.offset = 0;
+        sf.has_length = true;
+        sf.fin = false;
+        sf.data = {'h', 'i'};
+        encode_frame(payload, Frame{sf});
+    }
+    client_inject_1rtt(*client, server, payload);
+    EXPECT_NE(server.state(), Connection::State::Established)
+        << "server should have started closing after a stream-limit violation";
+    server.on_timer();
+
+    auto frames = collect_server_1rtt_frames(*client, server_outbox);
+    bool found = false;
+    for (auto& f : frames) {
+        if (auto* cc = std::get_if<ConnectionCloseFrame>(&f); cc != nullptr) {
+            EXPECT_FALSE(cc->application);
+            EXPECT_EQ(cc->error_code, 0x04U); // STREAM_LIMIT_ERROR
+            found = true;
+        }
+    }
+    EXPECT_TRUE(found) << "no CONNECTION_CLOSE(STREAM_LIMIT_ERROR) emitted";
+}
+
+// RFC 9000 §4.1 — STREAM data exceeding the connection-level receive
+// limit closes the connection with FLOW_CONTROL_ERROR.
+TEST(QuicConnection, EnforcesConnectionMaxData) {
+    auto [cert, key] = make_self_signed_p256();
+    TlsServerConfig cfg{cert, key, {"h3"}};
+    auto ctx = TlsContext::make_server(cfg);
+    ASSERT_NE(ctx, nullptr);
+
+    std::vector<uint8_t> client_dcid = {0x81, 0x82, 0x83, 0x84};
+    std::vector<uint8_t> client_scid = {0x91, 0x92};
+    std::vector<uint8_t> server_scid = {0xA1, 0xA2, 0xA3, 0xA4};
+
+    std::deque<std::vector<uint8_t>> server_outbox;
+    TransportParameters server_tp;
+    server_tp.initial_max_data = 10; // tiny connection window
+    server_tp.initial_max_stream_data_bidi_remote = 1 << 16; // per-stream is generous
+    server_tp.initial_max_stream_data_bidi_local = 1 << 16;
+    server_tp.initial_max_streams_bidi = 16;
+    server_tp.initial_max_streams_uni = 3;
+
+    auto clock_now = std::chrono::steady_clock::now();
+    Connection::ClockFn clock_fn = [&]() { return clock_now; };
+    Connection server(ctx, {client_dcid.data(), client_dcid.size()},
+                      {client_scid.data(), client_scid.size()},
+                      {server_scid.data(), server_scid.size()}, server_tp,
+                      [&](std::span<const uint8_t> dg) {
+                          server_outbox.emplace_back(dg.begin(), dg.end());
+                      },
+                      clock_fn);
+
+    auto client = make_client(client_dcid, client_scid);
+    drive_to_established(server, *client, server_outbox, clock_now);
+    ASSERT_EQ(server.state(), Connection::State::Established);
+    server_outbox.clear();
+    client->dcid = server_scid;
+
+    // 20 bytes on stream 0 blows past the 10-byte connection limit even
+    // though the per-stream window (64 KiB) would allow it.
+    std::vector<uint8_t> payload;
+    {
+        StreamFrame sf;
+        sf.stream_id = 0;
+        sf.offset = 0;
+        sf.has_length = true;
+        sf.fin = false;
+        sf.data.assign(20, 0x5A);
+        encode_frame(payload, Frame{sf});
+    }
+    client_inject_1rtt(*client, server, payload);
+    EXPECT_NE(server.state(), Connection::State::Established)
+        << "server should have started closing after a connection flow-control violation";
+    server.on_timer();
+
+    auto frames = collect_server_1rtt_frames(*client, server_outbox);
+    bool found = false;
+    for (auto& f : frames) {
+        if (auto* cc = std::get_if<ConnectionCloseFrame>(&f); cc != nullptr) {
+            EXPECT_FALSE(cc->application);
+            EXPECT_EQ(cc->error_code, 0x03U); // FLOW_CONTROL_ERROR
+            found = true;
+        }
+    }
+    EXPECT_TRUE(found) << "no CONNECTION_CLOSE(FLOW_CONTROL_ERROR) emitted";
+}
+
+// RFC 9000 §4.1 — as the application consumes received bytes, the server
+// advertises a larger connection window via a MAX_DATA frame.
+TEST(QuicConnection, EmitsMaxDataAfterConsume) {
+    auto [cert, key] = make_self_signed_p256();
+    TlsServerConfig cfg{cert, key, {"h3"}};
+    auto ctx = TlsContext::make_server(cfg);
+    ASSERT_NE(ctx, nullptr);
+
+    std::vector<uint8_t> client_dcid = {0xB1, 0xB2, 0xB3, 0xB4};
+    std::vector<uint8_t> client_scid = {0xC1, 0xC2};
+    std::vector<uint8_t> server_scid = {0xD1, 0xD2, 0xD3, 0xD4};
+
+    std::deque<std::vector<uint8_t>> server_outbox;
+    TransportParameters server_tp;
+    constexpr uint64_t kWindow = 100;
+    server_tp.initial_max_data = kWindow;
+    server_tp.initial_max_stream_data_bidi_remote = 1 << 16;
+    server_tp.initial_max_stream_data_bidi_local = 1 << 16;
+    server_tp.initial_max_streams_bidi = 16;
+    server_tp.initial_max_streams_uni = 3;
+
+    auto clock_now = std::chrono::steady_clock::now();
+    Connection::ClockFn clock_fn = [&]() { return clock_now; };
+    Connection server(ctx, {client_dcid.data(), client_dcid.size()},
+                      {client_scid.data(), client_scid.size()},
+                      {server_scid.data(), server_scid.size()}, server_tp,
+                      [&](std::span<const uint8_t> dg) {
+                          server_outbox.emplace_back(dg.begin(), dg.end());
+                      },
+                      clock_fn);
+
+    auto client = make_client(client_dcid, client_scid);
+    drive_to_established(server, *client, server_outbox, clock_now);
+    ASSERT_EQ(server.state(), Connection::State::Established);
+    server_outbox.clear();
+    client->dcid = server_scid;
+
+    // Deliver 60 bytes (within the 100-byte window) on stream 0.
+    constexpr uint64_t kBytes = 60;
+    std::vector<uint8_t> payload;
+    {
+        StreamFrame sf;
+        sf.stream_id = 0;
+        sf.offset = 0;
+        sf.has_length = true;
+        sf.fin = false;
+        sf.data.assign(kBytes, 0x7E);
+        encode_frame(payload, Frame{sf});
+    }
+    client_inject_1rtt(*client, server, payload);
+    ASSERT_EQ(server.state(), Connection::State::Established);
+
+    // Consume the bytes; remaining window (40) drops below half (50) so
+    // the server should extend to consumed + window == 160.
+    std::vector<uint8_t> out;
+    bool fin = false;
+    const std::size_t n = server.read_stream(0, out, fin);
+    ASSERT_EQ(n, kBytes);
+    server_outbox.clear();
+    server.on_timer();
+
+    auto frames = collect_server_1rtt_frames(*client, server_outbox);
+    bool found = false;
+    for (auto& f : frames) {
+        if (auto* md = std::get_if<MaxDataFrame>(&f); md != nullptr) {
+            EXPECT_EQ(md->maximum, kBytes + kWindow);
+            found = true;
+        }
+    }
+    EXPECT_TRUE(found) << "server did not emit MAX_DATA after the application consumed data";
 }

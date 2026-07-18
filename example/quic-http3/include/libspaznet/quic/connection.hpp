@@ -248,6 +248,7 @@ class Connection {
     auto deliver_frames(EncryptionLevel level, std::span<const uint8_t> payload) -> void;
     auto on_crypto_frame(EncryptionLevel level, const CryptoFrame& f) -> void;
     auto on_stream_frame(const StreamFrame& f) -> void;
+    auto on_reset_stream_frame(const ResetStreamFrame& f) -> void;
     auto on_ack_frame(EncryptionLevel level, const AckFrame& f) -> void;
 
     auto build_and_send(EncryptionLevel level) -> bool;
@@ -257,6 +258,29 @@ class Connection {
 
     // Get-or-create stream.
     auto ensure_stream(uint64_t stream_id) -> Stream*;
+
+    // Non-creating stream lookup (unlike ensure_stream, returns nullptr
+    // for unknown IDs instead of allocating). Used on the ack/loss path
+    // so a late ACK can never resurrect a stream we've already retired.
+    auto find_stream(uint64_t stream_id) -> Stream*;
+
+    // RFC 9000 §4.6 — verify a peer-initiated stream ID is within the
+    // MAX_STREAMS limit we advertised. On violation, closes the
+    // connection with STREAM_LIMIT_ERROR and returns false.
+    auto enforce_stream_limit(uint64_t stream_id) -> bool;
+
+    // RFC 9000 §4.1 — recompute how much stream data the application has
+    // consumed (summing every stream's read cursor, including retired
+    // ones) and, when the window has drained, flag a MAX_DATA update.
+    // Recomputing is robust to callers reading straight off the Stream
+    // (as the HTTP/3 layer does) rather than via read_stream.
+    auto refresh_conn_recv_window() -> void;
+    auto extend_conn_recv_window() -> void;
+
+    // Erase streams that are fully closed in both live directions,
+    // crediting MAX_STREAMS for peer-initiated streams so a long-lived
+    // connection isn't permanently capped at the initial stream limit.
+    auto retire_closed_streams() -> void;
 
     // Re-queue the CRYPTO + STREAM frames carried by `rec` for
     // retransmission, and notify congestion control of the loss.
@@ -363,6 +387,44 @@ class Connection {
     bool peer_address_validated_{false};
     uint64_t recv_bytes_total_{0};
     uint64_t sent_bytes_unvalidated_{0};
+
+    // ---- Connection-level flow control (RFC 9000 §4.1) ------------------
+    // Receive side: conn_recv_max_data_ is the aggregate byte limit we
+    // advertise to the peer (starts at local_tp_.initial_max_data).
+    // conn_recv_total_ is the sum of the highest byte offset received on
+    // every stream; if a STREAM/RESET_STREAM frame would push it past the
+    // limit we close with FLOW_CONTROL_ERROR. As the application consumes
+    // bytes (conn_recv_consumed_) we push the limit forward and flag a
+    // MAX_DATA update.
+    uint64_t conn_recv_max_data_{0};
+    uint64_t conn_recv_total_{0};
+    uint64_t conn_recv_consumed_{0};
+    // Consumed bytes carried by streams we've already retired, so the
+    // consumption total survives their erasure.
+    uint64_t retired_recv_consumed_{0};
+    bool max_data_pending_{false};
+
+    // Send side: conn_send_max_data_ is the peer's aggregate data limit
+    // (starts at the peer's initial_max_data, raised by MAX_DATA frames).
+    // conn_send_total_ is the number of fresh stream bytes we've put on
+    // the wire; build_and_send caps new stream data at the remaining
+    // budget.
+    uint64_t conn_send_max_data_{0};
+    uint64_t conn_send_total_{0};
+
+    // ---- Stream count limits (RFC 9000 §4.6) ----------------------------
+    // local_max_streams_* is how many peer-initiated streams of each type
+    // we currently allow; enforced against the stream index on receive and
+    // raised (crediting closed streams) via MAX_STREAMS. peer_max_streams_*
+    // mirrors the peer's MAX_STREAMS limit for streams we initiate.
+    uint64_t local_max_streams_bidi_{0};
+    uint64_t local_max_streams_uni_{0};
+    uint64_t peer_max_streams_bidi_{0};
+    uint64_t peer_max_streams_uni_{0};
+    uint64_t streams_bidi_closed_{0};
+    uint64_t streams_uni_closed_{0};
+    bool max_streams_bidi_pending_{false};
+    bool max_streams_uni_pending_{false};
 };
 
 } // namespace quic

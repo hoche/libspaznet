@@ -54,6 +54,14 @@ Connection::Connection(std::shared_ptr<TlsContext> tls_ctx,
     // MTU we'd actually send.
     scratch_packet_.reserve(1500);
 
+    // RFC 9000 §4.1 / §4.6 — seed the flow-control and stream-count
+    // limits we advertise from our own transport parameters. The peer
+    // side (conn_send_max_data_, peer_max_streams_*) is populated from
+    // the peer's transport parameters once the handshake surfaces them.
+    conn_recv_max_data_ = local_tp_.initial_max_data;
+    local_max_streams_bidi_ = local_tp_.initial_max_streams_bidi;
+    local_max_streams_uni_ = local_tp_.initial_max_streams_uni;
+
     // Pre-install Initial-level keys for both directions.
     auto& init = space(EncryptionLevel::Initial);
     init.aead = Aead::Aes128Gcm;
@@ -429,11 +437,43 @@ auto Connection::deliver_frames(EncryptionLevel level, std::span<const uint8_t> 
                     if (level == EncryptionLevel::Application) {
                         pending_path_responses_.push_back(x.data);
                     }
+                } else if constexpr (std::is_same_v<T, ResetStreamFrame>) {
+                    on_reset_stream_frame(x);
+                } else if constexpr (std::is_same_v<T, MaxDataFrame>) {
+                    // RFC 9000 §4.1 — peer raised our connection send limit.
+                    if (x.maximum > conn_send_max_data_) {
+                        conn_send_max_data_ = x.maximum;
+                    }
+                } else if constexpr (std::is_same_v<T, MaxStreamDataFrame>) {
+                    // RFC 9000 §4.1 — peer raised our per-stream send limit.
+                    if (auto* st = find_stream(x.stream_id); st != nullptr) {
+                        st->set_send_limit(x.maximum);
+                    }
+                } else if constexpr (std::is_same_v<T, MaxStreamsFrame>) {
+                    // RFC 9000 §4.6 — peer raised how many streams we may open.
+                    if (x.bidi) {
+                        if (x.maximum > peer_max_streams_bidi_) {
+                            peer_max_streams_bidi_ = x.maximum;
+                        }
+                    } else if (x.maximum > peer_max_streams_uni_) {
+                        peer_max_streams_uni_ = x.maximum;
+                    }
+                } else if constexpr (std::is_same_v<T, DataBlockedFrame>) {
+                    // RFC 9000 §4.1 — peer is stalled on our connection
+                    // limit; re-advertise it (covers a lost MAX_DATA).
+                    max_data_pending_ = true;
+                } else if constexpr (std::is_same_v<T, StreamsBlockedFrame>) {
+                    // RFC 9000 §4.6 — re-advertise the relevant MAX_STREAMS.
+                    if (x.bidi) {
+                        max_streams_bidi_pending_ = true;
+                    } else {
+                        max_streams_uni_pending_ = true;
+                    }
                 }
-                // PADDING, PING, HANDSHAKE_DONE, MAX_*, PATH_RESPONSE,
-                // RETIRE_CONNECTION_ID, etc. — no-op for this minimal
-                // first pass.  We don't initiate connection migration
-                // ourselves, so PATH_RESPONSE has nothing to match.
+                // PADDING, PING, HANDSHAKE_DONE, STOP_SENDING,
+                // PATH_RESPONSE, RETIRE_CONNECTION_ID, etc. — no-op for
+                // now.  We don't initiate connection migration ourselves,
+                // so PATH_RESPONSE has nothing to match.
             },
             f);
     }
@@ -466,9 +506,90 @@ auto Connection::feed_tls_crypto(EncryptionLevel level) -> void {
 }
 
 auto Connection::on_stream_frame(const StreamFrame& f) -> void {
+    // RFC 9000 §4.6 — reject a stream beyond the limit we advertised.
+    if (!enforce_stream_limit(f.stream_id)) {
+        return;
+    }
+
+    // RFC 9000 §4.5 — a stream offset may never exceed 2^62-1.
+    constexpr uint64_t kMaxStreamOffset = (1ULL << 62) - 1;
+    if (f.data.size() > kMaxStreamOffset || f.offset > kMaxStreamOffset - f.data.size()) {
+        initiate_close(/*error_code=*/0x03, /*application=*/false, "stream offset overflow",
+                       static_cast<uint64_t>(FrameType::Stream)); // FLOW_CONTROL_ERROR
+        return;
+    }
+
     auto* s = ensure_stream(f.stream_id);
-    if (s != nullptr) {
-        (void)s->deliver(f.offset, f.data, f.fin);
+    if (s == nullptr) {
+        return;
+    }
+
+    // RFC 9000 §4.1 — connection-level receive flow control. New bytes
+    // are the amount by which this frame advances the stream's highest
+    // received offset; charge them against the aggregate limit.
+    const uint64_t prev_hw = s->recv_high_water();
+    const uint64_t end = f.offset + f.data.size();
+    if (end > prev_hw) {
+        const uint64_t delta = end - prev_hw;
+        if (delta > conn_recv_max_data_ - conn_recv_total_) {
+            initiate_close(/*error_code=*/0x03, /*application=*/false,
+                           "connection flow control",
+                           static_cast<uint64_t>(FrameType::Stream)); // FLOW_CONTROL_ERROR
+            return;
+        }
+    }
+
+    if (!s->deliver(f.offset, f.data, f.fin)) {
+        // Per-stream FLOW_CONTROL_ERROR or FINAL_SIZE_ERROR (RFC 9000
+        // §4.1 / §4.5). Either way the peer violated a limit it agreed
+        // to; tear the connection down rather than silently dropping.
+        initiate_close(/*error_code=*/0x03, /*application=*/false, "stream limit violation",
+                       static_cast<uint64_t>(FrameType::Stream));
+        return;
+    }
+
+    const uint64_t new_hw = s->recv_high_water();
+    if (new_hw > prev_hw) {
+        conn_recv_total_ += (new_hw - prev_hw);
+    }
+}
+
+auto Connection::on_reset_stream_frame(const ResetStreamFrame& f) -> void {
+    // RFC 9000 §3.2 / §4.6 — a RESET_STREAM opens the stream (for
+    // limit-accounting purposes) just like a STREAM frame does.
+    if (!enforce_stream_limit(f.stream_id)) {
+        return;
+    }
+    constexpr uint64_t kMaxStreamOffset = (1ULL << 62) - 1;
+    if (f.final_size > kMaxStreamOffset) {
+        initiate_close(/*error_code=*/0x03, /*application=*/false, "reset final size overflow",
+                       static_cast<uint64_t>(FrameType::ResetStream)); // FLOW_CONTROL_ERROR
+        return;
+    }
+    auto* s = ensure_stream(f.stream_id);
+    if (s == nullptr) {
+        return;
+    }
+    // RFC 9000 §4.5 — the final size a reset declares counts toward
+    // both stream- and connection-level flow control.
+    const uint64_t prev_hw = s->recv_high_water();
+    if (f.final_size > prev_hw) {
+        const uint64_t delta = f.final_size - prev_hw;
+        if (delta > conn_recv_max_data_ - conn_recv_total_) {
+            initiate_close(/*error_code=*/0x03, /*application=*/false,
+                           "connection flow control",
+                           static_cast<uint64_t>(FrameType::ResetStream)); // FLOW_CONTROL_ERROR
+            return;
+        }
+    }
+    if (!s->reset_recvd(f.final_size, f.app_error)) {
+        initiate_close(/*error_code=*/0x06, /*application=*/false, "final size error",
+                       static_cast<uint64_t>(FrameType::ResetStream)); // FINAL_SIZE_ERROR
+        return;
+    }
+    const uint64_t new_hw = s->recv_high_water();
+    if (new_hw > prev_hw) {
+        conn_recv_total_ += (new_hw - prev_hw);
     }
 }
 
@@ -494,7 +615,7 @@ auto Connection::on_ack_frame(EncryptionLevel level, const AckFrame& f) -> void 
     auto ack_entry = [&](typename std::map<uint64_t, SentRecord>::iterator it) {
         // Notify streams of acked bytes.
         for (const auto& sf : it->second.streams) {
-            if (auto* st = ensure_stream(sf.stream_id); st != nullptr) {
+            if (auto* st = find_stream(sf.stream_id); st != nullptr) {
                 st->on_acked(sf.offset, sf.data.size());
             }
         }
@@ -560,7 +681,7 @@ auto Connection::on_ack_frame(EncryptionLevel level, const AckFrame& f) -> void 
 auto Connection::declare_lost(SentRecord& rec, EncryptionLevel level) -> void {
     // Re-queue stream frames via the Stream's lost-ranges machinery.
     for (auto& sf : rec.streams) {
-        if (auto* st = ensure_stream(sf.stream_id); st != nullptr) {
+        if (auto* st = find_stream(sf.stream_id); st != nullptr) {
             st->on_lost(sf.offset, sf.data.size());
         }
     }
@@ -762,6 +883,106 @@ auto Connection::ensure_stream(uint64_t stream_id) -> Stream* {
     return raw;
 }
 
+auto Connection::find_stream(uint64_t stream_id) -> Stream* {
+    auto it = streams_.find(stream_id);
+    return it == streams_.end() ? nullptr : it->second.get();
+}
+
+auto Connection::enforce_stream_limit(uint64_t stream_id) -> bool {
+    // Only peer-initiated (client) streams count against the limits we
+    // advertise. Streams we open ourselves are governed by the peer's
+    // MAX_STREAMS on the send path.
+    if (!is_client_initiated(stream_id)) {
+        return true;
+    }
+    if (find_stream(stream_id) != nullptr) {
+        return true; // already open — within limit when first admitted
+    }
+    // RFC 9000 §2.1: the stream index is the ID with the two low type
+    // bits removed. A type's MAX_STREAMS N permits indices 0..N-1.
+    const uint64_t index = stream_id >> 2;
+    const uint64_t limit = is_bidi(stream_id) ? local_max_streams_bidi_ : local_max_streams_uni_;
+    if (index >= limit) {
+        initiate_close(/*error_code=*/0x04, /*application=*/false, "stream limit exceeded",
+                       static_cast<uint64_t>(FrameType::Stream)); // STREAM_LIMIT_ERROR
+        return false;
+    }
+    return true;
+}
+
+auto Connection::refresh_conn_recv_window() -> void {
+    uint64_t consumed = retired_recv_consumed_;
+    for (auto& [id, st] : streams_) {
+        consumed += st->recv_read_offset();
+    }
+    conn_recv_consumed_ = consumed;
+    extend_conn_recv_window();
+}
+
+auto Connection::extend_conn_recv_window() -> void {
+    // Keep roughly a full initial window available beyond what the
+    // application has consumed. Only flag an update once the remaining
+    // window has drained past half, to avoid a MAX_DATA per read.
+    const uint64_t window = local_tp_.initial_max_data;
+    if (window == 0) {
+        return; // connection-level receive flow control disabled
+    }
+    if (conn_recv_max_data_ - conn_recv_consumed_ < window / 2) {
+        conn_recv_max_data_ = conn_recv_consumed_ + window;
+        max_data_pending_ = true;
+    }
+}
+
+auto Connection::retire_closed_streams() -> void {
+    for (auto it = streams_.begin(); it != streams_.end();) {
+        const uint64_t id = it->first;
+        const Stream& s = *it->second;
+        const bool recv_done = s.recv_state() == RecvState::DataRead ||
+                               s.recv_state() == RecvState::ResetRead ||
+                               s.recv_state() == RecvState::ResetRecvd;
+        const bool send_done = s.send_state() == SendState::DataRecvd ||
+                               s.send_state() == SendState::ResetRecvd;
+        bool terminal = false;
+        if (is_bidi(id)) {
+            terminal = recv_done && send_done;
+        } else if (is_client_initiated(id)) {
+            terminal = recv_done; // client uni: receive-only at the server
+        } else {
+            terminal = send_done; // server uni: send-only
+        }
+        if (!terminal) {
+            ++it;
+            continue;
+        }
+        // RFC 9000 §4.6 — a peer-initiated stream closing frees a slot;
+        // credit it so we can raise MAX_STREAMS and bound concurrency
+        // without capping the connection's lifetime request count.
+        if (is_client_initiated(id)) {
+            if (is_bidi(id)) {
+                ++streams_bidi_closed_;
+            } else {
+                ++streams_uni_closed_;
+            }
+        }
+        // Preserve this stream's contribution to consumed bytes so the
+        // connection-level window accounting survives its erasure
+        // (RFC 9000 §4.5 credits the full received size on close).
+        retired_recv_consumed_ += s.recv_high_water();
+        it = streams_.erase(it);
+    }
+
+    const uint64_t bidi_window = local_tp_.initial_max_streams_bidi;
+    if (bidi_window > 0 && streams_bidi_closed_ + bidi_window > local_max_streams_bidi_) {
+        local_max_streams_bidi_ = streams_bidi_closed_ + bidi_window;
+        max_streams_bidi_pending_ = true;
+    }
+    const uint64_t uni_window = local_tp_.initial_max_streams_uni;
+    if (uni_window > 0 && streams_uni_closed_ + uni_window > local_max_streams_uni_) {
+        local_max_streams_uni_ = streams_uni_closed_ + uni_window;
+        max_streams_uni_pending_ = true;
+    }
+}
+
 auto Connection::write_stream(uint64_t stream_id, std::span<const uint8_t> data, bool fin)
     -> void {
     auto* s = ensure_stream(stream_id);
@@ -776,6 +997,9 @@ auto Connection::read_stream(uint64_t stream_id, std::vector<uint8_t>& out, bool
         fin_out = false;
         return 0;
     }
+    // Connection-level window bookkeeping is recomputed from stream read
+    // cursors in on_timer (refresh_conn_recv_window), so it captures both
+    // this path and callers that read straight off the Stream.
     return it->second->read_contiguous(out, fin_out);
 }
 
@@ -956,14 +1180,31 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
     // 2. Collect STREAM frames (1-RTT only).
     std::vector<StreamFrame> stream_pending;
     if (level == EncryptionLevel::Application) {
+        // RFC 9000 §4.1 — honor the peer's connection-level data limit.
+        // Track it from the peer's transport parameters (available once
+        // the handshake completes) and any MAX_DATA frames since.
+        const uint64_t peer_md = peer_transport_params().initial_max_data;
+        if (peer_md > conn_send_max_data_) {
+            conn_send_max_data_ = peer_md;
+        }
+        uint64_t conn_budget =
+            conn_send_max_data_ > conn_send_total_ ? conn_send_max_data_ - conn_send_total_ : 0;
+
         for (auto& [id, st] : streams_) {
             std::size_t budget = 1100; // leave room for header/tag/ACK
             while (budget > 0) {
                 uint64_t off = 0;
                 std::vector<uint8_t> data;
                 bool fin = false;
-                std::size_t n = st->pull_send(budget, off, data, fin);
+                const uint64_t before = st->send_next_offset();
+                std::size_t n = st->pull_send(budget, off, data, fin, conn_budget);
                 if (n == 0 && !fin) break;
+                // Fresh (never-sent) bytes advance send_next_offset_ and
+                // are what count against the connection data limit;
+                // retransmissions do not.
+                const uint64_t fresh = st->send_next_offset() - before;
+                conn_send_total_ += fresh;
+                conn_budget -= fresh;
                 StreamFrame sf;
                 sf.stream_id = id;
                 sf.offset = off;
@@ -1000,8 +1241,34 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
         path_responses.swap(pending_path_responses_);
     }
 
+    // 6. Connection-level control frames — MAX_DATA / MAX_STREAMS
+    // (RFC 9000 §4.1 / §4.6).  Only meaningful in 1-RTT.  We carry the
+    // latest advertised value; a DATA_BLOCKED / STREAMS_BLOCKED from the
+    // peer re-flags these so a lost update is recovered.
+    std::vector<Frame> control_frames;
+    if (level == EncryptionLevel::Application) {
+        if (max_data_pending_) {
+            control_frames.emplace_back(MaxDataFrame{conn_recv_max_data_});
+            max_data_pending_ = false;
+        }
+        if (max_streams_bidi_pending_) {
+            MaxStreamsFrame f;
+            f.bidi = true;
+            f.maximum = local_max_streams_bidi_;
+            control_frames.emplace_back(f);
+            max_streams_bidi_pending_ = false;
+        }
+        if (max_streams_uni_pending_) {
+            MaxStreamsFrame f;
+            f.bidi = false;
+            f.maximum = local_max_streams_uni_;
+            control_frames.emplace_back(f);
+            max_streams_uni_pending_ = false;
+        }
+    }
+
     if (crypto_pending.empty() && stream_pending.empty() && !include_ack &&
-        !include_hs_done && path_responses.empty()) {
+        !include_hs_done && path_responses.empty() && control_frames.empty()) {
         return false;
     }
 
@@ -1010,6 +1277,10 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
                   {stream_pending.data(), stream_pending.size()}, include_ack, ack,
                   include_hs_done, {path_responses.data(), path_responses.size()}, false,
                   payload);
+    // MAX_DATA / MAX_STREAMS (Application level only; empty otherwise).
+    for (const auto& cf : control_frames) {
+        encode_frame(payload, cf);
+    }
 
     const uint64_t pn = sp.next_send_pn++;
     // Initial path keeps the original `build_initial_packet` helper
@@ -1119,7 +1390,8 @@ auto Connection::build_and_send(EncryptionLevel level) -> bool {
     // counts; we don't retransmit it on loss (the peer will re-probe
     // if it cares).
     rec.ack_eliciting = !crypto_pending.empty() || !stream_pending.empty() ||
-                        include_hs_done || !path_responses.empty();
+                        include_hs_done || !path_responses.empty() ||
+                        !control_frames.empty();
     rec.bytes = buf.size();
     rec.sent_at = clock_fn_();
     rec.crypto = std::move(crypto_pending);
@@ -1161,6 +1433,12 @@ auto Connection::on_timer() -> void {
     // freshly-arrived bytes.
     check_pto();
     pull_crypto_from_tls();
+    // RFC 9000 §4.6 — reclaim fully-closed streams and credit
+    // MAX_STREAMS before sending so any resulting update rides out now.
+    retire_closed_streams();
+    // RFC 9000 §4.1 — advance the connection-level receive window based
+    // on how much the application has consumed so a MAX_DATA rides out.
+    refresh_conn_recv_window();
     for (auto lvl :
          {EncryptionLevel::Initial, EncryptionLevel::Handshake, EncryptionLevel::Application}) {
         while (build_and_send(lvl)) {

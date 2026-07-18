@@ -208,7 +208,8 @@ auto Stream::write(const std::vector<uint8_t>& bytes, bool fin) -> void {
 }
 
 auto Stream::pull_send(std::size_t max_bytes, uint64_t& offset_out,
-                       std::vector<uint8_t>& data_out, bool& fin_out) -> std::size_t {
+                       std::vector<uint8_t>& data_out, bool& fin_out,
+                       uint64_t max_fresh) -> std::size_t {
     data_out.clear();
     fin_out = false;
     if (max_bytes == 0) {
@@ -256,8 +257,10 @@ auto Stream::pull_send(std::size_t max_bytes, uint64_t& offset_out,
     }
     const uint64_t window = send_limit_ - send_next_offset_;
     const uint64_t avail = send_high_water_ - send_next_offset_;
-    const std::size_t take =
-        static_cast<std::size_t>(std::min<uint64_t>({max_bytes, window, avail}));
+    // `max_fresh` is the connection-level send flow-control budget
+    // (RFC 9000 §4.1); fresh bytes may not exceed it.
+    const std::size_t take = static_cast<std::size_t>(
+        std::min<uint64_t>({max_bytes, window, avail, max_fresh}));
     if (take == 0) {
         if (send_fin_queued_ && !send_fin_sent_ &&
             send_next_offset_ == send_high_water_) {
