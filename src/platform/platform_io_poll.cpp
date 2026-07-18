@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <cerrno>
 #include <libspaznet/platform/platform_io.hpp>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -18,6 +19,18 @@ class PlatformIOPoll : public PlatformIO {
     // wire to round-trip caller-supplied data, so we keep it here and
     // hand it back in wait().
     std::unordered_map<int, std::pair<void*, uint32_t>> fd_info_;
+
+    // Guards pollfds_ and fd_info_. Unlike the epoll/kqueue backends —
+    // whose registration state lives in the kernel, so their wait()
+    // touches no shared userspace table — poll keeps its interest set in
+    // these two containers and reads them in wait(). Since wait() runs on
+    // the event-loop thread while worker threads call add_fd/modify_fd/
+    // remove_fd (IOContext holds its own map_lock_ there, which wait()
+    // does NOT take), those accesses would race and reallocate the vector
+    // / rehash the map out from under wait(). This mutex serializes them.
+    // wait() only holds it to snapshot / map results, never across the
+    // blocking poll() syscall, so registrations don't stall.
+    mutable std::mutex mutex_;
 
   public:
     PlatformIOPoll() = default;
@@ -36,7 +49,9 @@ class PlatformIOPoll : public PlatformIO {
         return true;
     }
 
-    auto add_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
+    // Unlocked insert; caller must hold mutex_. Shared by add_fd and
+    // modify_fd's "not yet registered" fallback so we never re-lock.
+    auto add_fd_locked(int file_descriptor, uint32_t events, void* user_data) -> bool {
         if (fd_info_.find(file_descriptor) != fd_info_.end()) {
             return false; // Already exists
         }
@@ -58,10 +73,16 @@ class PlatformIOPoll : public PlatformIO {
         return true;
     }
 
+    auto add_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return add_fd_locked(file_descriptor, events, user_data);
+    }
+
     auto modify_fd(int file_descriptor, uint32_t events, void* user_data) -> bool override {
+        std::lock_guard<std::mutex> lock(mutex_);
         auto it = fd_info_.find(file_descriptor);
         if (it == fd_info_.end()) {
-            return add_fd(file_descriptor, events, user_data);
+            return add_fd_locked(file_descriptor, events, user_data);
         }
 
         it->second = {user_data, events};
@@ -83,6 +104,7 @@ class PlatformIOPoll : public PlatformIO {
     }
 
     auto remove_fd(int file_descriptor) -> bool override {
+        std::lock_guard<std::mutex> lock(mutex_);
         auto it = fd_info_.find(file_descriptor);
         if (it == fd_info_.end()) {
             return false;
@@ -101,14 +123,24 @@ class PlatformIOPoll : public PlatformIO {
     }
 
     auto wait(std::vector<Event>& events, int timeout_ms) -> int override {
-        if (pollfds_.empty()) {
-            return 0;
+        // Snapshot the interest set under the lock, then run the blocking
+        // poll() on the copy WITHOUT the lock held — otherwise a worker
+        // thread's add_fd/modify_fd/remove_fd would block until poll()
+        // returns. poll() itself only reads its argument array (revents
+        // are written into our local copy), so a snapshot is race-free.
+        std::vector<pollfd> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (pollfds_.empty()) {
+                return 0;
+            }
+            snapshot = pollfds_;
         }
 
         // EINTR is benign; retry so the loop survives signals.
         int nfds;
         do {
-            nfds = poll(pollfds_.data(), pollfds_.size(), timeout_ms);
+            nfds = poll(snapshot.data(), snapshot.size(), timeout_ms);
         } while (nfds < 0 && errno == EINTR);
 
         if (nfds < 0) {
@@ -116,11 +148,23 @@ class PlatformIOPoll : public PlatformIO {
         }
 
         events.clear();
-        events.reserve(nfds);
+        events.reserve(static_cast<std::size_t>(nfds));
 
-        for (const auto& pfd : pollfds_) {
+        // Re-acquire the lock to translate revents into Events and look up
+        // each fd's token. An fd may have been removed between the snapshot
+        // and now; if it's no longer in fd_info_ we drop the event rather
+        // than reporting a null token (which IOContext would misread as the
+        // wakeup pipe). The real wakeup pipe stays in fd_info_ with a null
+        // token, so it is still reported correctly.
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& pfd : snapshot) {
             if (pfd.revents == 0) {
                 continue;
+            }
+
+            auto info_it = fd_info_.find(pfd.fd);
+            if (info_it == fd_info_.end()) {
+                continue; // fd was removed after the snapshot
             }
 
             Event event{};
@@ -145,8 +189,7 @@ class PlatformIOPoll : public PlatformIO {
 
             // Hand the caller's token back unchanged so IOContext can
             // verify the registration generation.
-            auto info_it = fd_info_.find(pfd.fd);
-            event.user_data = (info_it != fd_info_.end()) ? info_it->second.first : nullptr;
+            event.user_data = info_it->second.first;
 
             events.push_back(event);
         }
@@ -155,6 +198,7 @@ class PlatformIOPoll : public PlatformIO {
     }
 
     void cleanup() override {
+        std::lock_guard<std::mutex> lock(mutex_);
         pollfds_.clear();
         fd_info_.clear();
     }
