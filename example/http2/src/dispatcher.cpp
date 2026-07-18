@@ -66,6 +66,14 @@ constexpr std::size_t kPrefaceLen = 24;
 constexpr std::uint32_t kInitialWindow = 65535;
 constexpr std::uint32_t kMaxFrameSizeDefault = 16384;
 
+// Resource caps on attacker-controlled accumulation. Without these, a peer
+// can stream CONTINUATION frames that never set END_HEADERS (unbounded
+// `pending_hpack`) or DATA frames that never set END_STREAM (unbounded
+// `body`) and exhaust server memory — the receive window is replenished on
+// every DATA frame, so flow control alone provides no backpressure.
+constexpr std::size_t kMaxHeaderListBytes = 64ULL * 1024;      // compressed HEADERS+CONTINUATION block
+constexpr std::size_t kMaxBodyBytes = 64ULL * 1024 * 1024;     // total buffered request body
+
 // Per-stream state, scoped to the frame loop coroutine.  Once
 // END_STREAM is seen we extract the request data and erase the
 // stream; the spawned dispatch_request coroutine owns the Request by
@@ -470,6 +478,15 @@ auto serve(::spaznet::Socket socket, Handler& handler) -> ::spaznet::Task {
                     goto loop_end;
                 }
                 auto& s = it->second;
+                // Bound the header block: a CONTINUATION flood that never
+                // sets END_HEADERS would otherwise grow pending_hpack without
+                // limit (RFC 9113 CONTINUATION-flood DoS, CVE-2024-27316
+                // class). Treat an oversized block as a connection error.
+                if (s.pending_hpack.size() + payload.size() > kMaxHeaderListBytes) {
+                    send_goaway(/*ENHANCE_YOUR_CALM*/ 0xb);
+                    state->socket.close();
+                    goto loop_end;
+                }
                 s.pending_hpack.insert(s.pending_hpack.end(), payload.begin(),
                                        payload.end());
                 if ((flags & Flags::END_HEADERS) != 0) {
@@ -499,6 +516,16 @@ auto serve(::spaznet::Socket socket, Handler& handler) -> ::spaznet::Task {
                         break;
                     }
                     end_off -= pad_len;
+                }
+                // Bound the buffered body. The receive window is refilled on
+                // every DATA frame below, so flow control provides no memory
+                // backpressure; without this cap a single stream that never
+                // sets END_STREAM can exhaust memory. Reset the stream once
+                // it exceeds the limit rather than buffering further.
+                if (s.body.size() + (end_off - off) > kMaxBodyBytes) {
+                    rst_stream(stream_id, /*ENHANCE_YOUR_CALM*/ 0xb);
+                    streams.erase(stream_id);
+                    break;
                 }
                 s.body.insert(s.body.end(), payload.begin() + off,
                               payload.begin() + end_off);
