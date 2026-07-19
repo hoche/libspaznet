@@ -27,3 +27,6 @@ endif()
 
 add_executable(udp_echo demo/echo.cpp)
 target_link_libraries(udp_echo PRIVATE spaznet_udp)
+
+add_executable(udp_relay demo/relay.cpp)
+target_link_libraries(udp_relay PRIVATE spaznet_udp)
