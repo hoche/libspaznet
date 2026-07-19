@@ -26,4 +26,6 @@ clang-tidy-output.txt
 valgrind-*.log
 *.supp
 .claude/settings.local.json
+cscope.out
+tags
 
