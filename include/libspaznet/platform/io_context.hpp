@@ -132,6 +132,12 @@ struct CoroutineControlBlock {
     std::coroutine_handle<> handle;
     TaskPromiseBase* promise{nullptr};
     std::atomic<std::size_t> ref_count{1};
+    // Statistics sink this coroutine was accounted against at creation.
+    // Captured here (rather than re-read from g_statistics at destruction)
+    // so the create/destroy counter updates are always balanced against
+    // the *same* IOContext even when several contexts exist and the global
+    // pointer changes between the two events.
+    StatisticsInternal* stats{nullptr};
 };
 
 // Awaiter returned from final_suspend (defined just below, once
@@ -548,8 +554,10 @@ template <typename P> inline auto make_coroutine_control_block(P& promise) -> Co
     cb->promise = &promise; // P derives from TaskPromiseBase
     promise.control_block = cb;
 
-    // Track coroutine creation (lock-free)
+    // Track coroutine creation (lock-free). Remember which sink we charged
+    // so release_coroutine_control_block decrements the same one.
     StatisticsInternal* stats = g_statistics.load(std::memory_order_acquire);
+    cb->stats = stats;
     if (stats != nullptr) {
         stats->total_coroutines_created.fetch_add(1, std::memory_order_relaxed);
         stats->active_coroutines.fetch_add(1, std::memory_order_relaxed);
@@ -584,8 +592,10 @@ inline void release_coroutine_control_block(CoroutineControlBlock* cb) noexcept 
         cb->handle = std::coroutine_handle<>{};
         cb->promise = nullptr;
 
-        // Track coroutine destruction (lock-free)
-        StatisticsInternal* stats = g_statistics.load(std::memory_order_acquire);
+        // Track coroutine destruction (lock-free) against the same sink the
+        // creation was charged to, so the counters stay balanced even if
+        // g_statistics now points at a different IOContext (or is null).
+        StatisticsInternal* stats = cb->stats;
         if (stats != nullptr) {
             stats->active_coroutines.fetch_sub(1, std::memory_order_relaxed);
             stats->total_memory_bytes.fetch_sub(Statistics::ESTIMATED_COROUTINE_FRAME_SIZE,
