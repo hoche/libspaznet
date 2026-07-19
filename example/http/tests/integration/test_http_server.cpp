@@ -88,26 +88,14 @@ class HTTPServerTest : public ::testing::Test {
         request << "\r\n";
 
         std::string req_str = request.str();
-#ifdef _WIN32
-        int sent = send(sock, req_str.c_str(), static_cast<int>(req_str.size()), 0);
-        if (sent < 0) {
-            close_socket(sock);
-            return "";
-        }
-#else
-        // Use MSG_NOSIGNAL to prevent SIGPIPE on closed sockets
-        ssize_t sent = send(sock, req_str.c_str(), req_str.size(), MSG_NOSIGNAL);
+        ssize_t sent =
+            spaznet::detail::socket_send(sock, req_str.c_str(), req_str.size(), MSG_NOSIGNAL);
         if (sent < 0 || static_cast<size_t>(sent) != req_str.size()) {
             close_socket(sock);
             return "";
         }
 
-        // Set receive timeout
-        struct timeval tv;
-        tv.tv_sec = 3;
-        tv.tv_usec = 0;
-        spaznet::detail::setsockopt_val(sock, SOL_SOCKET, SO_RCVTIMEO, tv);
-#endif
+        spaznet::detail::setsockopt_rcvtimeo_ms(sock, 3000);
 
         // Give the server time to process async coroutines and send response
         std::this_thread::sleep_for(std::chrono::milliseconds(150));

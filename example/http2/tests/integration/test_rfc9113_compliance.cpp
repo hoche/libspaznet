@@ -486,10 +486,7 @@ TEST_F(HTTP2MultiplexingTest, FrameLoopUnblockedBySlowHandler) {
     while (!got_ping_ack && std::chrono::steady_clock::now() < deadline) {
         char buf[4096];
         // Use a recv timeout so we don't block forever in the loop.
-        timeval tv{};
-        tv.tv_sec = 0;
-        tv.tv_usec = 100'000;
-        spaznet::detail::setsockopt_val(sock, SOL_SOCKET, SO_RCVTIMEO, tv);
+        spaznet::detail::setsockopt_rcvtimeo_ms(sock, 100);
         ssize_t n = recv(sock, buf, sizeof(buf), 0);
         if (n > 0) {
             rx_buf.insert(rx_buf.end(), buf, buf + n);

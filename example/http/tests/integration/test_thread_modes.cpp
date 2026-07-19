@@ -52,7 +52,7 @@ static std::string send_http_request(uint16_t port, const std::string& path = "/
     addr.sin_port = htons(port);
 
     if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(sock);
+        detail::close_socket_fd(sock);
         return "";
     }
 
@@ -63,24 +63,24 @@ static std::string send_http_request(uint16_t port, const std::string& path = "/
     request << "\r\n";
 
     std::string req_str = request.str();
-    ssize_t sent = send(sock, req_str.c_str(), req_str.size(), MSG_NOSIGNAL);
+    ssize_t sent = detail::socket_send(sock, req_str.c_str(), req_str.size(), MSG_NOSIGNAL);
     if (sent < 0 || static_cast<size_t>(sent) != req_str.size()) {
-        ::close(sock);
+        detail::close_socket_fd(sock);
         return "";
     }
 
     std::string response;
     char buffer[4096];
     for (;;) {
-        int received = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        ssize_t received = detail::socket_recv(sock, buffer, sizeof(buffer) - 1, 0);
         if (received <= 0) {
             break;
         }
         buffer[received] = '\0';
-        response.append(buffer, received);
+        response.append(buffer, static_cast<size_t>(received));
     }
 
-    ::close(sock);
+    detail::close_socket_fd(sock);
     return response;
 }
 

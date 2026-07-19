@@ -28,7 +28,12 @@
 #include <thread>
 
 #include <libspaznet/detail/socket_compat.hpp>
-#include <sys/types.h>
+
+#ifdef _WIN32
+#include <stdio.h>
+#define popen _popen
+#define pclose _pclose
+#endif
 
 #include <openssl/bio.h>
 #include <openssl/evp.h>
@@ -41,23 +46,28 @@ using namespace spaznet;
 
 namespace {
 
-// `popen` + read-to-end + waitpid wrapper.  Returns (stdout, exit_status).
+// `popen` + read-to-end + wait wrapper.  Returns (stdout, exit_status).
 auto run_capture(const std::string& cmd) -> std::pair<std::string, int> {
-    FILE* p = ::popen(cmd.c_str(), "r");
+    FILE* p = popen(cmd.c_str(), "r");
     if (p == nullptr) return {"", -1};
     std::string out;
     std::array<char, 4096> buf{};
     while (auto n = std::fread(buf.data(), 1, buf.size(), p)) {
         out.append(buf.data(), n);
     }
-    const int rc = ::pclose(p);
+    const int rc = pclose(p);
     return {std::move(out), rc};
 }
 
 // Probe the host's `curl` for HTTP/3 support.  Returns true iff
 // `curl -V` lists "HTTP3" in its Features line.
 auto curl_supports_http3() -> bool {
+#ifdef _WIN32
+    // `_popen` runs via cmd.exe; use NUL, not /dev/null.
+    auto [out, rc] = run_capture("curl -V 2>NUL");
+#else
     auto [out, rc] = run_capture("curl -V 2>/dev/null");
+#endif
     if (rc != 0) return false;
     return out.find("HTTP3") != std::string::npos ||
            out.find("http3") != std::string::npos;
@@ -134,16 +144,16 @@ auto pick_free_udp_port() -> uint16_t {
     sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     sin.sin_port = 0;
     if (::bind(fd, reinterpret_cast<sockaddr*>(&sin), sizeof(sin)) < 0) {
-        ::close(fd);
+        detail::close_socket_fd(fd);
         return 0;
     }
     socklen_t slen = sizeof(sin);
     if (::getsockname(fd, reinterpret_cast<sockaddr*>(&sin), &slen) < 0) {
-        ::close(fd);
+        detail::close_socket_fd(fd);
         return 0;
     }
     const uint16_t port = ntohs(sin.sin_port);
-    ::close(fd);
+    detail::close_socket_fd(fd);
     return port;
 }
 
@@ -187,10 +197,12 @@ TEST(QuicHttp3CurlInterop, RealCurlReceivesResponseBody) {
     auto service = std::make_unique<http3::QuicHttp3Service>(std::move(lcfg), on_request);
     auto dispatcher = http3::make_dispatcher(std::move(service));
 
+    // Construct Server first so Winsock is initialised before we probe
+    // for a free UDP port with raw socket()/bind()/getsockname().
+    Server srv;
     const uint16_t port = pick_free_udp_port();
     ASSERT_NE(port, 0U);
 
-    Server srv;
     srv.set_datagram_handler(std::move(dispatcher));
     srv.listen_udp(port);
 

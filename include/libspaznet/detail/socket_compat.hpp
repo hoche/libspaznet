@@ -142,6 +142,19 @@ inline auto setsockopt_val(int fd, int level, int optname, const T& value) -> in
 #endif
 }
 
+// SO_RCVTIMEO: DWORD milliseconds on Winsock, timeval on POSIX.
+inline auto setsockopt_rcvtimeo_ms(int fd, int timeout_ms) -> int {
+#ifdef _WIN32
+    const DWORD ms = static_cast<DWORD>(timeout_ms < 0 ? 0 : timeout_ms);
+    return setsockopt_val(fd, SOL_SOCKET, SO_RCVTIMEO, ms);
+#else
+    timeval tv{};
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    return setsockopt_val(fd, SOL_SOCKET, SO_RCVTIMEO, tv);
+#endif
+}
+
 inline auto socket_sendto(int fd, const void* buf, std::size_t len, int flags,
                           const sockaddr* addr, socklen_t addr_len) -> ssize_t {
 #ifdef _WIN32

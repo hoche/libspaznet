@@ -99,25 +99,14 @@ class RFC9112IntegrationTest : public ::testing::Test {
         if (sock < 0)
             return "";
 
-#ifdef _WIN32
-        int sent = send(sock, request.c_str(), static_cast<int>(request.size()), 0);
-        if (sent < 0) {
-            close_socket(sock);
-            return "";
-        }
-#else
-        ssize_t sent = send(sock, request.c_str(), request.size(), MSG_NOSIGNAL);
+        ssize_t sent =
+            spaznet::detail::socket_send(sock, request.c_str(), request.size(), MSG_NOSIGNAL);
         if (sent < 0 || static_cast<size_t>(sent) != request.size()) {
             close_socket(sock);
             return "";
         }
 
-        // Set receive timeout
-        struct timeval tv;
-        tv.tv_sec = 2;
-        tv.tv_usec = 0;
-        spaznet::detail::setsockopt_val(sock, SOL_SOCKET, SO_RCVTIMEO, tv);
-#endif
+        spaznet::detail::setsockopt_rcvtimeo_ms(sock, 2000);
 
         // Give server time to process
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -278,24 +267,15 @@ TEST_F(RFC9112IntegrationTest, KeepAliveAllowsMultipleRequestsOnSameConnection) 
     int sock = connect_to_server();
     ASSERT_GE(sock, 0);
 
-#ifndef _WIN32
     // Set receive timeout so tests don't hang.
-    struct timeval tv;
-    tv.tv_sec = 2;
-    tv.tv_usec = 0;
-    spaznet::detail::setsockopt_val(sock, SOL_SOCKET, SO_RCVTIMEO, tv);
-#endif
+    spaznet::detail::setsockopt_rcvtimeo_ms(sock, 2000);
 
     std::string req1 = "GET /one HTTP/1.1\r\n"
                        "Host: localhost:9996\r\n"
                        "Connection: keep-alive\r\n"
                        "\r\n";
-#ifdef _WIN32
-    ASSERT_GT(send(sock, req1.c_str(), static_cast<int>(req1.size()), 0), 0);
-#else
-    ASSERT_EQ(send(sock, req1.c_str(), req1.size(), MSG_NOSIGNAL),
+    ASSERT_EQ(spaznet::detail::socket_send(sock, req1.c_str(), req1.size(), MSG_NOSIGNAL),
               static_cast<ssize_t>(req1.size()));
-#endif
 
     std::string resp1 = read_response(sock);
     EXPECT_NE(resp1.find("HTTP/1.1 200 OK"), std::string::npos);
@@ -305,12 +285,8 @@ TEST_F(RFC9112IntegrationTest, KeepAliveAllowsMultipleRequestsOnSameConnection) 
                        "Host: localhost:9996\r\n"
                        "Connection: close\r\n"
                        "\r\n";
-#ifdef _WIN32
-    ASSERT_GT(send(sock, req2.c_str(), static_cast<int>(req2.size()), 0), 0);
-#else
-    ASSERT_EQ(send(sock, req2.c_str(), req2.size(), MSG_NOSIGNAL),
+    ASSERT_EQ(spaznet::detail::socket_send(sock, req2.c_str(), req2.size(), MSG_NOSIGNAL),
               static_cast<ssize_t>(req2.size()));
-#endif
 
     std::string resp2 = read_response(sock);
     EXPECT_NE(resp2.find("HTTP/1.1 200 OK"), std::string::npos);
@@ -405,7 +381,8 @@ TEST_F(RFC9112IntegrationTest, LargeRequestBody) {
 
     int sock = connect_to_server();
     ASSERT_GE(sock, 0);
-    ssize_t sent = send(sock, request.c_str(), request.size(), MSG_NOSIGNAL);
+    ssize_t sent =
+        spaznet::detail::socket_send(sock, request.c_str(), request.size(), MSG_NOSIGNAL);
     ASSERT_EQ(static_cast<size_t>(sent), request.size());
 
     std::string response = read_response(sock);
