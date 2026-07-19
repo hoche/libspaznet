@@ -137,7 +137,7 @@ When adding new functionality:
 
 - **Linux**: Uses epoll for I/O multiplexing
 - **macOS/BSD**: Uses kqueue for I/O multiplexing
-- **Windows**: Uses IOCP for I/O multiplexing
+- **Windows**: Uses readiness-style IOCP by default (`-DSPAZNET_FORCE_POLL=ON` for poll)
 - **Other Unix**: Falls back to poll()
 
 Tests should work on all platforms, but some integration tests may require network access.

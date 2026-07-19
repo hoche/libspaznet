@@ -1,7 +1,7 @@
 # TODO
 
-- Fix Windows builds (with poll)
-- Fix Windows IOCP backend (low priority)
+- [x] Fix Windows builds (poll, then readiness IOCP as default)
+- [x] Fix Windows IOCP backend (readiness demux; `-DSPAZNET_FORCE_POLL=ON` fallback)
 - TLS addition. Already in QUIC, of course, but needs to be added to the
   other protocols. HTTP/1.x should support both separate socket listeners
   and ALPN. Websockets should support both ws as wss.
@@ -228,26 +228,14 @@ remove_fd ENOENT, ConnectionGuard / Socket::close TOCTOU, and the
 integration tests that asserted on a dead handler instance. Open
 items from the same re-audit, none critical:
 
-- [ ] Rewrite the IOCP backend
-  - Currently gated off (#error unless SPAZNET_ENABLE_BROKEN_IOCP),
-    so default Windows builds fall through to the portable poll
-    backend. The IOCP code itself still has the audit-flagged defects:
-    no WSAStartup of its own (the WSAStartup added in 02f77d0 lives
-    in io_context.cpp and is independent), zero-byte WSARecv probes
-    that confuse 0-byte completions with EOF, no CancelIoEx on
-    remove_fd (heap-allocated OverlappedContext blocks leak per
-    cancelled op), ERROR_OPERATION_ABORTED treated as fatal,
-    fd-based dispatch in process_io_events that predates the
-    per-registration token (d64bce1) so the fd-reuse race is wide
-    open here.
-  - When picking this back up: build on top of the per-registration
-    token (encode the token into the OVERLAPPED's hEvent/Internal
-    slot or into a side-table keyed by overlapped*), call WSAStartup
-    via the io_context.cpp helper, use AcceptEx + WSARecv with a
-    real buffer instead of zero-byte probes, and cancel via
-    CancelIoEx with proper bookkeeping. Default Windows builds
-    should be opt-in to IOCP via -DSPAZNET_ENABLE_BROKEN_IOCP=ON
-    (rename the flag once the backend is actually finished).
+- [x] Rewrite the IOCP backend — readiness-style demux matching
+  PlatformIO oneshot + generation tokens. Connected TCP uses
+  zero-byte WSARecv/WSASend probes; UDP uses MSG_PEEK; listen
+  sockets use WSAEventSelect(FD_ACCEPT). CancelIoEx / UnregisterWait
+  on modify/remove; aborted completions dropped. Default Windows
+  builds use IOCP; `-DSPAZNET_FORCE_POLL=ON` keeps the portable
+  poll fallback. Buffer-based IOCP inside Socket remains a future
+  architecture project.
 
 - [x] parse_chunked_body should accept trailer headers — landed
   2026-05-31 in example/http/src/handler.cpp; trailers are

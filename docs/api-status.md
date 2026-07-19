@@ -49,8 +49,8 @@ PlatformIO.
 | example/quic-http3 | Dynamic QPACK table | **Not implemented** | Compression ratios suffer on repeated headers. |
 | Platform I/O | `PlatformIO` epoll backend (Linux) | **Stable** | |
 | Platform I/O | `PlatformIO` kqueue backend (BSD/macOS) | **Stable** | |
-| Platform I/O | `PlatformIO` poll backend (other Unix) | **Stable** | Slower than epoll/kqueue; only used when nothing better is available. Currently the default on Windows (see below). |
-| Platform I/O | `PlatformIO` IOCP backend (Windows) | **Disabled** | Gated behind `SPAZNET_ENABLE_BROKEN_IOCP`; the code has known UAF + WSAStartup + 0-byte-recv issues from the 2026-05-27 audit. Default Windows builds use the portable poll backend. Tracked in [TODO.md](../TODO.md). |
+| Platform I/O | `PlatformIO` poll backend (other Unix / Windows fallback) | **Stable** | Slower than epoll/kqueue/IOCP; used when nothing better is available. On Windows, force with `-DSPAZNET_FORCE_POLL=ON`. |
+| Platform I/O | `PlatformIO` IOCP backend (Windows) | **Stable** | Readiness-style demux (zero-byte probes + listen `WSAEventSelect`); default on Windows. Same oneshot + generation-token contract as epoll/kqueue/poll. |
 | Build | `find_package(spaznet)` | **Stable** | Install target ships `spaznetConfig.cmake`. See `docs/integration.md`. |
 | Build | `SPAZNET_BUILD_QUIC` CMake option | **Stable** | Gates `example/quic-http3`. Defaults `ON` if OpenSSL 3.5+ is detected; warns + disables otherwise. Core builds with no OpenSSL dependency when this is `OFF`. |
 | Build | `SPAZNET_BUILD_EXAMPLES` CMake option | **Stable** | Defaults `ON`. Pulls in `example/http`, `example/http-websocket`, `example/http2`, `example/udp`, and (gated on `SPAZNET_BUILD_QUIC`) `example/quic-http3`. |

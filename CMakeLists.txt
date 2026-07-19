@@ -96,15 +96,13 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
 # ---- Platform demultiplexer selection -----------------------------------
-# The IOCP backend is incomplete (see src/platform/platform_io_iocp.cpp);
-# it is opt-in via SPAZNET_ENABLE_BROKEN_IOCP. Default Windows builds
-# fall through to the portable poll backend so the library is usable
-# out of the box.
+# Windows defaults to the readiness-style IOCP backend. Force the portable
+# poll backend with -DSPAZNET_FORCE_POLL=ON if needed.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(USE_EPOLL ON)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME MATCHES "BSD")
     set(USE_KQUEUE ON)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND SPAZNET_ENABLE_BROKEN_IOCP)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND NOT SPAZNET_FORCE_POLL)
     set(USE_IOCP ON)
 else()
     set(USE_POLL ON)
@@ -165,7 +163,7 @@ if(USE_EPOLL)
 elseif(USE_KQUEUE)
     target_compile_definitions(spaznet PRIVATE USE_KQUEUE)
 elseif(USE_IOCP)
-    target_compile_definitions(spaznet PRIVATE USE_IOCP SPAZNET_ENABLE_BROKEN_IOCP)
+    target_compile_definitions(spaznet PRIVATE USE_IOCP)
 else()
     target_compile_definitions(spaznet PRIVATE USE_POLL)
 endif()

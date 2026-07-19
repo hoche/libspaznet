@@ -8,7 +8,7 @@ A high-performance, cross-platform network server library written in C++20 using
   - kqueue on BSD/macOS
   - epoll on Linux
   - poll on other Unix systems
-  - IOCP on Windows
+  - readiness-style IOCP on Windows (force poll with `-DSPAZNET_FORCE_POLL=ON`)
 
 - **Coroutine-based async I/O:** Uses C++20 coroutines as the primary execution model
 - **Thread-safe:** Single-threaded by default, or multi-threaded with a small set of mutexes (five total in the library; see `docs/mutex-vs-atomics.md`)

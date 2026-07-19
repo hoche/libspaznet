@@ -11,7 +11,7 @@ This document explains how `libspaznet` schedules work, how coroutines move betw
 - **IOContext** owns the event loop, worker threads, timer wheel, and platform-specific I/O demultiplexer.
 - **Task** is a coroutine return type; its promise (`TaskPromise`) stores a continuation handle so `co_await` chains resume correctly.
 - **TaskQueue** is a multi-producer/multi-consumer queue. Both enqueue and dequeue take a single `std::mutex` — the original lock-free enqueue had a use-after-free against the mutex-protected dequeue. See `mutex-vs-atomics.md` for the broader discussion of when atomics are not enough.
-- **PlatformIO** (epoll/kqueue/poll; IOCP is currently gated off as unfinished) translates OS events into coroutine resumes. Each registration carries a per-fd generation counter packed into the user_data handed to the kernel; on event delivery the IOContext verifies the generation matches the current registration so that fd-reuse cannot resurrect a stale coroutine.
+- **PlatformIO** (epoll/kqueue/poll/IOCP) translates OS events into coroutine resumes. Each registration carries a per-fd generation counter packed into the user_data handed to the kernel; on event delivery the IOContext verifies the generation matches the current registration so that fd-reuse cannot resurrect a stale coroutine.
 
 ![Core execution model](svgs/core-execution-model.svg)
 
