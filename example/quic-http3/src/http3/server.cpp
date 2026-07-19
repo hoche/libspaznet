@@ -13,6 +13,16 @@ namespace {
 
 using spaznet::quic::VarInt;
 
+// Buffering caps to bound memory against a peer that dribbles data toward
+// an oversized (or never-completing) frame. Exceeding any of these is
+// treated as excessive load and tears the connection down rather than
+// letting an attacker exhaust server memory (RFC 9114 §8.1 error codes).
+constexpr std::size_t kMaxRequestStreamBytes = 64ULL * 1024 * 1024; // recv_buf ceiling
+constexpr std::size_t kMaxRequestBodyBytes = 64ULL * 1024 * 1024;   // accumulated body
+constexpr std::size_t kMaxFieldSectionBytes = 128ULL * 1024;        // one HEADERS block
+constexpr std::size_t kMaxUniStreamBytes = 64ULL * 1024;            // control/qpack uni buffer
+constexpr uint64_t kH3ExcessiveLoad = 0x0508;                       // H3_EXCESSIVE_LOAD
+
 // Try to decode a leading varint from `buf`. Returns true and consumes
 // the bytes from the front on success.
 auto consume_leading_varint(std::vector<uint8_t>& buf, uint64_t& out) -> bool {
@@ -103,6 +113,13 @@ auto Http3Server::process_stream(uint64_t id, quic::Stream& s) -> void {
     }
     if (is_uni(id) && is_client_initiated(id)) {
         auto& u = uni_[id];
+        // Bound the per-uni-stream buffer so an incomplete control frame
+        // (or a QPACK stream the peer floods) can't grow without limit.
+        if (chunk.size() > kMaxUniStreamBytes - u.buf.size()) {
+            conn_.close_with_error(kH3ExcessiveLoad, /*application=*/true,
+                                   "uni stream buffer overflow");
+            return;
+        }
         u.buf.insert(u.buf.end(), chunk.begin(), chunk.end());
         if (u.type == UINT64_MAX) {
             uint64_t t = 0;
@@ -113,13 +130,16 @@ auto Http3Server::process_stream(uint64_t id, quic::Stream& s) -> void {
         }
         // For Control streams: parse and discard incoming frames; we
         // only care about SETTINGS for now (and just ignore them).
-        // For QPACK encoder/decoder streams: also discard (we set
-        // capacity to 0 so the peer can't send meaningful instructions).
         if (u.type == static_cast<uint64_t>(H3UniStreamType::Control)) {
             H3Frame f;
             while (consume_leading_h3_frame(u.buf, f)) {
                 // no-op
             }
+        } else {
+            // QPACK encoder/decoder (we advertised capacity 0) or an
+            // unknown uni type: we don't act on these, so discard the
+            // bytes instead of accumulating them forever.
+            u.buf.clear();
         }
         return;
     }
@@ -127,6 +147,13 @@ auto Http3Server::process_stream(uint64_t id, quic::Stream& s) -> void {
         return; // ignore non-request bidi (shouldn't happen as a server)
     }
     auto& pr = pending_[id];
+    // Bound the pre-parse buffer: a peer can otherwise dribble bytes
+    // toward an oversized (or never-completing) frame and exhaust memory.
+    if (chunk.size() > kMaxRequestStreamBytes - pr.recv_buf.size()) {
+        conn_.close_with_error(kH3ExcessiveLoad, /*application=*/true,
+                               "request stream buffer overflow");
+        return;
+    }
     pr.recv_buf.insert(pr.recv_buf.end(), chunk.begin(), chunk.end());
     if (fin) pr.fin_seen = true;
 
@@ -135,6 +162,11 @@ auto Http3Server::process_stream(uint64_t id, quic::Stream& s) -> void {
         H3Frame f;
         if (!consume_leading_h3_frame(pr.recv_buf, f)) break;
         if (auto* h = std::get_if<H3Headers>(&f); h != nullptr) {
+            if (h->encoded_field_section.size() > kMaxFieldSectionBytes) {
+                conn_.close_with_error(kH3ExcessiveLoad, /*application=*/true,
+                                       "header section too large");
+                return;
+            }
             HeaderList hl;
             if (!qpack_decode({h->encoded_field_section.data(),
                                h->encoded_field_section.size()},
@@ -150,6 +182,11 @@ auto Http3Server::process_stream(uint64_t id, quic::Stream& s) -> void {
             }
             pr.headers_parsed = true;
         } else if (auto* d = std::get_if<H3Data>(&f); d != nullptr) {
+            if (d->data.size() > kMaxRequestBodyBytes - pr.req.body.size()) {
+                conn_.close_with_error(kH3ExcessiveLoad, /*application=*/true,
+                                       "request body too large");
+                return;
+            }
             pr.req.body.insert(pr.req.body.end(), d->data.begin(), d->data.end());
         }
         // SETTINGS / GOAWAY / etc. on a request stream are protocol

@@ -1715,3 +1715,53 @@ TEST(QuicConnection, EmitsMaxDataAfterConsume) {
     }
     EXPECT_TRUE(found) << "server did not emit MAX_DATA after the application consumed data";
 }
+
+// RFC 9000 §7.5 — a CRYPTO frame whose offset sits far beyond the
+// in-order read cursor is rejected with CRYPTO_BUFFER_EXCEEDED rather
+// than buffered, closing an unauthenticated pre-handshake memory DoS.
+TEST(QuicConnection, RejectsOversizedCryptoOffset) {
+    auto [cert, key] = make_self_signed_p256();
+    TlsServerConfig cfg{cert, key, {"h3"}};
+    auto ctx = TlsContext::make_server(cfg);
+    ASSERT_NE(ctx, nullptr);
+
+    std::vector<uint8_t> client_dcid = {0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7};
+    std::vector<uint8_t> client_scid = {0xD5, 0xD6};
+    std::vector<uint8_t> server_scid = {0xE5, 0xE6, 0xE7, 0xE8};
+
+    std::deque<std::vector<uint8_t>> server_outbox;
+    TransportParameters server_tp;
+    server_tp.initial_max_data = 1 << 20;
+    server_tp.initial_max_streams_bidi = 16;
+    server_tp.initial_max_streams_uni = 3;
+
+    auto clock_now = std::chrono::steady_clock::now();
+    Connection::ClockFn clock_fn = [&]() { return clock_now; };
+    Connection server(ctx, {client_dcid.data(), client_dcid.size()},
+                      {client_scid.data(), client_scid.size()},
+                      {server_scid.data(), server_scid.size()}, server_tp,
+                      [&](std::span<const uint8_t> dg) {
+                          server_outbox.emplace_back(dg.begin(), dg.end());
+                      },
+                      clock_fn);
+
+    // First datagram from the "client": a valid Initial packet whose sole
+    // CRYPTO frame declares an offset far past the 64 KiB reassembly
+    // window. Padded to the client Initial minimum so the server accepts
+    // it for processing.
+    auto client = make_client(client_dcid, client_scid);
+    std::vector<uint8_t> payload;
+    {
+        CryptoFrame cf;
+        cf.offset = 200000; // >> 64 KiB window above read offset 0
+        cf.data = {0x01, 0x02, 0x03, 0x04};
+        encode_frame(payload, Frame{cf});
+    }
+    payload.resize(1200, 0x00); // trailing PADDING frames
+    auto pkt =
+        client_build_long(*client, EncryptionLevel::Initial, LongType::Initial, payload);
+
+    server.on_datagram({pkt.data(), pkt.size()});
+    EXPECT_EQ(server.state(), Connection::State::Closing)
+        << "server should close on a CRYPTO frame past the reassembly window";
+}

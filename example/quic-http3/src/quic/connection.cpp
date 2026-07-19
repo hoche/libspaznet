@@ -481,6 +481,19 @@ auto Connection::deliver_frames(EncryptionLevel level, std::span<const uint8_t> 
 
 auto Connection::on_crypto_frame(EncryptionLevel level, const CryptoFrame& f) -> void {
     auto& sp = space(level);
+    // RFC 9000 §7.5 — bound how far ahead of the in-order read cursor we
+    // will buffer out-of-order CRYPTO data. Without this, a peer can send
+    // high-offset fragments (leaving a permanent hole) and grow the
+    // reassembly map without bound before the handshake even completes —
+    // an unauthenticated memory-exhaustion DoS. 64 KiB dwarfs any real
+    // handshake flight while keeping the buffer bounded.
+    constexpr uint64_t kMaxCryptoWindow = 64ULL * 1024;
+    const uint64_t end = f.offset + static_cast<uint64_t>(f.data.size());
+    if (end > sp.crypto_read_offset + kMaxCryptoWindow) {
+        initiate_close(/*error_code=*/0x0d, /*application=*/false, "crypto buffer exceeded",
+                       static_cast<uint64_t>(FrameType::Crypto)); // CRYPTO_BUFFER_EXCEEDED
+        return;
+    }
     sp.crypto_recv_[f.offset] = f.data;
     feed_tls_crypto(level);
 }
