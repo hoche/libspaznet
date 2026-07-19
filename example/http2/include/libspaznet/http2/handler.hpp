@@ -73,8 +73,14 @@ struct Settings {
     // Serialize to SETTINGS frame payload
     [[nodiscard]] auto serialize() const -> std::vector<uint8_t>;
 
-    // Parse from SETTINGS frame payload
+    // Parse from SETTINGS frame payload (starts from RFC defaults).
     static auto parse(const std::vector<uint8_t>& payload) -> Settings;
+
+    // Apply a SETTINGS frame payload onto an existing Settings, updating
+    // only the parameters actually present. RFC 9113 §6.5 defines SETTINGS
+    // as a cumulative update: absent parameters retain their prior value,
+    // so `parse` (which resets to defaults) is wrong for incremental frames.
+    static auto parse_into(const std::vector<uint8_t>& payload, Settings& into) -> void;
 };
 
 // HTTP/2 Stream State per RFC 9113 Section 5.1

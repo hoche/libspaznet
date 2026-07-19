@@ -152,7 +152,11 @@ std::vector<uint8_t> Settings::serialize() const {
 // Settings parsing
 Settings Settings::parse(const std::vector<uint8_t>& payload) {
     Settings settings;
+    parse_into(payload, settings);
+    return settings;
+}
 
+void Settings::parse_into(const std::vector<uint8_t>& payload, Settings& settings) {
     for (size_t i = 0; i + 6 <= payload.size(); i += 6) {
         uint16_t id = (static_cast<uint16_t>(payload[i]) << 8) | payload[i + 1];
         uint32_t value = (static_cast<uint32_t>(payload[i + 2]) << 24) |
@@ -183,8 +187,6 @@ Settings Settings::parse(const std::vector<uint8_t>& payload) {
                 break;
         }
     }
-
-    return settings;
 }
 
 // Request helper methods

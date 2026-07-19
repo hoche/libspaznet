@@ -73,6 +73,13 @@ constexpr std::uint32_t kMaxFrameSizeDefault = 16384;
 // every DATA frame, so flow control alone provides no backpressure.
 constexpr std::size_t kMaxHeaderListBytes = 64ULL * 1024;      // compressed HEADERS+CONTINUATION block
 constexpr std::size_t kMaxBodyBytes = 64ULL * 1024 * 1024;     // total buffered request body
+// SETTINGS_MAX_CONCURRENT_STREAMS we advertise and enforce (RFC 9113
+// §5.1.2). Bounds the live-stream map so a peer can't open unbounded
+// concurrent streams.
+constexpr std::uint32_t kMaxConcurrentStreams = 100;
+// Largest legal HTTP/2 flow-control window (RFC 9113 §6.9.1); a
+// WINDOW_UPDATE pushing a window past this is a FLOW_CONTROL_ERROR.
+constexpr std::int64_t kMaxFlowControlWindow = 0x7FFFFFFF;
 
 // Per-stream state, scoped to the frame loop coroutine.  Once
 // END_STREAM is seen we extract the request data and erase the
@@ -288,7 +295,7 @@ auto serve(::spaznet::Socket socket, Handler& handler) -> ::spaznet::Task {
         state->our_settings.enable_push = false;
         state->our_settings.initial_window_size = kInitialWindow;
         state->our_settings.max_frame_size = kMaxFrameSizeDefault;
-        state->our_settings.max_concurrent_streams = 100;
+        state->our_settings.max_concurrent_streams = kMaxConcurrentStreams;
     }
     enqueue_frame(state, Parser::build_settings_frame(state->our_settings, false));
 
@@ -297,8 +304,10 @@ auto serve(::spaznet::Socket socket, Handler& handler) -> ::spaznet::Task {
 
     auto rst_stream = [&](std::uint32_t sid, std::uint32_t error_code) {
         enqueue_frame(state, Parser::build_rst_stream_frame(sid, error_code));
-        auto it = streams.find(sid);
-        if (it != streams.end()) it->second.reset = true;
+        // Reap the stream: once we've reset it we won't process it further,
+        // so drop it from the live map to bound memory (a peer that opens
+        // and resets streams in a loop would otherwise grow it unboundedly).
+        streams.erase(sid);
     };
 
     auto send_goaway = [&](std::uint32_t error_code) {
@@ -373,11 +382,32 @@ auto serve(::spaznet::Socket socket, Handler& handler) -> ::spaznet::Task {
 
         switch (type) {
             case FrameType::SETTINGS: {
-                if ((flags & Flags::ACK) != 0) break;
-                Settings parsed = Settings::parse(payload);
+                // RFC 9113 §6.5: SETTINGS is a connection-level frame; a
+                // non-zero stream id is PROTOCOL_ERROR, and the length must
+                // be a multiple of 6 (FRAME_SIZE_ERROR).
+                if (stream_id != 0) {
+                    send_goaway(/*PROTOCOL_ERROR*/ 0x1);
+                    state->socket.close();
+                    goto loop_end;
+                }
+                if ((flags & Flags::ACK) != 0) {
+                    if (!payload.empty()) {
+                        send_goaway(/*FRAME_SIZE_ERROR*/ 0x6);
+                        state->socket.close();
+                        goto loop_end;
+                    }
+                    break;
+                }
+                if (payload.size() % 6 != 0) {
+                    send_goaway(/*FRAME_SIZE_ERROR*/ 0x6);
+                    state->socket.close();
+                    goto loop_end;
+                }
                 {
+                    // Cumulative update: only the parameters present in this
+                    // frame change; the rest keep their prior values.
                     std::lock_guard<std::mutex> lk(state->mu);
-                    state->peer_settings = parsed;
+                    Settings::parse_into(payload, state->peer_settings);
                 }
                 Frame ack;
                 ack.type = FrameType::SETTINGS;
@@ -387,6 +417,17 @@ auto serve(::spaznet::Socket socket, Handler& handler) -> ::spaznet::Task {
                 break;
             }
             case FrameType::PING: {
+                // RFC 9113 §6.7: PING is 8 octets on stream 0.
+                if (stream_id != 0) {
+                    send_goaway(/*PROTOCOL_ERROR*/ 0x1);
+                    state->socket.close();
+                    goto loop_end;
+                }
+                if (payload.size() != 8) {
+                    send_goaway(/*FRAME_SIZE_ERROR*/ 0x6);
+                    state->socket.close();
+                    goto loop_end;
+                }
                 if ((flags & Flags::ACK) != 0) break; // pong — done
                 Frame pong;
                 pong.type = FrameType::PING;
@@ -407,19 +448,61 @@ auto serve(::spaznet::Socket socket, Handler& handler) -> ::spaznet::Task {
                      (static_cast<std::uint32_t>(payload[2]) << 8) |
                      static_cast<std::uint32_t>(payload[3])) &
                     0x7FFFFFFFU;
+                // RFC 9113 §6.9: a 0 increment is a PROTOCOL_ERROR
+                // (connection error on stream 0, stream error otherwise).
+                if (inc == 0) {
+                    if (stream_id == 0) {
+                        send_goaway(/*PROTOCOL_ERROR*/ 0x1);
+                        state->socket.close();
+                        goto loop_end;
+                    }
+                    rst_stream(stream_id, /*PROTOCOL_ERROR*/ 0x1);
+                    break;
+                }
                 if (stream_id == 0) {
-                    std::lock_guard<std::mutex> lk(state->mu);
-                    state->conn_send_window += static_cast<std::int64_t>(inc);
+                    bool overflow = false;
+                    {
+                        std::lock_guard<std::mutex> lk(state->mu);
+                        if (state->conn_send_window + static_cast<std::int64_t>(inc) >
+                            kMaxFlowControlWindow) {
+                            overflow = true;
+                        } else {
+                            state->conn_send_window += static_cast<std::int64_t>(inc);
+                        }
+                    }
+                    if (overflow) {
+                        send_goaway(/*FLOW_CONTROL_ERROR*/ 0x3);
+                        state->socket.close();
+                        goto loop_end;
+                    }
                 } else {
-                    auto& s = streams[stream_id];
-                    s.id = stream_id;
-                    s.send_window += static_cast<std::int64_t>(inc);
+                    // Only adjust an existing stream; a WINDOW_UPDATE for an
+                    // unknown id must not spawn a phantom stream (map-growth
+                    // DoS). Idle/closed streams are simply ignored here.
+                    auto it = streams.find(stream_id);
+                    if (it == streams.end()) break;
+                    if (it->second.send_window + static_cast<std::int64_t>(inc) >
+                        kMaxFlowControlWindow) {
+                        rst_stream(stream_id, /*FLOW_CONTROL_ERROR*/ 0x3);
+                        break;
+                    }
+                    it->second.send_window += static_cast<std::int64_t>(inc);
                 }
                 break;
             }
             case FrameType::RST_STREAM: {
-                auto it = streams.find(stream_id);
-                if (it != streams.end()) it->second.reset = true;
+                if (stream_id == 0) {
+                    send_goaway(/*PROTOCOL_ERROR*/ 0x1);
+                    state->socket.close();
+                    goto loop_end;
+                }
+                if (payload.size() != 4) {
+                    send_goaway(/*FRAME_SIZE_ERROR*/ 0x6);
+                    state->socket.close();
+                    goto loop_end;
+                }
+                // Peer reset the stream: reap it to bound memory.
+                streams.erase(stream_id);
                 break;
             }
             case FrameType::GOAWAY: {
@@ -433,6 +516,13 @@ auto serve(::spaznet::Socket socket, Handler& handler) -> ::spaznet::Task {
                     send_goaway(/*PROTOCOL_ERROR*/ 0x1);
                     state->socket.close();
                     goto loop_end;
+                }
+                // RFC 9113 §5.1.2: refuse a new stream beyond the limit we
+                // advertised, bounding concurrent stream state.
+                if (streams.find(stream_id) == streams.end() &&
+                    streams.size() >= kMaxConcurrentStreams) {
+                    rst_stream(stream_id, /*REFUSED_STREAM*/ 0x7);
+                    break;
                 }
                 auto& s = streams[stream_id];
                 s.id = stream_id;

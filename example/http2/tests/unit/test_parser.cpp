@@ -216,6 +216,22 @@ TEST_F(RFC9113ParserTest, SettingsParsing) {
     EXPECT_EQ(parsed.max_concurrent_streams, 50);
 }
 
+// RFC 9113 §6.5: SETTINGS is a cumulative update — a frame that carries
+// only one parameter must leave the others untouched. parse_into applies
+// onto an existing Settings rather than resetting to defaults.
+TEST_F(RFC9113ParserTest, SettingsParseIntoIsCumulative) {
+    spaznet::http2::Settings state;
+    state.max_concurrent_streams = 100;
+    state.initial_window_size = 65535;
+
+    // A frame that sets only INITIAL_WINDOW_SIZE (id 0x4).
+    std::vector<uint8_t> frame = {0x00, 0x04, 0x00, 0x01, 0x00, 0x00}; // 65536
+    spaznet::http2::Settings::parse_into(frame, state);
+
+    EXPECT_EQ(state.initial_window_size, 65536U);       // updated
+    EXPECT_EQ(state.max_concurrent_streams, 100U);      // preserved, not reset
+}
+
 // Test spaznet::http2::Request Pseudo-Headers
 TEST_F(RFC9113ParserTest, RequestPseudoHeaders) {
     spaznet::http2::Request request;
