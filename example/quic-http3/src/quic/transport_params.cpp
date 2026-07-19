@@ -1,6 +1,7 @@
 #include <libspaznet/quic/transport_params.hpp>
 
 #include <cstring>
+#include <unordered_set>
 
 #include <libspaznet/quic/varint.hpp>
 
@@ -129,6 +130,13 @@ auto read_varint_value(std::span<const uint8_t> value, uint64_t& out) -> bool {
 } // namespace
 
 auto decode_transport_params(std::span<const uint8_t> wire, TransportParameters& tp) -> bool {
+    // RFC 9000 §18: a connection ID carried in a transport parameter is at
+    // most 20 bytes. A longer value is a TRANSPORT_PARAMETER_ERROR.
+    constexpr std::size_t kMaxCidLen = 20;
+    // RFC 9000 §7.4: a given transport parameter MUST NOT appear more than
+    // once; a duplicate is a connection error.
+    std::unordered_set<uint64_t> seen;
+
     std::size_t off = 0;
     while (off < wire.size()) {
         uint64_t id = 0;
@@ -140,19 +148,31 @@ auto decode_transport_params(std::span<const uint8_t> wire, TransportParameters&
         if (off + len > wire.size()) {
             return false;
         }
+        if (!seen.insert(id).second) {
+            return false; // duplicate transport parameter
+        }
         std::span<const uint8_t> value{wire.data() + off, static_cast<std::size_t>(len)};
         off += static_cast<std::size_t>(len);
 
         switch (static_cast<TransportParamId>(id)) {
             case TransportParamId::OriginalDestinationConnectionId:
+                if (value.size() > kMaxCidLen) {
+                    return false;
+                }
                 tp.original_destination_connection_id =
                     std::vector<uint8_t>(value.begin(), value.end());
                 break;
             case TransportParamId::InitialSourceConnectionId:
+                if (value.size() > kMaxCidLen) {
+                    return false;
+                }
                 tp.initial_source_connection_id =
                     std::vector<uint8_t>(value.begin(), value.end());
                 break;
             case TransportParamId::RetrySourceConnectionId:
+                if (value.size() > kMaxCidLen) {
+                    return false;
+                }
                 tp.retry_source_connection_id =
                     std::vector<uint8_t>(value.begin(), value.end());
                 break;

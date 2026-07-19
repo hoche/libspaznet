@@ -222,9 +222,11 @@ auto Connection::process_long_packet(std::span<const uint8_t> datagram, std::siz
             level = EncryptionLevel::EarlyData;
             break;
         case LongType::Retry:
-            // Server doesn't receive Retry.
-            off = cursor;
-            return cursor - off;
+            // RFC 9000 §17.2.5: a server never processes a Retry packet.
+            // Return 0 (nothing meaningfully consumed) so on_datagram stops
+            // walking this datagram. (The previous `off = cursor; return
+            // cursor - off;` always evaluated to 0 — dead arithmetic.)
+            return 0;
     }
     auto& sp = space(level);
     if (!sp.recv_keys_ready) {

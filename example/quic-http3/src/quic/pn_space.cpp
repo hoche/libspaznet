@@ -49,6 +49,17 @@ auto PnSpace::on_received(uint64_t pn, bool ack_eliciting) -> void {
 
     // Otherwise insert a new singleton range at the correct sorted spot.
     ranges_.insert(it, Range{pn, pn});
+
+    // Bound the number of retained ACK ranges. A peer that sends packet
+    // numbers with deliberate gaps (e.g. only odd PNs) would otherwise make
+    // ranges_ — and the ACK frame we build from it — grow without limit.
+    // ranges_ is sorted by descending `hi`, so dropping the tail discards
+    // the oldest (lowest-PN) ranges; not acking very old packets is
+    // harmless (RFC 9000 §13.2.1 does not require acking every packet).
+    constexpr std::size_t kMaxAckRanges = 32;
+    if (ranges_.size() > kMaxAckRanges) {
+        ranges_.resize(kMaxAckRanges);
+    }
 }
 
 auto PnSpace::largest_received() const -> std::optional<uint64_t> {

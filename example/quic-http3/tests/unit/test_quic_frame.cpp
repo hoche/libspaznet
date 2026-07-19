@@ -9,6 +9,9 @@
 #include <gtest/gtest.h>
 
 #include <libspaznet/quic/frame.hpp>
+#include <libspaznet/quic/pn_space.hpp>
+#include <libspaznet/quic/transport_params.hpp>
+#include <libspaznet/quic/varint.hpp>
 
 #include <cstring>
 #include <vector>
@@ -206,6 +209,34 @@ TEST(QuicFrame, RetireConnectionId) {
     EXPECT_TRUE(round_trip_one(f));
 }
 
+// RFC 9000 §19.15: a NEW_CONNECTION_ID connection ID length outside 1..20
+// is a FRAME_ENCODING_ERROR — the parser must reject it.
+TEST(QuicFrame, NewConnectionIdRejectsOversizedCid) {
+    // Hand-encode: type, seq, retire_prior_to, cid_len=21, 21 CID bytes,
+    // then a 16-byte stateless reset token.
+    std::vector<uint8_t> wire;
+    VarInt::append(wire, static_cast<uint64_t>(FrameType::NewConnectionId));
+    VarInt::append(wire, /*sequence_number=*/1);
+    VarInt::append(wire, /*retire_prior_to=*/0);
+    wire.push_back(21); // illegal: > 20
+    for (int i = 0; i < 21; ++i) wire.push_back(static_cast<uint8_t>(i));
+    for (int i = 0; i < 16; ++i) wire.push_back(0xAB);
+    std::vector<Frame> parsed;
+    EXPECT_FALSE(parse_frames({wire.data(), wire.size()}, parsed))
+        << "parser accepted a 21-byte connection ID";
+
+    // A zero-length CID is likewise illegal.
+    std::vector<uint8_t> wire0;
+    VarInt::append(wire0, static_cast<uint64_t>(FrameType::NewConnectionId));
+    VarInt::append(wire0, 1);
+    VarInt::append(wire0, 0);
+    wire0.push_back(0); // illegal: < 1
+    for (int i = 0; i < 16; ++i) wire0.push_back(0xAB);
+    std::vector<Frame> parsed0;
+    EXPECT_FALSE(parse_frames({wire0.data(), wire0.size()}, parsed0))
+        << "parser accepted a zero-length connection ID";
+}
+
 TEST(QuicFrame, PathChallengeAndResponse) {
     PathChallengeFrame a;
     a.data = {1, 2, 3, 4, 5, 6, 7, 8};
@@ -261,4 +292,61 @@ TEST(QuicFrame, AckEliciting) {
     EXPECT_TRUE(is_ack_eliciting(Frame{StreamFrame{}}));
     EXPECT_TRUE(is_ack_eliciting(Frame{CryptoFrame{}}));
     EXPECT_TRUE(is_ack_eliciting(Frame{HandshakeDoneFrame{}}));
+}
+
+// RFC 9000 §18: a connection ID in a transport parameter is at most 20
+// bytes; a longer value is a TRANSPORT_PARAMETER_ERROR (decode fails).
+TEST(QuicTransportParams, RejectsOversizedConnectionId) {
+    std::vector<uint8_t> wire;
+    VarInt::append(wire,
+                   static_cast<uint64_t>(TransportParamId::InitialSourceConnectionId));
+    VarInt::append(wire, 21); // length > 20
+    for (int i = 0; i < 21; ++i) wire.push_back(static_cast<uint8_t>(i));
+    TransportParameters tp;
+    EXPECT_FALSE(decode_transport_params({wire.data(), wire.size()}, tp));
+}
+
+// RFC 9000 §7.4: a transport parameter appearing twice is a connection
+// error.
+TEST(QuicTransportParams, RejectsDuplicateParameter) {
+    std::vector<uint8_t> wire;
+    for (int rep = 0; rep < 2; ++rep) {
+        VarInt::append(wire, static_cast<uint64_t>(TransportParamId::InitialMaxData));
+        std::vector<uint8_t> v;
+        VarInt::append(v, 4096);
+        VarInt::append(wire, v.size());
+        wire.insert(wire.end(), v.begin(), v.end());
+    }
+    TransportParameters tp;
+    EXPECT_FALSE(decode_transport_params({wire.data(), wire.size()}, tp));
+}
+
+// A well-formed single set of parameters still decodes.
+TEST(QuicTransportParams, AcceptsWellFormed) {
+    TransportParameters in;
+    in.initial_max_data = 4096;
+    in.initial_max_streams_bidi = 8;
+    in.initial_source_connection_id = std::vector<uint8_t>{0x01, 0x02, 0x03, 0x04};
+    auto wire = encode_transport_params(in);
+    TransportParameters out;
+    ASSERT_TRUE(decode_transport_params({wire.data(), wire.size()}, out));
+    EXPECT_EQ(out.initial_max_data, 4096U);
+    EXPECT_EQ(out.initial_max_streams_bidi, 8U);
+    ASSERT_TRUE(out.initial_source_connection_id.has_value());
+    EXPECT_EQ(out.initial_source_connection_id->size(), 4U);
+}
+
+// RFC 9000 §13.2.1: the stored ACK-range set is bounded so a peer sending
+// packet numbers with gaps can't grow it (and the ACK frame) without limit.
+TEST(QuicPnSpace, BoundsAckRanges) {
+    PnSpace sp;
+    // Deliver 500 packets spaced two apart (0, 2, 4, ...), so every one
+    // starts its own range that never merges with a neighbour.
+    for (uint64_t pn = 0; pn < 1000; pn += 2) {
+        sp.on_received(pn, /*ack_eliciting=*/true);
+    }
+    AckFrame ack;
+    sp.build_ack_frame(/*ack_delay_us=*/0, ack);
+    // first_range + subsequent ranges must stay within the cap (32).
+    EXPECT_LE(ack.ranges.size() + 1, 32U);
 }

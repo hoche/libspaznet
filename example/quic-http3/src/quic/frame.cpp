@@ -261,6 +261,12 @@ auto parse_frame(std::span<const uint8_t> buf, std::size_t& offset, Frame& out) 
             return false;
         }
         std::size_t cid_len = buf[offset++];
+        // RFC 9000 §19.15: a NEW_CONNECTION_ID connection ID is 1..20 bytes;
+        // anything else is a FRAME_ENCODING_ERROR (signalled by parse fail).
+        if (cid_len < 1 || cid_len > 20) {
+            offset = start;
+            return false;
+        }
         if (!read_bytes(buf, offset, cid_len, f.connection_id)) {
             offset = start;
             return false;
