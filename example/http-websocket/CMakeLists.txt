@@ -48,3 +48,6 @@ endif()
 
 add_executable(ws_echo demo/echo.cpp)
 target_link_libraries(ws_echo PRIVATE spaznet_http_websocket)
+
+add_executable(ws_chat demo/chat.cpp)
+target_link_libraries(ws_chat PRIVATE spaznet_http_websocket)
