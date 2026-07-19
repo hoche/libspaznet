@@ -17,10 +17,13 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <coroutine>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -28,7 +31,100 @@
 
 namespace spaznet::websocket {
 
+// Per-connection async write gate. Every write to a connection's socket is
+// serialized through here: the dispatcher's reader coroutine (Pong/Close) and
+// any application coroutine (e.g. a chat broadcaster) all acquire the gate
+// before writing and release it after, so frames never interleave on the wire
+// and two coroutines never both hold the IOContext's per-fd write slot.
+//
+// The gate is a fair (FIFO) async mutex. Acquisition never blocks a worker
+// thread: an uncontended acquire completes inline; a contended one suspends
+// the coroutine and is resumed by whoever releases the gate.
+struct WriteGate {
+    std::mutex m;
+    bool held{false};
+    std::vector<std::coroutine_handle<TaskPromise>> waiters; // FIFO
+
+    struct AcquireAwaiter {
+        WriteGate* gate;
+        [[nodiscard]] auto await_ready() const noexcept -> bool { return false; }
+        // Returns false to continue immediately (gate acquired), true to
+        // suspend until a release() hands this coroutine the gate. The decision
+        // is made under the lock so a concurrent release can't be lost.
+        auto await_suspend(std::coroutine_handle<TaskPromise> handle) -> bool {
+            std::lock_guard<std::mutex> lock(gate->m);
+            if (!gate->held) {
+                gate->held = true;
+                return false;
+            }
+            gate->waiters.push_back(handle);
+            return true;
+        }
+        void await_resume() const noexcept {}
+    };
+
+    auto acquire() -> AcquireAwaiter { return AcquireAwaiter{this}; }
+
+    // Hand the gate to the next waiter (resuming it via the scheduler so we
+    // don't recurse into it on the releasing coroutine's stack), or mark the
+    // gate free if nobody is waiting.
+    void release(::spaznet::IOContext* ctx) {
+        std::coroutine_handle<TaskPromise> next{};
+        {
+            std::lock_guard<std::mutex> lock(m);
+            if (!waiters.empty()) {
+                next = waiters.front();
+                waiters.erase(waiters.begin());
+                // held stays true: ownership transfers to `next`.
+            } else {
+                held = false;
+            }
+        }
+        if (next) {
+            ctx->schedule(Task::from_handle(next));
+        }
+    }
+};
+
 namespace {
+
+// Build a server-origin (unmasked) WebSocket frame in one allocation.
+// Shared by send_message() and Connection::send().
+auto build_frame(Opcode opcode, std::span<const std::uint8_t> payload, bool fin)
+    -> std::vector<std::uint8_t> {
+    const std::size_t len = payload.size();
+
+    std::size_t header_size = 2;
+    if (len > 65535) {
+        header_size += 8;
+    } else if (len > 125) {
+        header_size += 2;
+    }
+
+    std::vector<std::uint8_t> buf;
+    buf.resize(header_size + len);
+
+    buf[0] = static_cast<std::uint8_t>((fin ? 0x80 : 0x00) |
+                                       (static_cast<std::uint8_t>(opcode) & 0x0F));
+
+    if (len > 65535) {
+        buf[1] = 127;
+        for (int i = 0; i < 8; ++i) {
+            buf[2 + i] = static_cast<std::uint8_t>((len >> (56 - i * 8)) & 0xFF);
+        }
+    } else if (len > 125) {
+        buf[1] = 126;
+        buf[2] = static_cast<std::uint8_t>((len >> 8) & 0xFF);
+        buf[3] = static_cast<std::uint8_t>(len & 0xFF);
+    } else {
+        buf[1] = static_cast<std::uint8_t>(len);
+    }
+
+    if (len > 0) {
+        std::memcpy(buf.data() + header_size, payload.data(), len);
+    }
+    return buf;
+}
 
 // ---- crypto helpers (moved from src/server_impl.cpp) -----------------
 
@@ -215,9 +311,21 @@ auto serve_websocket(::spaznet::Socket socket, Handler& handler,
          << "Connection: Upgrade\r\n"
          << "Sec-WebSocket-Accept: " << accept_key << "\r\n\r\n";
     std::string resp_str = resp.str();
+    // The handshake response is written before on_open and before any
+    // application writer coroutine can exist, so this raw write is
+    // uncontended and doesn't need the gate.
     co_await socket.async_write({resp_str.begin(), resp_str.end()});
 
-    co_await handler.on_open(socket);
+    // From here on every write to this socket — the dispatcher's own control
+    // frames below AND anything the handler sends (including from a separate
+    // writer coroutine on another thread) — funnels through `conn`, which
+    // serializes them via `gate`. gate/conn live on this coroutine frame for
+    // the whole connection, so handlers that stash `&conn` must not use it
+    // after on_close returns (the frame is destroyed right after).
+    WriteGate gate;
+    Connection conn{socket, gate};
+
+    co_await handler.on_open(conn);
 
     // Per-connection scratch buffers reused across every read.  See
     // server_impl.cpp's pre-extraction comments for the rationale: this
@@ -275,9 +383,9 @@ auto serve_websocket(::spaznet::Socket socket, Handler& handler,
             body.push_back(static_cast<std::uint8_t>((close_code >> 8) & 0xFF));
             body.push_back(static_cast<std::uint8_t>(close_code & 0xFF));
             body.insert(body.end(), payload.begin(), payload.end());
-            co_await send_message(socket, opcode, body);
+            co_await conn.send(opcode, body);
         } else {
-            co_await send_message(socket, opcode, payload);
+            co_await conn.send(opcode, payload);
         }
     };
 
@@ -385,7 +493,7 @@ auto serve_websocket(::spaznet::Socket socket, Handler& handler,
             if (opcode == Opcode::Close) {
                 if (!sent_close) {
                     sent_close = true;
-                    co_await send_message(socket, Opcode::Close, payload);
+                    co_await conn.send(Opcode::Close, payload);
                 }
                 break;
             } else if (opcode == Opcode::Ping) {
@@ -423,14 +531,14 @@ auto serve_websocket(::spaznet::Socket socket, Handler& handler,
                 msg.opcode = current_message_opcode;
                 std::swap(msg.data, message_buffer);
                 fragmented = false;
-                co_await handler.handle_message(std::move(msg), socket);
+                co_await handler.handle_message(std::move(msg), conn);
                 std::swap(message_buffer, msg.data);
                 message_buffer.clear();
             }
         }
     }
 
-    co_await handler.on_close(socket);
+    co_await handler.on_close(conn);
 }
 
 } // namespace
@@ -439,39 +547,32 @@ auto serve_websocket(::spaznet::Socket socket, Handler& handler,
 
 auto send_message(::spaznet::Socket& socket, Opcode opcode,
                   std::span<const std::uint8_t> payload, bool fin) -> ::spaznet::Task {
-    const std::size_t len = payload.size();
+    // Low-level, UNSERIALIZED write. Safe only when the caller guarantees it
+    // is the sole writer of `socket` (e.g. a handler that writes exclusively
+    // from its own inline handle_message). Handlers with an independent writer
+    // coroutine must use Connection::send instead, which serializes writes.
+    co_await socket.async_write(build_frame(opcode, payload, fin));
+}
 
-    std::size_t header_size = 2;
-    if (len > 65535) {
-        header_size += 8;
-    } else if (len > 125) {
-        header_size += 2;
-    }
+// ---- Connection (serialized per-connection sender) ------------------
 
-    std::vector<std::uint8_t> buf;
-    buf.resize(header_size + len);
+auto Connection::id() const -> int {
+    return socket_->fd();
+}
 
-    buf[0] = static_cast<std::uint8_t>((fin ? 0x80 : 0x00) |
-                                       (static_cast<std::uint8_t>(opcode) & 0x0F));
+auto Connection::context() const -> ::spaznet::IOContext* {
+    return socket_->context();
+}
 
-    if (len > 65535) {
-        buf[1] = 127;
-        for (int i = 0; i < 8; ++i) {
-            buf[2 + i] = static_cast<std::uint8_t>((len >> (56 - i * 8)) & 0xFF);
-        }
-    } else if (len > 125) {
-        buf[1] = 126;
-        buf[2] = static_cast<std::uint8_t>((len >> 8) & 0xFF);
-        buf[3] = static_cast<std::uint8_t>(len & 0xFF);
-    } else {
-        buf[1] = static_cast<std::uint8_t>(len);
-    }
-
-    if (len > 0) {
-        std::memcpy(buf.data() + header_size, payload.data(), len);
-    }
-
-    co_await socket.async_write(std::move(buf));
+auto Connection::send(Opcode opcode, std::span<const std::uint8_t> payload, bool fin)
+    -> ::spaznet::Task {
+    // Build first (no shared state touched), then serialize the actual write
+    // through the per-connection gate so this never interleaves with the
+    // dispatcher's control frames or another coroutine's send.
+    std::vector<std::uint8_t> buf = build_frame(opcode, payload, fin);
+    co_await gate_->acquire();
+    co_await socket_->async_write(std::move(buf));
+    gate_->release(socket_->context());
 }
 
 // ---- combined dispatcher --------------------------------------------

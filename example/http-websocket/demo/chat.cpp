@@ -27,22 +27,17 @@
 // the IOContext's per-fd write registration), and B could disconnect
 // mid-write (use-after-free on the Socket object).
 //
-// To avoid that, every connection remains the *sole* writer of its own
-// socket. A broadcast is delivered as data — pushed onto the target
+// To avoid that, a broadcast is delivered as data — pushed onto the target
 // connection's own outbound queue — and a per-connection writer_loop
-// coroutine (started from on_open, running independently of the reader
-// loop inside serve_websocket) drains that queue and performs the actual
-// send_message() calls. The queue is guarded by a plain mutex that is
-// never held across a co_await.
+// coroutine (started from on_open) drains that queue. The queue is guarded
+// by a plain mutex that is never held across a co_await.
 //
-// Known caveat: serve_websocket still writes its own protocol control
-// frames (Pong replies, the closing Close frame) directly from the
-// connection's *reader* coroutine, not through writer_loop. In steady
-// state that never overlaps an application write to the same socket, but
-// a client Ping arriving in the same instant as a broadcast write is a
-// narrow, unaddressed interleave. Removing it would require refactoring
-// serve_websocket so every write — protocol and application — funnels
-// through one place; out of scope for this demo.
+// All actual socket writes go through Connection::send, which serializes
+// every write to a connection through a shared per-connection gate. That
+// gate is also used by the dispatcher's reader coroutine for its control
+// frames (Pong, Close), so a broadcast write and a Pong can never interleave
+// on the wire or both grab the fd's write registration — the writer_loop and
+// the reader coroutine take turns via the gate.
 
 #include <libspaznet/http/handler.hpp>
 #include <libspaznet/server.hpp>
@@ -157,10 +152,11 @@ class HttpFallback : public spaznet::http::HTTPHandler {
 // Per-connection state: an outbound queue fed by *other* connections'
 // handle_message calls, drained only by this connection's own writer_loop.
 struct Session {
-    Session(int id_param, spaznet::Socket* sock_param) : id(id_param), sock(sock_param) {}
+    Session(int id_param, spaznet::websocket::Connection* conn_param)
+        : id(id_param), conn(conn_param) {}
 
     const int id;
-    spaznet::Socket* const sock;
+    spaznet::websocket::Connection* const conn;
 
     std::mutex mu;
     std::deque<std::vector<uint8_t>> outbox;
@@ -190,16 +186,17 @@ struct Session {
     }
 };
 
-// Drains one Session's outbox on an interval, performing the only
-// send_message() calls that ever touch that connection's socket.
+// Drains one Session's outbox on an interval. All writes go through
+// Connection::send, which shares the connection's write gate with the
+// dispatcher's control frames — so this writer never races the reader
+// coroutine's Pong/Close writes.
 spaznet::Task writer_loop(std::shared_ptr<Session> session) {
     using namespace std::chrono_literals;
-    auto* ctx = session->sock->context();
+    auto* ctx = session->conn->context();
     while (true) {
         auto pending = session->drain();
         for (auto& msg : pending) {
-            co_await spaznet::websocket::send_message(*session->sock,
-                                                       spaznet::websocket::Opcode::Text, msg);
+            co_await session->conn->send(spaznet::websocket::Opcode::Text, msg);
         }
         if (!session->open.load(std::memory_order_acquire) && session->empty()) {
             break;
@@ -211,15 +208,15 @@ spaznet::Task writer_loop(std::shared_ptr<Session> session) {
 
 class ChatRoom : public spaznet::websocket::Handler {
   public:
-    spaznet::Task on_open(spaznet::Socket& socket) override {
-        auto session = std::make_shared<Session>(socket.fd(), &socket);
+    spaznet::Task on_open(spaznet::websocket::Connection& conn) override {
+        auto session = std::make_shared<Session>(conn.id(), &conn);
         std::size_t online = 0;
         {
             std::lock_guard<std::mutex> lock(mu_);
             sessions_[session->id] = session;
             online = sessions_.size();
         }
-        socket.context()->schedule(writer_loop(session));
+        conn.context()->schedule(writer_loop(session));
 
         std::string notice = "* user" + std::to_string(session->id) + " joined (" +
                              std::to_string(online) + " online)\n";
@@ -231,21 +228,21 @@ class ChatRoom : public spaznet::websocket::Handler {
     // the rvalue overload's default forwarder calls it, which is fine here
     // since we don't need to move the payload out of `message`.
     spaznet::Task handle_message(const spaznet::websocket::Message& message,
-                                 spaznet::Socket& socket) override {
+                                 spaznet::websocket::Connection& conn) override {
         if (message.opcode != spaznet::websocket::Opcode::Text) {
             co_return;
         }
-        std::string framed = "user" + std::to_string(socket.fd()) + ": " +
+        std::string framed = "user" + std::to_string(conn.id()) + ": " +
                              std::string(message.data.begin(), message.data.end());
-        broadcast(socket.fd(), {framed.begin(), framed.end()});
+        broadcast(conn.id(), {framed.begin(), framed.end()});
         co_return;
     }
 
-    spaznet::Task on_close(spaznet::Socket& socket) override {
+    spaznet::Task on_close(spaznet::websocket::Connection& conn) override {
         std::shared_ptr<Session> session;
         {
             std::lock_guard<std::mutex> lock(mu_);
-            auto it = sessions_.find(socket.fd());
+            auto it = sessions_.find(conn.id());
             if (it != sessions_.end()) {
                 session = it->second;
                 sessions_.erase(it);
@@ -260,9 +257,9 @@ class ChatRoom : public spaznet::websocket::Handler {
 
         // Tell writer_loop to drain whatever is left and stop; then wait
         // for it to finish before returning, since our caller
-        // (serve_websocket) destroys `socket` right after on_close.
+        // (serve_websocket) destroys `conn`/`gate` right after on_close.
         session->open.store(false, std::memory_order_release);
-        auto* ctx = socket.context();
+        auto* ctx = conn.context();
         while (!session->writer_done.load(std::memory_order_acquire)) {
             co_await ctx->sleep_for(std::chrono::milliseconds(5));
         }
@@ -301,6 +298,6 @@ int main() {
     spaznet::Server server(4);
     server.set_connection_handler(spaznet::websocket::make_dispatcher(
         std::make_unique<HttpFallback>(), std::make_unique<ChatRoom>()));
-    server.listen_tcp(9082);
+    server.listen_tcp(8080);
     server.run();
 }

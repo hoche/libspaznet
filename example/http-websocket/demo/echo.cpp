@@ -30,16 +30,12 @@ class HttpFallback : public spaznet::http::HTTPHandler {
 
 class Echo : public spaznet::websocket::Handler {
   public:
-    spaznet::Task on_open(spaznet::Socket&) override { co_return; }
-    spaznet::Task on_close(spaznet::Socket&) override { co_return; }
+    spaznet::Task on_open(spaznet::websocket::Connection&) override { co_return; }
+    spaznet::Task on_close(spaznet::websocket::Connection&) override { co_return; }
 
-    spaznet::Task handle_message(spaznet::websocket::Message&& m,
-                                 spaznet::Socket& sock) override {
-        co_await spaznet::websocket::send_message(sock, m.opcode, m.data);
-    }
     spaznet::Task handle_message(const spaznet::websocket::Message& m,
-                                 spaznet::Socket& sock) override {
-        co_await spaznet::websocket::send_message(sock, m.opcode, m.data);
+                                 spaznet::websocket::Connection& conn) override {
+        co_await conn.send(m.opcode, m.data);
     }
 };
 

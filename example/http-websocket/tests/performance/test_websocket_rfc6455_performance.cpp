@@ -157,21 +157,14 @@ std::string handshake_request(const std::string& key) {
 
 class EchoWSHandler : public spaznet::websocket::Handler {
   public:
-    Task on_open(Socket&) override {
+    Task on_open(spaznet::websocket::Connection&) override {
         co_return;
     }
-    Task handle_message(const spaznet::websocket::Message& message, Socket& socket) override {
-        spaznet::websocket::Frame frame;
-        frame.fin = true;
-        frame.rsv1 = frame.rsv2 = frame.rsv3 = false;
-        frame.opcode = message.opcode;
-        frame.masked = false;
-        frame.payload = message.data;
-        frame.payload_length = frame.payload.size();
-        auto bytes = frame.serialize();
-        co_await socket.async_write(std::move(bytes));
+    Task handle_message(const spaznet::websocket::Message& message,
+                        spaznet::websocket::Connection& conn) override {
+        co_await conn.send(message.opcode, message.data);
     }
-    Task on_close(Socket&) override {
+    Task on_close(spaznet::websocket::Connection&) override {
         co_return;
     }
 };
