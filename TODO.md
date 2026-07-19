@@ -1,20 +1,48 @@
 # TODO
 
-- TLS addition. Already in QUIC, of course, but needs to be added to the other protocols. HTTP/1.x should support both separate socket listeners and ALPN. Websockets should support both ws as wss. 
+- Fix Windows builds (with poll)
+- Fix Windows IOCP backend (low priority)
+- TLS addition. Already in QUIC, of course, but needs to be added to the
+  other protocols. HTTP/1.x should support both separate socket listeners
+  and ALPN. Websockets should support both ws as wss.
 - QUIC Demo. There is none at this point.
 - QUIC Improvements
-	+ 0-RTT / session resumption (RFC 9001 §4.6) — not implemented. Needs session-ticket issuance, early-data keys, and anti-replay. Flagged in the perf profile as the single biggest realistic win.
-	+ Connection-level flow control (RFC 9000 §4.1) — only per-stream limits exist (ensure_stream sets recv/send limits). There's no connection-aggregate MAX_DATA accounting, no MAX_DATA emission, and MAX_STREAMS is not enforced — ensure_stream creates unbounded streams (also the Medium DoS from the security review). connection.cpp has no conn_recv/conn_send window tracking.
-	+ Active Connection ID management (RFC 9000 §5.1) — NEW_CONNECTION_ID/RETIRE_CONNECTION_ID frames parse and encode but are not acted on: the server never issues spare CIDs, never processes the peer's, and does no CID rotation.
-	+ Connection migration / path validation (RFC 9000 §9) — currently "Limited": it echoes inbound PATH_CHALLENGE and freezes the peer address post-handshake, but does not initiate PATH_CHALLENGE, validate alternate paths, or migrate — so legitimate NAT rebinding strands the connection until idle timeout. Depends on #4.
-	+ Stateless reset (RFC 9000 §10.3) — only the stateless_reset_token transport parameter is advertised; there's no detection of inbound stateless resets and no emission of one for unknown-CID datagrams.
-	+ Path MTU discovery (DPLPMTUD, RFC 8899) — fixed max_udp_payload_size; no probing.
-	+ ECN validation (RFC 9000 §13.4) — ACK carries ECN counts on the wire but there's no marking/validation path.
-	+ Client mode — Connection::Role has only Server. No client handshake initiation, client-initiated streams, or client TP handling. (Large component.)
-- Other client modes (examples)
+	+ 0-RTT / session resumption (RFC 9001 §4.6) — not
+	 implemented. Needs session-ticket issuance, early-data keys,
+	 and anti-replay. Flagged in the perf profile as the single
+	 biggest realistic win.
+	+ Connection-level flow control (RFC 9000 §4.1) —
+	 only per-stream limits exist (ensure_stream sets recv/send
+	limits). There's no connection-aggregate MAX_DATA accounting,
+	 no MAX_DATA emission, and MAX_STREAMS is not enforced —
+	 ensure_stream creates unbounded streams (also the Medium DoS from
+	 the security review). connection.cpp has no conn_recv/conn_send
+	 window tracking.
+	+ Active Connection ID management (RFC 9000 §5.1) —
+	 NEW_CONNECTION_ID/RETIRE_CONNECTION_ID frames parse and encode
+	 but are not acted on: the server never issues spare CIDs, never
+	 processes the peer's, and does no CID rotation.
+	+ Connection migration / path validation (RFC 9000 §9) —
+	 currently "Limited": it echoes inbound PATH_CHALLENGE and
+	 freezes the peer address post-handshake, but does not initiate
+	 PATH_CHALLENGE, validate alternate paths, or migrate — so
+	 legitimate NAT rebinding strands the connection until idle
+	 timeout. Depends on #4.
+	+ Stateless reset (RFC 9000 §10.3) — only the
+	 stateless_reset_token transport parameter is advertised; there's
+	 no detection of inbound stateless resets and no emission of one
+	 for unknown-CID datagrams.
+	+ Path MTU discovery (DPLPMTUD, RFC 8899) — fixed
+	 max_udp_payload_size; no probing.
+	+ ECN validation (RFC 9000 §13.4) — ACK carries ECN counts
+	 on the wire but there's no marking/validation path.
+	+ Client mode — Connection::Role has only Server. No client
+	 handshake initiation, client-initiated streams, or client TP
+	 handling. (Large component.)
+- Other client modes (provide examples)
 	+ HTTP Client
 	+ HTTP/2 Client
-	+ Websocket Client
+	+ WEbsocket Client
 
 ## Progress Summary - 2026-07-18
 
