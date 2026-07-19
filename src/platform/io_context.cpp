@@ -77,8 +77,23 @@ IOContext::IOContext(std::size_t num_threads)
     g_statistics.store(&statistics_, std::memory_order_release);
 }
 
+void IOContext::join_workers() {
+    std::lock_guard<std::mutex> lock(worker_join_mutex_);
+    for (auto& thread : worker_threads_) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    worker_threads_.clear();
+}
+
 IOContext::~IOContext() {
+    // Wake parked workers, then join them before any member destructors run.
+    // Destroying worker_wake_mutex_ / worker_wake_cv_ while a worker is still
+    // inside condition_variable::wait() is undefined behaviour and shows up
+    // on macOS ARM64 as std::system_error("mutex lock failed: Invalid argument").
     stop();
+    join_workers();
 
     // Clear global statistics pointer
     StatisticsInternal* expected = &statistics_;
@@ -123,6 +138,21 @@ auto IOContext::drain_wakeup_pipe() const -> void {
 
 void IOContext::run() {
     running_.store(true, std::memory_order_release);
+
+    // Join workers even if the event loop throws — otherwise ~IOContext would
+    // destroy worker_wake_mutex_ under a parked condition_variable::wait().
+    struct JoinWorkersGuard {
+        IOContext* self;
+        ~JoinWorkersGuard() {
+            self->running_.store(false, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(self->worker_wake_mutex_);
+                self->worker_wake_cv_.notify_all();
+            }
+            self->wakeup_event_loop();
+            self->join_workers();
+        }
+    } join_guard{this};
 
     // Start worker threads
     for (std::size_t i = 0; i < num_threads_; ++i) {
@@ -172,22 +202,17 @@ void IOContext::run() {
             }
         }
     }
-
-    // Wait for worker threads
-    for (auto& thread : worker_threads_) {
-        if (thread.joinable()) {
-            thread.join();
-        }
-    }
 }
 
 void IOContext::stop() {
     running_.store(false, std::memory_order_release);
     // Wake every parked worker so it observes running_ == false and exits.
+    // Notify under the lock so the store to running_ and the wakeup are
+    // visible to a waiter that is between its predicate check and wait().
     {
         std::lock_guard<std::mutex> lock(worker_wake_mutex_);
+        worker_wake_cv_.notify_all();
     }
-    worker_wake_cv_.notify_all();
     // Ensure any blocking wait() returns promptly.
     wakeup_event_loop();
 }
@@ -219,8 +244,8 @@ void IOContext::schedule(Task task) {
     // wait() — that would otherwise lose the wakeup and strand the task.
     {
         std::lock_guard<std::mutex> lock(worker_wake_mutex_);
+        worker_wake_cv_.notify_one();
     }
-    worker_wake_cv_.notify_one();
     // If the run() thread is blocked in wait(), wake it too so it can steal
     // and help drain the queues promptly.
     wakeup_event_loop();

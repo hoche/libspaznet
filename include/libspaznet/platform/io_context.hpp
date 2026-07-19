@@ -697,12 +697,22 @@ class IOContext {
   private:
     std::unique_ptr<PlatformIO> platform_io_;
     std::vector<TaskQueue> thread_queues_;
-    std::vector<std::thread> worker_threads_;
     // Idle worker threads park on this CV instead of busy-yielding when their
     // queues are empty. schedule() notifies after enqueuing; stop() wakes all
     // so they can observe running_ == false and exit. See worker_thread().
+    //
+    // Mutex/CV are declared before worker_threads_ so member destruction
+    // tears down the thread objects first. That way a still-joinable worker
+    // hits ~thread's std::terminate path instead of destroying the mutex
+    // under a parked wait() (which manifests on macOS ARM64 libc++ as
+    // "mutex lock failed: Invalid argument"). The real safety net is
+    // join_workers() in run()'s exit path and in ~IOContext.
     std::mutex worker_wake_mutex_;
     std::condition_variable worker_wake_cv_;
+    // Serializes joining workers between run()'s exit path and ~IOContext,
+    // so a destructor that races a returning run() cannot double-join.
+    std::mutex worker_join_mutex_;
+    std::vector<std::thread> worker_threads_;
     std::atomic<bool> running_;
     std::atomic<std::size_t> next_queue_;
     // Number of worker threads to spawn (0 means fully non-threaded: everything runs on run()
@@ -784,6 +794,10 @@ class IOContext {
     auto drain_wakeup_pipe() const -> void;
 
     void worker_thread(std::size_t queue_index);
+    // Join every worker and clear worker_threads_. Must be called only when
+    // no new workers will be spawned concurrently (i.e. from run()'s exit
+    // path or from ~IOContext after stop()).
+    void join_workers();
     void process_io_events(const std::vector<PlatformIO::Event>& events);
     void process_timers();
     auto compute_wait_timeout_ms() -> int;

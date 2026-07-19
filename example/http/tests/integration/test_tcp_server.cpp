@@ -44,10 +44,21 @@ class TCPServerTest : public ::testing::Test {
     }
 
     void TearDown() override {
-        server->stop();
+        // Always join the run() thread before destroying Server/IOContext.
+        // stop() can throw std::system_error if a prior bug left a mutex
+        // invalid; still join so we never destroy IOContext under live workers
+        // (that is what surfaces as "mutex lock failed: Invalid argument" on
+        // macOS ARM64 when worker_wake_mutex_ is torn down mid-wait).
+        if (server) {
+            try {
+                server->stop();
+            } catch (...) {
+            }
+        }
         if (server_thread.joinable()) {
             server_thread.join();
         }
+        server.reset();
     }
 
     int connect_to_server(uint16_t port) {
