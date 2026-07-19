@@ -306,6 +306,7 @@ set(SPAZNET_UNIT_TEST_SOURCES
     tests/unit/test_io_context.cpp
     tests/unit/test_timer.cpp
     tests/unit/test_logger.cpp
+    tests/unit/test_number_utils.cpp
 )
 add_executable(test_unit ${SPAZNET_UNIT_TEST_SOURCES})
 target_link_libraries(test_unit PRIVATE spaznet GTest::gtest GTest::gmock)
