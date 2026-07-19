@@ -12,60 +12,26 @@ jobs:
     name: Build and Test - Linux x64
     runs-on: ubuntu-latest
 
-    env:
-      OPENSSL_VERSION: 3.5.4
-      OPENSSL_PREFIX: ${{ github.workspace }}/.openssl
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up CMake
-        uses: jwlawson/actions-setup-cmake@v1.14
-        with:
-          cmake-version: '3.30'
-
-      - name: Install dependencies
+      - name: Build and test in Ubuntu 25.10 container
         run: |
-          sudo apt-get update
-          # Need gcc 13.1+ for <format>; noble (24.04) has g++-13 available.
-          sudo apt-get install -y build-essential g++-13 iperf3
-          echo "CC=gcc-13"  >> "$GITHUB_ENV"
-          echo "CXX=g++-13" >> "$GITHUB_ENV"
-
-      - name: Cache OpenSSL ${{ env.OPENSSL_VERSION }}
-        id: openssl-cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.OPENSSL_PREFIX }}
-          key: openssl-${{ env.OPENSSL_VERSION }}-linux-x64
-
-      - name: Build OpenSSL ${{ env.OPENSSL_VERSION }}
-        if: steps.openssl-cache.outputs.cache-hit != 'true'
-        run: |
-          set -e
-          cd /tmp
-          curl -sSL -O "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
-          tar xzf "openssl-${OPENSSL_VERSION}.tar.gz"
-          cd "openssl-${OPENSSL_VERSION}"
-          ./Configure --prefix="${OPENSSL_PREFIX}" --openssldir="${OPENSSL_PREFIX}" no-tests shared
-          make -j$(nproc)
-          make install_sw
-
-      - name: Configure CMake
-        run: |
-          mkdir -p build
-          cd build
-          cmake .. -DOPENSSL_ROOT_DIR="${OPENSSL_PREFIX}"
-
-      - name: Build
-        run: |
-          cd build
-          cmake --build . --config Release -j$(nproc)
-
-      - name: Run Tests
-        env:
-          LD_LIBRARY_PATH: ${{ env.OPENSSL_PREFIX }}/lib64:${{ env.OPENSSL_PREFIX }}/lib
-        run: |
-          cd build
-          ctest --output-on-failure
+          # Host runner is still 24.04 (OpenSSL 3.0). Pull OpenSSL 3.5 from
+          # ubuntu:25.10 apt instead of building it from source. Native amd64
+          # — no QEMU.
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace -w /workspace \
+            ubuntu:25.10 bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y build-essential g++ cmake git ca-certificates \
+                               iperf3 libssl-dev
+            mkdir -p build && cd build
+            cmake ..
+            grep -q "SPAZNET_BUILD_QUIC:BOOL=ON" CMakeCache.txt
+            cmake --build . --config Release -j$(nproc)
+            ctest --output-on-failure
+          '

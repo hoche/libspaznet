@@ -21,34 +21,23 @@ jobs:
         with:
           platforms: arm64
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Build and test in ARM64 container
         run: |
-          # ubuntu:24.04 ships g++-13 in apt; we still build OpenSSL 3.5
-          # from source because no Ubuntu release through 25.10 has it
-          # packaged. Building under QEMU is slow (~10 min); the rest of
-          # the test suite runs in another few minutes.
+          # ubuntu:25.10 (questing) packages OpenSSL 3.5 via apt, so we can
+          # skip the ~10 min from-source build that ubuntu:24.04 forced under
+          # QEMU. g++ on 25.10 is new enough for <format>.
+          # (No buildx needed — plain `docker run`, not `docker buildx`.)
           docker run --rm --platform linux/arm64 \
             -v ${{ github.workspace }}:/workspace -w /workspace \
-            ubuntu:24.04 bash -c '
+            ubuntu:25.10 bash -c '
             set -e
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            apt-get install -y build-essential g++-13 cmake git curl ca-certificates iperf3
-            export CC=gcc-13 CXX=g++-13
-            cd /tmp
-            curl -sSL -O https://github.com/openssl/openssl/releases/download/openssl-3.5.4/openssl-3.5.4.tar.gz
-            tar xzf openssl-3.5.4.tar.gz
-            cd openssl-3.5.4
-            ./Configure --prefix=/opt/openssl-3.5 --openssldir=/opt/openssl-3.5 no-tests shared
-            make -j$(nproc)
-            make install_sw
-            cd /workspace
+            apt-get install -y build-essential g++ cmake git ca-certificates \
+                               iperf3 libssl-dev
             mkdir -p build && cd build
-            cmake .. -DOPENSSL_ROOT_DIR=/opt/openssl-3.5
+            cmake ..
+            grep -q "SPAZNET_BUILD_QUIC:BOOL=ON" CMakeCache.txt
             cmake --build . --config Release -j$(nproc)
-            export LD_LIBRARY_PATH=/opt/openssl-3.5/lib64:/opt/openssl-3.5/lib
             ctest --output-on-failure
           '

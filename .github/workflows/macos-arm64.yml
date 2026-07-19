@@ -23,14 +23,28 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install cmake openssl@3.5 iperf3 || true
-          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3.5)" >> "$GITHUB_ENV"
+          # Do not swallow brew failures with `|| true` — a missing
+          # openssl@3.5 would silently disable QUIC (find_package QUIET)
+          # while the job still looked green. CMake comes from the
+          # setup-cmake step above; no need to brew it.
+          brew install openssl@3.5 iperf3
+          OPENSSL_PREFIX="$(brew --prefix openssl@3.5)"
+          if [[ ! -d "$OPENSSL_PREFIX" ]]; then
+            echo "openssl@3.5 prefix missing: $OPENSSL_PREFIX" >&2
+            exit 1
+          fi
+          echo "OPENSSL_ROOT_DIR=$OPENSSL_PREFIX" >> "$GITHUB_ENV"
 
       - name: Configure CMake
         run: |
           mkdir -p build
           cd build
           cmake .. -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"
+
+      - name: Verify QUIC enabled
+        run: |
+          # Fail fast if OpenSSL 3.5 wasn't found and QUIC was auto-disabled.
+          grep -q 'SPAZNET_BUILD_QUIC:BOOL=ON' build/CMakeCache.txt
 
       - name: Build
         run: |
