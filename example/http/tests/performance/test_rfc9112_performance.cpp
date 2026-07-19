@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "perf_budget.hpp"
 #include <chrono>
 #include <iostream>
 #include <libspaznet/http/dispatcher.hpp>
@@ -112,7 +113,7 @@ TEST_F(RFC9112PerformanceTest, ParseRequestSmall) {
     std::cout << "[PERF] Throughput: " << (1000000.0 / avg_time_us) << " requests/sec" << std::endl;
 
     // Should parse small requests very quickly (< 10μs)
-    EXPECT_LT(avg_time_us, 100);
+    EXPECT_LT(avg_time_us, spaznet::test::perf_ceiling(100));
 }
 
 TEST_F(RFC9112PerformanceTest, ParseRequestMedium) {
@@ -134,7 +135,7 @@ TEST_F(RFC9112PerformanceTest, ParseRequestMedium) {
     std::cout << "\n[PERF] Medium request parsing: " << avg_time_us << " μs/request" << std::endl;
     std::cout << "[PERF] Throughput: " << (1000000.0 / avg_time_us) << " requests/sec" << std::endl;
 
-    EXPECT_LT(avg_time_us, 500);
+    EXPECT_LT(avg_time_us, spaznet::test::perf_ceiling(500));
 }
 
 TEST_F(RFC9112PerformanceTest, ParseRequestLarge) {
@@ -156,7 +157,7 @@ TEST_F(RFC9112PerformanceTest, ParseRequestLarge) {
     std::cout << "\n[PERF] Large request parsing: " << avg_time_us << " μs/request" << std::endl;
     std::cout << "[PERF] Throughput: " << (1000000.0 / avg_time_us) << " requests/sec" << std::endl;
 
-    EXPECT_LT(avg_time_us, 5000);
+    EXPECT_LT(avg_time_us, spaznet::test::perf_ceiling(5000));
 }
 
 TEST_F(RFC9112PerformanceTest, ParseRequestChunked) {
@@ -178,7 +179,7 @@ TEST_F(RFC9112PerformanceTest, ParseRequestChunked) {
     std::cout << "\n[PERF] Chunked request parsing: " << avg_time_us << " μs/request" << std::endl;
     std::cout << "[PERF] Throughput: " << (1000000.0 / avg_time_us) << " requests/sec" << std::endl;
 
-    EXPECT_LT(avg_time_us, 1000);
+    EXPECT_LT(avg_time_us, spaznet::test::perf_ceiling(1000));
 }
 
 // Benchmark response serialization performance
@@ -200,7 +201,7 @@ TEST_F(RFC9112PerformanceTest, SerializeResponseSmall) {
     std::cout << "[PERF] Throughput: " << (1000000.0 / avg_time_us) << " responses/sec"
               << std::endl;
 
-    EXPECT_LT(avg_time_us, 50);
+    EXPECT_LT(avg_time_us, spaznet::test::perf_ceiling(50));
 }
 
 TEST_F(RFC9112PerformanceTest, SerializeResponseMedium) {
@@ -221,7 +222,7 @@ TEST_F(RFC9112PerformanceTest, SerializeResponseMedium) {
     std::cout << "[PERF] Throughput: " << (1000000.0 / avg_time_us) << " responses/sec"
               << std::endl;
 
-    EXPECT_LT(avg_time_us, 500);
+    EXPECT_LT(avg_time_us, spaznet::test::perf_ceiling(500));
 }
 
 TEST_F(RFC9112PerformanceTest, SerializeResponseLarge) {
@@ -242,7 +243,7 @@ TEST_F(RFC9112PerformanceTest, SerializeResponseLarge) {
     std::cout << "[PERF] Throughput: " << (1000000.0 / avg_time_us) << " responses/sec"
               << std::endl;
 
-    EXPECT_LT(avg_time_us, 5000);
+    EXPECT_LT(avg_time_us, spaznet::test::perf_ceiling(5000));
 }
 
 TEST_F(RFC9112PerformanceTest, SerializeResponseChunked) {
@@ -263,7 +264,7 @@ TEST_F(RFC9112PerformanceTest, SerializeResponseChunked) {
     std::cout << "[PERF] Throughput: " << (1000000.0 / avg_time_us) << " responses/sec"
               << std::endl;
 
-    EXPECT_LT(avg_time_us, 1000);
+    EXPECT_LT(avg_time_us, spaznet::test::perf_ceiling(1000));
 }
 
 // Benchmark header field lookup (case-insensitive)
@@ -295,9 +296,9 @@ TEST_F(RFC9112PerformanceTest, HeaderLookupPerformance) {
               << std::endl;
     std::cout << "[PERF] Throughput: " << (1000000.0 / avg_time_us) << " lookups/sec" << std::endl;
 
-    // Performance tests can vary slightly across CPUs / schedulers.
-    // Keep this as a regression guard, but avoid flaking on ~1.0µs boundary.
-    EXPECT_LT(avg_time_us, 1.2);
+    // Regression guard. Tight on native hosts; perf_ceiling() loosens 10x
+    // under QEMU so the Linux ARM64 CI job does not flake.
+    EXPECT_LT(avg_time_us, spaznet::test::perf_ceiling(1.2));
 }
 
 // Benchmark chunked body parsing
@@ -329,5 +330,5 @@ TEST_F(RFC9112PerformanceTest, ParseChunkedBodyPerformance) {
     std::cout << "\n[PERF] Chunked body parsing (100KB): " << avg_time_us << " μs" << std::endl;
     std::cout << "[PERF] Throughput: " << (100000.0 / avg_time_us) << " KB/sec" << std::endl;
 
-    EXPECT_LT(avg_time_us, 10000);
+    EXPECT_LT(avg_time_us, spaznet::test::perf_ceiling(10000));
 }

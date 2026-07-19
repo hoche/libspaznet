@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "perf_budget.hpp"
 #include <signal.h>
 #include <libspaznet/detail/socket_compat.hpp>
 #include <atomic>
@@ -139,7 +140,7 @@ TEST_F(ThroughputTest, SingleConnectionThroughput) {
               << " req/s" << std::endl;
 
     // Should handle at least 100 req/s
-    EXPECT_GT(requests_per_second, 100.0);
+    EXPECT_GT(requests_per_second, spaznet::test::perf_floor(100.0));
 }
 
 TEST_F(ThroughputTest, MultipleConnectionsThroughput) {
@@ -179,7 +180,7 @@ TEST_F(ThroughputTest, MultipleConnectionsThroughput) {
               << " req/s" << std::endl;
 
     // Should handle at least 500 req/s with multiple connections
-    EXPECT_GT(requests_per_second, 500.0);
+    EXPECT_GT(requests_per_second, spaznet::test::perf_floor(500.0));
 }
 
 TEST_F(ThroughputTest, SustainedLoadThroughput) {
@@ -224,7 +225,7 @@ TEST_F(ThroughputTest, SustainedLoadThroughput) {
               << " req/s" << std::endl;
 
     // Should maintain throughput over time
-    EXPECT_GT(requests_per_second, 100.0);
+    EXPECT_GT(requests_per_second, spaznet::test::perf_floor(100.0));
 }
 
 TEST_F(ThroughputTest, LargeResponseThroughput) {

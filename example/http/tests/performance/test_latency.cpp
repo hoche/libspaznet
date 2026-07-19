@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "perf_budget.hpp"
 #include <libspaznet/detail/socket_compat.hpp>
 #include <algorithm>
 #include <chrono>
@@ -124,7 +125,7 @@ TEST_F(LatencyTest, SingleRequestLatency) {
     std::cout << "  P99: " << p99 << " μs" << std::endl;
 
     // Median latency should be reasonable (< 10ms)
-    EXPECT_LT(median, 10000);
+    EXPECT_LT(median, spaznet::test::perf_ceiling(10000));
 }
 
 TEST_F(LatencyTest, ConcurrentRequestLatency) {
@@ -168,7 +169,7 @@ TEST_F(LatencyTest, ConcurrentRequestLatency) {
     std::cout << "  Median: " << median << " μs" << std::endl;
     std::cout << "  P95: " << p95 << " μs" << std::endl;
 
-    EXPECT_LT(median, 20000); // Should handle concurrent requests reasonably
+    EXPECT_LT(median, spaznet::test::perf_ceiling(20000)); // Should handle concurrent requests reasonably
 }
 
 TEST_F(LatencyTest, ConnectionEstablishmentLatency) {

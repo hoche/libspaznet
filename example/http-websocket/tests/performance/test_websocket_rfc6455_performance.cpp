@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "perf_budget.hpp"
 #include <chrono>
 #include <libspaznet/websocket/dispatcher.hpp>
 #include <libspaznet/websocket/send.hpp>
@@ -203,7 +204,7 @@ TEST(WebSocketPerformance, EchoesHundredsOfFramesQuickly) {
     }
     auto end = std::chrono::steady_clock::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    EXPECT_LT(ms, 2000); // simple performance guard
+    EXPECT_LT(ms, spaznet::test::perf_ceiling(2000)); // simple performance guard
 
     close_socket(fd);
     server.stop();

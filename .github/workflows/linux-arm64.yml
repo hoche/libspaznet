@@ -32,6 +32,9 @@ jobs:
             ubuntu:25.10 bash -c '
             set -e
             export DEBIAN_FRONTEND=noninteractive
+            # Tell perf_budget.hpp to loosen microbenchmark ceilings/floors.
+            # /proc/cpuinfo usually also says QEMU, but the env var is explicit.
+            export SPAZNET_UNDER_QEMU=1
             apt-get update
             apt-get install -y build-essential g++ cmake ninja-build git \
                                ca-certificates iperf3 libssl-dev

@@ -214,6 +214,8 @@ endif()
 
 function(spaznet_apply_test_warnings target)
     target_compile_options(${target} PRIVATE ${spaznet_test_warning_flags})
+    # So performance suites can `#include "perf_budget.hpp"`.
+    target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/tests)
 endfunction()
 
 spaznet_apply_warnings(spaznet)
