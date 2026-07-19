@@ -1,14 +1,63 @@
 # TODO
 
-> Status as of 9630b58 (2026-05-29): unit suite is fully green on both
-> macOS (AppleClang + OpenSSL 3.6.1) and Linux (gcc 13.3 + OpenSSL
-> 3.5.4) — **225/225 unit tests**. asan+ubsan and tsan builds also
-> clean on both platforms (tsan on meep needs `setarch -R` to dodge
-> the kernel-ASLR-vs-tsan-shadow conflict; not a code issue). The two
-> long-standing macOS PlatformIO failures fixed earlier in e9d66f6
-> remain fixed.
+- TLS addition. Already in QUIC, of course, but needs to be added to the other protocols. HTTP/1.x should support both separate socket listeners and ALPN. Websockets should support both ws as wss. 
+- QUIC Demo. There is none at this point.
+- QUIC Improvements
+	+ 0-RTT / session resumption (RFC 9001 §4.6) — not implemented. Needs session-ticket issuance, early-data keys, and anti-replay. Flagged in the perf profile as the single biggest realistic win.
+	+ Connection-level flow control (RFC 9000 §4.1) — only per-stream limits exist (ensure_stream sets recv/send limits). There's no connection-aggregate MAX_DATA accounting, no MAX_DATA emission, and MAX_STREAMS is not enforced — ensure_stream creates unbounded streams (also the Medium DoS from the security review). connection.cpp has no conn_recv/conn_send window tracking.
+	+ Active Connection ID management (RFC 9000 §5.1) — NEW_CONNECTION_ID/RETIRE_CONNECTION_ID frames parse and encode but are not acted on: the server never issues spare CIDs, never processes the peer's, and does no CID rotation.
+	+ Connection migration / path validation (RFC 9000 §9) — currently "Limited": it echoes inbound PATH_CHALLENGE and freezes the peer address post-handshake, but does not initiate PATH_CHALLENGE, validate alternate paths, or migrate — so legitimate NAT rebinding strands the connection until idle timeout. Depends on #4.
+	+ Stateless reset (RFC 9000 §10.3) — only the stateless_reset_token transport parameter is advertised; there's no detection of inbound stateless resets and no emission of one for unknown-CID datagrams.
+	+ Path MTU discovery (DPLPMTUD, RFC 8899) — fixed max_udp_payload_size; no probing.
+	+ ECN validation (RFC 9000 §13.4) — ACK carries ECN counts on the wire but there's no marking/validation path.
+	+ Client mode — Connection::Role has only Server. No client handshake initiation, client-initiated streams, or client TP handling. (Large component.)
+- Other client modes (examples)
+	+ HTTP Client
+	+ HTTP/2 Client
+	+ Websocket Client
 
-## Active multi-session work
+## Progress Summary - 2026-07-18
+
+### Bugfixes
+
+- [x] **Idle worker busy-spin** (96aeb36) — worker threads no longer
+  `yield()`-loop when queues are empty. They park on
+  `worker_wake_cv_`; `schedule()` / `stop()` wake them. Idle CPU for
+  `Server(4)` drops from ~400% to ~0%.
+- [x] **Join parked workers before destroying the wake mutex** (7c0b4f7)
+  — `~IOContext` and `run()`'s exit path always `join_workers()` after
+  `stop()`. Destroying `worker_wake_mutex_` under a parked
+  `condition_variable::wait()` was undefined behaviour and showed up
+  on macOS ARM64 libc++ as `mutex lock failed: Invalid argument`
+  during `HttpIntegrationTests` / `TCPServerTest.ListenOnPort`
+  teardown. `TCPServerTest::TearDown` also joins even if `stop()`
+  throws.
+- [x] **WebSocket Ping/Pong vs application write race** (99c99aa) —
+  per-connection fair async `WriteGate` + `Connection` wrapper.
+  Dispatcher control frames and handler `send()` all serialize on the
+  same gate so frames cannot interleave on the wire.
+- [x] **iperf server orphan / port-in-use flake** (e81b137) —
+  `start_iperf_server()` execs `iperf`/`iperf3` directly instead of
+  via `sh -c`, so `stop()` kills the real listener. Prefer iperf3;
+  keep `-u` as an iperf2-server-only flag (iperf3 `-u` is client-only).
+
+### Example demos and docs added
+
+- [x] **WebSocket chat** (`ws_chat`, a7f464c + a39eceb) — multi-client
+  broadcast room with a served HTML+JS page; demo README explains why
+  chat exercises WebSocket better than echo.
+- [x] **HTTP/1.x showcase** (`http_showcase`, e20fac2 + f8ed6a0) —
+  keep-alive defaults, chunked vs Content-Length, request-body framing
+  observable with `curl --http1.0` vs `--http1.1`.
+- [x] **HTTP/2 showcase** (`http2_showcase`, 5be7fe7 + f8ed6a0) —
+  multiplexing via `/slow?ms=N`, plus stream-info / echo / status
+  routes (h2c prior-knowledge).
+- [x] **UDP relay + statsd** (`udp_relay`, `udp_statsd`, 1f37154..1080188)
+  — connectionless peer fan-out, and fire-and-forget metrics aggregation.
+- [x] **Top-level README demo table** (7a191a4) — one-line description
+  per demo binary under each example protocol.
+
+## Progress Summary - 2026-05-31
 
 - [x] **Pull protocol handlers out of core into `example/<protocol>/`** — landed 2026-05-31 across commits a7fab2d..2253437. All ten phases done; src/ and include/libspaznet/ now carry only the low-level server. Same 284 tests pass on Mac and meep.
   - Goal: `src/` and `include/` contain only the low-level server
@@ -29,8 +78,8 @@
     `spaznet::http::make_dispatcher(unique_ptr<HTTPHandler>)
     -> ConnectionHandler`. Dispatcher reads requests, runs
     keep-alive loop, calls the user's handler — no WS upgrade
-    detection. Demo: `example/http/demo/hello.cpp` (10-line
-    "Hello, World" server).
+    detection. Demos: `http_hello`, plus later `http_showcase`
+    (1.0 vs 1.1 feature routes).
   - **Phase 2b — HTTP/1.1 + WebSocket → `example/http-websocket/`**
     (combined stack, depends on `example/http/` for the HTTP/1.1
     parser used during upgrade). WS types live in
@@ -45,17 +94,19 @@
         -> ConnectionHandler`. Dispatcher reads first request,
     detects WS upgrade, either runs the WS frame loop or hands
     to the HTTP dispatcher (composing example/http's
-    machinery). Demo: `example/http-websocket/demo/echo.cpp`
-    (WebSocket echo server). This phase is where the ~400-line
-    WS frame loop currently inline in
-    `src/server_impl.cpp::handle_connection` ends up — it moves
-    to `example/http-websocket/src/dispatcher.cpp`.
+    machinery). Demos: `ws_echo`, plus later `ws_chat` (broadcast
+    room + browser page) and the `Connection` write gate. This phase
+    is where the ~400-line WS frame loop previously inline in
+    `src/server_impl.cpp::handle_connection` ends up — it moved to
+    `example/http-websocket/src/dispatcher.cpp`.
   - **Phase 3 — HTTP/2 → `example/http2/`**. Status quo: dispatch
     isn't wired into `Server::handle_connection` today; move keeps
     the parser/HPACK code visible without changing behavior.
+    Demos added later: `http2_hello`, `http2_showcase` (multiplexing).
   - **Phase 4 — UDP → `example/udp/`**. Becomes a thin wrapper
     around `set_datagram_handler` for code that prefers the
-    handler-interface idiom.
+    handler-interface idiom. Demos added later: `udp_echo`,
+    `udp_relay`, `udp_statsd`.
   - **Phase 5 — QUIC + HTTP/3 → `example/quic-http3/`**. The
     `quic::` and `http3::` namespaces stay; just relocate the
     files and update `add_subdirectory` wiring.
@@ -208,7 +259,7 @@ The seven-phase rewrite landed (see "From the 2026-05-27 audit" above),
 but a number of items were explicitly deferred or left as cleanup work.
 Ordered by priority.
 
-### Cleanup we deferred but should land before anyone uses this
+### Cleanup that was deferred but should land before anyone uses this
 
 - [x] Delete the toy QUIC/HTTP/3 code
   - Deleted `src/handlers/quic_handler.cpp`,
@@ -246,7 +297,7 @@ Ordered by priority.
     automatically when a Handshake-protected packet decrypts (proof
     the peer received our Initial response).
 
-### Spec MUSTs we deferred
+### Spec MUSTs deferred
 
 - [x] Key update (RFC 9001 §6) — landed 2026-05-31.
   Both directions of 1-RTT key updates are wired:
@@ -436,11 +487,24 @@ Ordered by priority.
 
 ## Other
 
-- [x] Add support for TLS
+- [x] Add support for TLS (QUIC path)
   - Shipped as part of the QUIC rewrite (commit 3da5cbb). The
     `TlsContext` / `TlsConnection` wrappers around OpenSSL 3.5+ live
     in `include/libspaznet/quic/tls.hpp`. They're QUIC-specific
     today — using them for vanilla TLS-over-TCP would need a thin
     `SSL_read`/`SSL_write`-driven path that isn't there yet, but the
     SSL_CTX construction (cert/key loading, ALPN) is reusable.
+
+- [ ] **TLS-over-TCP for HTTP / HTTP/2 / WebSocket (https / wss)** — LATER
+  - Design sketched 2026-07-18: optional OpenSSL path inside
+    `Socket::async_read` / `async_write` (opaque pimpl, `SSL_set_fd`,
+    `WANT_READ`/`WANT_WRITE` → existing `register_io` awaits), gated by
+    `SPAZNET_ENABLE_TLS` / `SPAZNET_HAS_TLS` (OpenSSL 1.1.1+/3.0+,
+    independent of QUIC's 3.5+ requirement). Would give all three
+    example servers https/wss with no dispatcher changes.
+  - **Blocked on ALPN protocol-selection decision:** one TLS port with
+    ALPN auto-routing (`h2` vs `http/1.1`/wss) vs per-server single
+    protocol. Scope (core only vs wire all examples + demos) also open.
+  - Plan file: `.cursor/plans/tls_https_support_later_00b0f3d4.plan.md`
+    (or the workspace copy under the user's Cursor plans dir).
 
