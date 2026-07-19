@@ -109,6 +109,13 @@ class PlatformIOIOCP : public PlatformIO {
         return true;
     }
 
+    // Probe post failed because the socket is not connected/bound yet.
+    // Poll allows registering such fds; keep interest without an outstanding op.
+    static auto is_deferred_probe_error(int err) -> bool {
+        return err == WSAENOTCONN || err == WSAEDESTADDRREQ || err == WSAEINVAL ||
+               err == WSAENOTSOCK;
+    }
+
     auto arm_listen_read_locked(int fd, FdRecord& rec) -> bool {
         if (rec.read_probe != nullptr) {
             return true;
@@ -143,6 +150,18 @@ class PlatformIOIOCP : public PlatformIO {
         }
 
         rec.read_probe = ctx;
+
+        // WSAEventSelect is edge-oriented: ResetEvent can hide connections
+        // already in the listen backlog. If accept is already possible,
+        // re-signal so the wait callback posts immediately.
+        WSAPOLLFD pfd{};
+        pfd.fd = socket_handle(fd);
+        pfd.events = POLLRDNORM;
+        pfd.revents = 0;
+        if (WSAPoll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLRDNORM | POLLIN | POLLERR)) != 0) {
+            SetEvent(rec.accept_event);
+        }
+
         return true;
     }
 
@@ -170,7 +189,7 @@ class PlatformIOIOCP : public PlatformIO {
             const int err = WSAGetLastError();
             if (err != WSA_IO_PENDING) {
                 delete ctx;
-                return false;
+                return is_deferred_probe_error(err);
             }
         }
         rec.read_probe = ctx;
@@ -197,7 +216,7 @@ class PlatformIOIOCP : public PlatformIO {
             const int err = WSAGetLastError();
             if (err != WSA_IO_PENDING) {
                 delete ctx;
-                return false;
+                return is_deferred_probe_error(err);
             }
         }
         rec.write_probe = ctx;
