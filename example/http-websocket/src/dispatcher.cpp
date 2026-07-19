@@ -173,6 +173,21 @@ std::string compute_accept(const std::string& key) {
     return base64_encode(std::vector<uint8_t>(digest.begin(), digest.end()));
 }
 
+// RFC 6455 §4.1: Sec-WebSocket-Key is a base64-encoded 16-byte nonce,
+// i.e. a 24-character base64 string ending in "==". Reject anything else
+// rather than computing an Accept over a malformed key.
+bool is_valid_ws_key(const std::string& key) {
+    if (key.size() != 24) return false;
+    auto is_b64 = [](char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+               (c >= '0' && c <= '9') || c == '+' || c == '/';
+    };
+    for (std::size_t i = 0; i < 22; ++i) {
+        if (!is_b64(key[i])) return false;
+    }
+    return key[22] == '=' && key[23] == '=';
+}
+
 bool is_upgrade(const HandshakeRequest& req) {
     const auto& hdrs = req.headers;
     auto upgrade_it = hdrs.find("upgrade");
@@ -183,13 +198,14 @@ bool is_upgrade(const HandshakeRequest& req) {
            version_it != hdrs.end() && req.method == "GET" &&
            header_has_token(upgrade_it->second, "websocket") &&
            header_has_token(conn_it->second, "upgrade") &&
-           to_lower(version_it->second) == "13";
+           to_lower(version_it->second) == "13" && is_valid_ws_key(key_it->second);
 }
 
 // ---- WS frame loop --------------------------------------------------
 
 auto serve_websocket(::spaznet::Socket socket, Handler& handler,
-                     const HandshakeRequest& req) -> ::spaznet::Task {
+                     const HandshakeRequest& req, std::vector<uint8_t> initial)
+    -> ::spaznet::Task {
     std::string client_key = req.headers.at("sec-websocket-key");
     std::string accept_key = compute_accept(client_key);
 
@@ -208,7 +224,9 @@ auto serve_websocket(::spaznet::Socket socket, Handler& handler,
     // is the WS hot path and the stash-buffered recv collapses
     // header/mask/payload into one syscall on small frames.
     std::vector<uint8_t> read_chunk;
-    std::vector<uint8_t> ws_recv_stash;
+    // Seed the stash with any bytes the client pipelined right after the
+    // upgrade request so the first WS frame isn't lost.
+    std::vector<uint8_t> ws_recv_stash = std::move(initial);
     std::size_t ws_stash_off = 0;
     constexpr std::size_t kWsRecvHint = 4096;
 
@@ -332,6 +350,17 @@ auto serve_websocket(::spaznet::Socket socket, Handler& handler,
             }
         }
 
+        const bool is_control =
+            opcode == Opcode::Close || opcode == Opcode::Ping || opcode == Opcode::Pong;
+        // RFC 6455 §5.5: control frames MUST NOT be fragmented and carry at
+        // most 125 bytes. Reject *before* reading and unmasking the payload
+        // so an oversized/fragmented control frame can't make us buffer and
+        // XOR up to kMaxPayloadBytes of attacker data.
+        if (is_control && (!fin || payload_len > 125)) {
+            co_await fail_close(1002);
+            break;
+        }
+
         if (payload_len > Frame::kMaxPayloadBytes) {
             co_await fail_close(1009);
             break;
@@ -351,13 +380,8 @@ auto serve_websocket(::spaznet::Socket socket, Handler& handler,
             payload[i] ^= ((masking_key >> ((3 - (i % 4)) * 8)) & 0xFF);
         }
 
-        const bool is_control =
-            opcode == Opcode::Close || opcode == Opcode::Ping || opcode == Opcode::Pong;
         if (is_control) {
-            if (!fin || payload_len > 125) {
-                co_await fail_close(1002);
-                break;
-            }
+            // Fragmentation / size already validated above, before the read.
             if (opcode == Opcode::Close) {
                 if (!sent_close) {
                     sent_close = true;
@@ -484,7 +508,20 @@ auto make_dispatcher(std::unique_ptr<::spaznet::http::HTTPHandler> http_handler,
         }
 
         if (handshake && is_upgrade(*handshake) && ws_shared) {
-            co_await serve_websocket(std::move(sock), *ws_shared, *handshake);
+            // Preserve any bytes pipelined after the upgrade request's
+            // header terminator (e.g. an immediate WS frame in the same
+            // TCP segment) — otherwise that first frame would be dropped.
+            std::vector<uint8_t> leftover;
+            auto hs_end = request_str.find("\r\n\r\n");
+            if (hs_end != std::string::npos) {
+                const std::size_t start = hs_end + 4;
+                if (start < buffer.size()) {
+                    leftover.assign(buffer.begin() + static_cast<std::ptrdiff_t>(start),
+                                    buffer.end());
+                }
+            }
+            co_await serve_websocket(std::move(sock), *ws_shared, *handshake,
+                                     std::move(leftover));
             co_return;
         }
 
