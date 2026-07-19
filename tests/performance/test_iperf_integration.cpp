@@ -24,8 +24,9 @@
 class IperfIntegrationTest : public ::testing::Test {
   protected:
     std::string find_iperf_executable() {
-        // Try iperf (iperf2) first, then iperf3
-        const char* candidates[] = {"iperf", "iperf3"};
+        // Prefer iperf3: CI installs it, and its server is protocol-agnostic
+        // (UDP is selected by the client). Fall back to classic iperf (v2).
+        const char* candidates[] = {"iperf3", "iperf"};
 
         for (const char* cmd : candidates) {
             std::string test_cmd = std::string(cmd) + " --version > /dev/null 2>&1";
@@ -56,32 +57,33 @@ class IperfIntegrationTest : public ::testing::Test {
         stop_iperf_server();
     }
 
-    bool start_iperf_server(int port, int duration_seconds = 300, bool udp = false) {
+    bool start_iperf_server(int port, int /*duration_seconds*/ = 300, bool udp = false) {
         if (iperf_executable_.empty()) {
             return false;
         }
 
         stop_iperf_server(); // Stop any existing server
 
-        std::ostringstream cmd;
-        if (is_iperf3(iperf_executable_)) {
-            // iperf3 syntax
-            cmd << iperf_executable_ << " -s -p " << port;
-        } else {
-            // iperf2 syntax (uses -t for time, but server doesn't need it)
-            cmd << iperf_executable_ << " -s -p " << port;
-            // For iperf2, UDP requires the server to be started with `-u`.
-            if (udp) {
-                cmd << " -u";
-            }
+        // Build the argv we will exec. Important: do NOT go through `sh -c`.
+        // If we tracked the shell's PID, stop_iperf_server() would kill the
+        // shell and leave an orphaned iperf/iperf3 still bound to `port`, so
+        // the next start fails with "Address already in use" and waitpid
+        // reports an immediate exit — which is what UDPBandwidthTest saw.
+        //
+        // iperf3: server is protocol-agnostic; `-u` is client-only (passing
+        // it to `iperf3 -s` exits with "parameter error").
+        // iperf2: UDP servers must be started with `-u`.
+        std::ostringstream cmd_log;
+        cmd_log << iperf_executable_ << " -s -p " << port;
+        if (!is_iperf3(iperf_executable_) && udp) {
+            cmd_log << " -u";
         }
-
-        std::cout << "\n[IPERF] Starting server: " << cmd.str() << std::endl;
+        std::cout << "\n[IPERF] Starting server: " << cmd_log.str() << std::endl;
 
 #ifdef _WIN32
         STARTUPINFOA si = {sizeof(si)};
         PROCESS_INFORMATION pi;
-        std::string cmd_str = cmd.str();
+        std::string cmd_str = cmd_log.str();
         char* cmd_cstr = new char[cmd_str.length() + 1];
         std::strcpy(cmd_cstr, cmd_str.c_str());
 
@@ -107,10 +109,20 @@ class IperfIntegrationTest : public ::testing::Test {
                 dup2(devnull, STDERR_FILENO);
                 close(devnull);
             }
-            execlp("/bin/sh", "sh", "-c", cmd.str().c_str(), nullptr);
+            const std::string port_str = std::to_string(port);
+            if (is_iperf3(iperf_executable_)) {
+                execlp(iperf_executable_.c_str(), iperf_executable_.c_str(), "-s", "-p",
+                       port_str.c_str(), static_cast<char*>(nullptr));
+            } else if (udp) {
+                execlp(iperf_executable_.c_str(), iperf_executable_.c_str(), "-s", "-p",
+                       port_str.c_str(), "-u", static_cast<char*>(nullptr));
+            } else {
+                execlp(iperf_executable_.c_str(), iperf_executable_.c_str(), "-s", "-p",
+                       port_str.c_str(), static_cast<char*>(nullptr));
+            }
             _exit(1); // Use _exit in child to avoid flushing buffers
         } else if (pid > 0) {
-            // Parent process
+            // Parent process — pid is the real iperf/iperf3, not a shell.
             server_process_id_ = pid;
             server_running_ = true;
             // Wait a moment for server to start
@@ -119,7 +131,7 @@ class IperfIntegrationTest : public ::testing::Test {
             if (waitpid(pid, nullptr, WNOHANG) == 0) {
                 return true;
             }
-            // Process exited immediately
+            // Process exited immediately (bad args, port in use, missing binary)
             server_running_ = false;
             server_process_id_ = 0;
             return false;

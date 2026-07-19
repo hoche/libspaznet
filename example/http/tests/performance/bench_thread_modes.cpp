@@ -511,27 +511,36 @@ static auto parse_iperf3_json_udp(const std::string& json)
 static auto start_iperf_server(const std::string& exe, int port, bool udp) -> pid_t {
     pid_t pid = fork();
     if (pid == 0) {
-        // Child: exec server, silence output.
+        // Child: exec server directly (not via `sh -c`) so the returned pid
+        // is the real iperf process. Killing a shell parent would orphan the
+        // listener and leave the port bound for the next run.
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) {
             dup2(devnull, STDOUT_FILENO);
             dup2(devnull, STDERR_FILENO);
             close(devnull);
         }
-        std::ostringstream cmd;
+        const std::string port_str = std::to_string(port);
+        // iperf3: server is protocol-agnostic; `-u` is client-only.
+        // iperf2: UDP servers must be started with `-u`.
         if (is_iperf3(exe)) {
-            cmd << exe << " -s -p " << port;
+            execlp(exe.c_str(), exe.c_str(), "-s", "-p", port_str.c_str(),
+                   static_cast<char*>(nullptr));
+        } else if (udp) {
+            execlp(exe.c_str(), exe.c_str(), "-s", "-p", port_str.c_str(), "-u",
+                   static_cast<char*>(nullptr));
         } else {
-            cmd << exe << " -s -p " << port;
-            if (udp) {
-                cmd << " -u";
-            }
+            execlp(exe.c_str(), exe.c_str(), "-s", "-p", port_str.c_str(),
+                   static_cast<char*>(nullptr));
         }
-        execlp("/bin/sh", "sh", "-c", cmd.str().c_str(), nullptr);
         _exit(1);
     }
     if (pid > 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        // Bail out if the server exited immediately (port in use, bad args).
+        if (waitpid(pid, nullptr, WNOHANG) == pid) {
+            return -1;
+        }
         return pid;
     }
     return -1;
