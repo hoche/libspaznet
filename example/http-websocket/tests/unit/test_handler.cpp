@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cstdint>
 #include <libspaznet/websocket/dispatcher.hpp>
 #include <libspaznet/websocket/send.hpp>

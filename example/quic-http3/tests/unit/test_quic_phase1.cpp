@@ -8,7 +8,9 @@
 #include <libspaznet/quic/packet.hpp>
 #include <libspaznet/quic/varint.hpp>
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <string>
