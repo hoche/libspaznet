@@ -364,59 +364,73 @@ void IOContext::register_io(int file_descriptor, uint32_t events, CoroutineHandl
     // critical section on purpose: it must stay mutually exclusive with
     // remove_io's remove_fd, which shares this lock to close the
     // platform-layer side-table fd-reuse race (see remove_io).
-    std::lock_guard<std::mutex> lock(map_lock_);
-
-    // Determine whether this fd was already registered before storing new handles.
-    auto pending_it = pending_io_.find(file_descriptor);
-    bool already_registered = pending_it != pending_io_.end();
-    PendingIO& pending = already_registered ? pending_it->second : pending_io_[file_descriptor];
-
-    // Bump the generation on first registration AND on every re-registration:
-    // any event still in the kernel's queue (or already returned to
-    // userspace but not yet dispatched) for the previous instance carries
-    // the old generation and will be filtered out by process_io_events.
     //
-    // generation 0 is the wakeup-pipe sentinel (delivered as a null
-    // token). If the counter wraps back to 0 after 2^32-1 registrations,
-    // re-roll so a real fd never gets the sentinel generation and has its
-    // events silently dropped as wakeup-pipe traffic.
-    uint32_t generation = next_generation_.fetch_add(1, std::memory_order_relaxed);
-    if (generation == 0) {
-        generation = next_generation_.fetch_add(1, std::memory_order_relaxed);
-    }
-    pending.generation = generation;
+    // Poll/WSAPoll snapshots the interest set before blocking. A worker
+    // that re-arms POLLIN/POLLOUT while wait() is inside that syscall
+    // would otherwise wait until the default 100ms timeout. Wake the
+    // event loop after releasing map_lock_ so the next wait() sees the
+    // updated interest (epoll/kqueue already observe ctl immediately;
+    // the extra wakeup byte is harmless there).
+    bool need_wakeup = false;
+    {
+        std::lock_guard<std::mutex> lock(map_lock_);
 
+        // Determine whether this fd was already registered before storing new handles.
+        auto pending_it = pending_io_.find(file_descriptor);
+        bool already_registered = pending_it != pending_io_.end();
+        PendingIO& pending = already_registered ? pending_it->second : pending_io_[file_descriptor];
 
-    // Keep the awaiting coroutine alive while it is registered. The handle
-    // arrives already ref-counted (the awaiter built it from its concrete
-    // promise type), so storing it here retains a strong reference — the
-    // coroutine frame would otherwise be destroyed while suspended.
-    uint32_t new_events = 0;
-    if (handle) {
-        if ((events & PlatformIO::EVENT_READ) != 0) {
-            pending.read = handle;
+        // Bump the generation on first registration AND on every re-registration:
+        // any event still in the kernel's queue (or already returned to
+        // userspace but not yet dispatched) for the previous instance carries
+        // the old generation and will be filtered out by process_io_events.
+        //
+        // generation 0 is the wakeup-pipe sentinel (delivered as a null
+        // token). If the counter wraps back to 0 after 2^32-1 registrations,
+        // re-roll so a real fd never gets the sentinel generation and has its
+        // events silently dropped as wakeup-pipe traffic.
+        uint32_t generation = next_generation_.fetch_add(1, std::memory_order_relaxed);
+        if (generation == 0) {
+            generation = next_generation_.fetch_add(1, std::memory_order_relaxed);
         }
-        if ((events & PlatformIO::EVENT_WRITE) != 0) {
-            pending.write = handle;
+        pending.generation = generation;
+
+        // Keep the awaiting coroutine alive while it is registered. The handle
+        // arrives already ref-counted (the awaiter built it from its concrete
+        // promise type), so storing it here retains a strong reference — the
+        // coroutine frame would otherwise be destroyed while suspended.
+        uint32_t new_events = 0;
+        if (handle) {
+            if ((events & PlatformIO::EVENT_READ) != 0) {
+                pending.read = handle;
+            }
+            if ((events & PlatformIO::EVENT_WRITE) != 0) {
+                pending.write = handle;
+            }
         }
+
+        // Enable event bits that currently have waiters.
+        if (pending.read) {
+            new_events |= PlatformIO::EVENT_READ;
+        }
+        if (pending.write) {
+            new_events |= PlatformIO::EVENT_WRITE;
+        }
+
+        // Pack (generation, fd) as the user_data token so the platform layer
+        // can hand it back verbatim on event delivery. The token is opaque
+        // to the platform — it must NOT be dereferenced.
+        void* token = encode_token(pending.generation, file_descriptor);
+        if (already_registered) {
+            platform_io_->modify_fd(file_descriptor, new_events, token);
+        } else {
+            platform_io_->add_fd(file_descriptor, new_events, token);
+        }
+        need_wakeup = (new_events != 0);
     }
 
-    // Enable event bits that currently have waiters.
-    if (pending.read) {
-        new_events |= PlatformIO::EVENT_READ;
-    }
-    if (pending.write) {
-        new_events |= PlatformIO::EVENT_WRITE;
-    }
-
-    // Pack (generation, fd) as the user_data token so the platform layer
-    // can hand it back verbatim on event delivery. The token is opaque
-    // to the platform — it must NOT be dereferenced.
-    void* token = encode_token(pending.generation, file_descriptor);
-    if (already_registered) {
-        platform_io_->modify_fd(file_descriptor, new_events, token);
-    } else {
-        platform_io_->add_fd(file_descriptor, new_events, token);
+    if (need_wakeup) {
+        wakeup_event_loop();
     }
 }
 

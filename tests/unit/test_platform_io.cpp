@@ -93,29 +93,34 @@ TEST_F(PlatformIOTest, WaitForEvents) {
     // Create a pair of connected sockets
     int fds[2];
 #ifdef _WIN32
-    // On Windows, use TCP sockets
+    // Winsock has no socketpair; use a TCP loopback pair. Connect must
+    // target 127.0.0.1 — connecting to INADDR_ANY (0.0.0.0) fails with
+    // WSAEADDRNOTAVAIL and leave accept() blocked forever.
     int listener = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr {};
+    ASSERT_GE(listener, 0);
+    sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;
-    bind(listener, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
-    listen(listener, 1);
+    ASSERT_EQ(bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ASSERT_EQ(listen(listener, 1), 0);
     socklen_t len = sizeof(addr);
-    getsockname(listener, reinterpret_cast<struct sockaddr*>(&addr), &len);
+    ASSERT_EQ(getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &len), 0);
 
     int client = socket(AF_INET, SOCK_STREAM, 0);
-    connect(client, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+    ASSERT_GE(client, 0);
+    ASSERT_EQ(connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
     fds[0] = accept(listener, nullptr, nullptr);
+    ASSERT_GE(fds[0], 0);
     fds[1] = client;
-    closesocket(listener);
+    detail::close_socket_fd(listener);
 #else
     ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
 #endif
 
     // Set non-blocking
     for (int i = 0; i < 2; ++i) {
-detail::set_nonblocking(fds[i]);
+        detail::set_nonblocking(fds[i]);
     }
 
     void* user_data1 = reinterpret_cast<void*>(0x1111);
@@ -137,7 +142,7 @@ detail::set_nonblocking(fds[i]);
     platform_io->remove_fd(fds[0]);
     platform_io->remove_fd(fds[1]);
 
-detail::close_socket_fd(fds[0]);
+    detail::close_socket_fd(fds[0]);
     detail::close_socket_fd(fds[1]);
 }
 
