@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <coroutine>
 #include <cstdint>
 #include <functional>
@@ -697,6 +698,11 @@ class IOContext {
     std::unique_ptr<PlatformIO> platform_io_;
     std::vector<TaskQueue> thread_queues_;
     std::vector<std::thread> worker_threads_;
+    // Idle worker threads park on this CV instead of busy-yielding when their
+    // queues are empty. schedule() notifies after enqueuing; stop() wakes all
+    // so they can observe running_ == false and exit. See worker_thread().
+    std::mutex worker_wake_mutex_;
+    std::condition_variable worker_wake_cv_;
     std::atomic<bool> running_;
     std::atomic<std::size_t> next_queue_;
     // Number of worker threads to spawn (0 means fully non-threaded: everything runs on run()

@@ -183,6 +183,11 @@ void IOContext::run() {
 
 void IOContext::stop() {
     running_.store(false, std::memory_order_release);
+    // Wake every parked worker so it observes running_ == false and exits.
+    {
+        std::lock_guard<std::mutex> lock(worker_wake_mutex_);
+    }
+    worker_wake_cv_.notify_all();
     // Ensure any blocking wait() returns promptly.
     wakeup_event_loop();
 }
@@ -209,34 +214,68 @@ void IOContext::schedule(Task task) {
     // Round-robin scheduling
     std::size_t index = next_queue_.fetch_add(1, std::memory_order_acq_rel) % queue_count_;
     thread_queues_[index].enqueue(std::move(task));
-    // If another thread is blocked in wait(), wake it so scheduled work runs promptly.
+    // Wake a parked worker. Take worker_wake_mutex_ (after the enqueue is
+    // visible) so this can't slip between a worker's predicate check and its
+    // wait() — that would otherwise lose the wakeup and strand the task.
+    {
+        std::lock_guard<std::mutex> lock(worker_wake_mutex_);
+    }
+    worker_wake_cv_.notify_one();
+    // If the run() thread is blocked in wait(), wake it too so it can steal
+    // and help drain the queues promptly.
     wakeup_event_loop();
 }
 
 void IOContext::worker_thread(std::size_t queue_index) {
-    TaskQueue& queue = thread_queues_[queue_index];
+    const std::size_t queue_n = thread_queues_.size();
+
+    // True if any thread queue currently holds a task. Called both to grab
+    // work and as the CV predicate, so a worker never parks while work is
+    // pending. Workers steal across all queues (not just their own) so a
+    // notify_one that happens to wake the "wrong" worker still drains the
+    // task instead of spinning.
+    auto try_take = [&](Task& out) -> bool {
+        for (std::size_t k = 0; k < queue_n; ++k) {
+            if (thread_queues_[(queue_index + k) % queue_n].dequeue(out)) {
+                return true;
+            }
+        }
+        return false;
+    };
 
     while (running_.load(std::memory_order_acquire)) {
         Task task;
-        if (queue.dequeue(task)) {
+        if (try_take(task)) {
             // Check if task handle is valid before accessing it
-            if (!task.handle) {
-                continue;
-            }
-
-            // Resume at most once. Do NOT auto-reschedule:
-            // resumption should be driven by I/O/timers/continuations.
-            if (!task.done()) {
+            if (task.handle && !task.done()) {
+                // Resume at most once. Do NOT auto-reschedule:
+                // resumption should be driven by I/O/timers/continuations.
                 task.resume();
             }
             // Drain any continuations deferred by resume_with_depth_bound
             // so a deep synchronous chain that exceeded the threshold
             // makes forward progress before the next dequeue.
             drain_pending_resumes();
-        } else {
-            // No work, yield
-            std::this_thread::yield();
+            continue;
         }
+
+        // No work: park until schedule() enqueues something or stop() runs.
+        // The predicate is re-checked under worker_wake_mutex_, and schedule()
+        // takes that same mutex after enqueuing, so an enqueue that races this
+        // park cannot be lost (either the predicate sees it, or the notify
+        // arrives after we begin waiting).
+        std::unique_lock<std::mutex> lock(worker_wake_mutex_);
+        worker_wake_cv_.wait(lock, [this, queue_n] {
+            if (!running_.load(std::memory_order_acquire)) {
+                return true;
+            }
+            for (std::size_t i = 0; i < queue_n; ++i) {
+                if (!thread_queues_[i].empty()) {
+                    return true;
+                }
+            }
+            return false;
+        });
     }
 }
 
