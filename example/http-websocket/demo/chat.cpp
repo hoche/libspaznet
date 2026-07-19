@@ -301,6 +301,6 @@ int main() {
     spaznet::Server server(4);
     server.set_connection_handler(spaznet::websocket::make_dispatcher(
         std::make_unique<HttpFallback>(), std::make_unique<ChatRoom>()));
-    server.listen_tcp(8080);
+    server.listen_tcp(9082);
     server.run();
 }
