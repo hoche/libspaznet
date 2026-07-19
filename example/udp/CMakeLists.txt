@@ -30,3 +30,6 @@ target_link_libraries(udp_echo PRIVATE spaznet_udp)
 
 add_executable(udp_relay demo/relay.cpp)
 target_link_libraries(udp_relay PRIVATE spaznet_udp)
+
+add_executable(udp_statsd demo/statsd.cpp)
+target_link_libraries(udp_statsd PRIVATE spaznet_udp)
