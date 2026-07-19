@@ -214,14 +214,34 @@ int main() {
 Core ships only the low-level server.  Each protocol — HTTP/1.1,
 WebSocket, HTTP/2, UDP, QUIC + HTTP/3 — is an `example/<protocol>/`
 library you link in addition to `spaznet::spaznet`.  Working demos
-under `example/*/demo/`:
+under `example/*/demo/` (see each directory's `README.md` for details):
+
+| Protocol | Binary | Description |
+|---|---|---|
+| **HTTP/1.x** | `http_hello` | Minimal `HTTPHandler` that always returns a fixed body |
+| | `http_showcase` | HTTP/1.0 vs 1.1 differences (keep-alive, chunked framing, request bodies) |
+| **WebSocket** | `ws_echo` | Minimal echo; also serves plain HTTP on the same port |
+| | `ws_chat` | Multi-client broadcast chat with a browser HTML+JS page |
+| **HTTP/2** | `http2_hello` | Minimal h2c (prior-knowledge) hello world |
+| | `http2_showcase` | Stream multiplexing via `/slow?ms=N`, plus HPACK/DATA routes |
+| **UDP** | `udp_echo` | Minimal datagram echo |
+| | `udp_relay` | Connectionless peer table + fan-out ("chat" over UDP) |
+| | `udp_statsd` | Fire-and-forget metrics aggregator (statsd-style line protocol) |
 
 ```bash
-./build/example/http/http_hello              # HTTP/1.1 hello world
-./build/example/http-websocket/ws_echo       # WebSocket echo (HTTP fallback)
-./build/example/http2/http2_hello            # HTTP/2 (h2c)
-./build/example/udp/udp_echo                 # UDP echo
+./build/example/http/http_hello
+./build/example/http/http_showcase
+./build/example/http-websocket/ws_echo
+./build/example/http-websocket/ws_chat
+./build/example/http2/http2_hello
+./build/example/http2/http2_showcase
+./build/example/udp/udp_echo
+./build/example/udp/udp_relay
+./build/example/udp/udp_statsd
 ```
+
+QUIC + HTTP/3 (`example/quic-http3/`) has no interactive demo yet; exercise
+it via the unit/integration tests and `bench_quic_steady_state`.
 
 See [docs/integration.md](docs/integration.md) for the CMake
 linkage and [docs/migration.md](docs/migration.md) if you're
