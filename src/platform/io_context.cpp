@@ -13,25 +13,6 @@ namespace spaznet {
 namespace {
 
 #ifdef _WIN32
-// Initialize Winsock exactly once per process. Calling WSAStartup is
-// required before any socket() / send() / recv() / etc. — without it,
-// every Winsock call returns WSANOTINITIALISED and connections fail
-// in confusing ways far from the actual root cause. We pair it with
-// std::atexit so WSACleanup runs at process exit; for libraries
-// embedded in a larger process this avoids reference-counting the
-// init/cleanup pair ourselves.
-void ensure_winsock_initialised() {
-    static std::once_flag once;
-    std::call_once(once, []() {
-        WSADATA wsa_data;
-        const int err = WSAStartup(MAKEWORD(2, 2), &wsa_data);
-        if (err != 0) {
-            throw std::runtime_error("WSAStartup failed");
-        }
-        std::atexit([]() { WSACleanup(); });
-    });
-}
-
 // Winsock has no pipe(2). A connected TCP loopback pair is pollable the
 // same way and is what every portable event-loop uses on Windows.
 auto create_wakeup_fds(int& read_fd, int& write_fd) -> bool {
@@ -122,7 +103,7 @@ IOContext::IOContext(std::size_t num_threads)
     // Must run before platform_io_->init() — IOCP itself, and every
     // socket call the demultiplexer subsequently makes, depends on
     // Winsock being initialised.
-    ensure_winsock_initialised();
+    detail::ensure_winsock();
 #endif
     if (!platform_io_->init()) {
         throw std::runtime_error("Failed to initialize platform I/O");

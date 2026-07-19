@@ -71,10 +71,11 @@ class LatencyTest : public ::testing::Test {
         }
 
         std::string request = "GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        send(sock, request.c_str(), request.size(), 0);
+        spaznet::detail::setsockopt_rcvtimeo_ms(sock, 2000);
+        (void)spaznet::detail::socket_send(sock, request.c_str(), request.size(), MSG_NOSIGNAL);
 
         char buffer[4096];
-        recv(sock, buffer, sizeof(buffer) - 1, 0);
+        (void)spaznet::detail::socket_recv(sock, buffer, sizeof(buffer) - 1, 0);
 
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);

@@ -29,6 +29,7 @@ int connect_client(uint16_t port) {
     if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         return -1;
     }
+    spaznet::detail::setsockopt_rcvtimeo_ms(fd, 3000);
     return fd;
 }
 
@@ -73,11 +74,11 @@ bool recv_exact(int fd, std::vector<uint8_t>& out, size_t n) {
             // Connection closed
             return false;
         } else {
-            // Error - wait and retry (might be EAGAIN or async delay)
+            const int err = spaznet::detail::last_socket_error();
 #ifdef _WIN32
-            if (WSAGetLastError() == WSAEWOULDBLOCK) {
+            if (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT) {
 #else
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (err == EAGAIN || err == EWOULDBLOCK || err == ETIMEDOUT) {
 #endif
                 attempts++;
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));

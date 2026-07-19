@@ -56,6 +56,8 @@ static std::string send_http_request(uint16_t port, const std::string& path = "/
         return "";
     }
 
+    detail::setsockopt_rcvtimeo_ms(sock, 3000);
+
     std::ostringstream request;
     request << "GET " << path << " HTTP/1.1\r\n";
     request << "Host: localhost\r\n";

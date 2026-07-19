@@ -53,10 +53,10 @@ class ConcurrentPerformanceTest : public ::testing::Test {
 
     void send_request(int sock) {
         std::string request = "GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        send(sock, request.c_str(), request.size(), 0);
+        (void)spaznet::detail::socket_send(sock, request.c_str(), request.size(), MSG_NOSIGNAL);
 
         char buffer[4096];
-        recv(sock, buffer, sizeof(buffer) - 1, 0);
+        (void)spaznet::detail::socket_recv(sock, buffer, sizeof(buffer) - 1, 0);
     }
 
     int create_connection() {
@@ -81,6 +81,7 @@ class ConcurrentPerformanceTest : public ::testing::Test {
             // EADDRNOTAVAIL.
             struct linger lin {1, 0};
             spaznet::detail::setsockopt_val(sock, SOL_SOCKET, SO_LINGER, lin);
+            spaznet::detail::setsockopt_rcvtimeo_ms(sock, 2000);
             if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0) {
                 return sock;
             }

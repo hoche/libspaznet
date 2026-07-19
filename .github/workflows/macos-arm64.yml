@@ -58,4 +58,4 @@ jobs:
         run: |
           cd build
           # Tests stay serial: several integration suites bind fixed ports.
-          ctest --output-on-failure
+          ctest --output-on-failure --timeout 180

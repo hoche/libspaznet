@@ -70,16 +70,18 @@ class ConcurrentConnectionsTest : public ::testing::Test {
             return;
         }
 
+        spaznet::detail::setsockopt_rcvtimeo_ms(sock, 3000);
+
         std::ostringstream request;
         request << "GET /test" << client_id << " HTTP/1.1\r\n";
         request << "Host: localhost\r\n";
         request << "\r\n";
 
         std::string req_str = request.str();
-        send(sock, req_str.c_str(), req_str.size(), 0);
+        (void)spaznet::detail::socket_send(sock, req_str.c_str(), req_str.size(), MSG_NOSIGNAL);
 
         char buffer[4096];
-        recv(sock, buffer, sizeof(buffer) - 1, 0);
+        (void)spaznet::detail::socket_recv(sock, buffer, sizeof(buffer) - 1, 0);
         close_socket(sock);
     }
 

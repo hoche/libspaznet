@@ -6,6 +6,8 @@
 
 #include <cstddef>
 #include <limits>
+#include <mutex>
+#include <stdexcept>
 
 #ifdef _WIN32
 
@@ -20,6 +22,7 @@
 #include <ws2tcpip.h>
 
 #include <BaseTsd.h>
+#include <cstdlib>
 
 #if !defined(SPAZNET_SSIZE_T_DEFINED)
 #define SPAZNET_SSIZE_T_DEFINED
@@ -44,6 +47,23 @@ using ssize_t = SSIZE_T;
 #endif // _WIN32
 
 namespace spaznet::detail {
+
+// Idempotent Winsock bootstrap. Safe (and required) before any socket()
+// call on Windows — including in tests that create sockets without an
+// IOContext / Server. No-op on POSIX.
+inline auto ensure_winsock() -> void {
+#ifdef _WIN32
+    static std::once_flag once;
+    std::call_once(once, []() {
+        WSADATA wsa_data;
+        const int err = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+        if (err != 0) {
+            throw std::runtime_error("WSAStartup failed");
+        }
+        std::atexit([]() { WSACleanup(); });
+    });
+#endif
+}
 
 inline auto last_socket_error() -> int {
 #ifdef _WIN32

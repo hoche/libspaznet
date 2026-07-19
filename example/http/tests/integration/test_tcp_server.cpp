@@ -70,6 +70,7 @@ class TCPServerTest : public ::testing::Test {
             return -1;
         }
 
+        spaznet::detail::setsockopt_rcvtimeo_ms(sock, 3000);
         return sock;
     }
 

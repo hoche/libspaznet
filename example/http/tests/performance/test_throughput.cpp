@@ -77,10 +77,10 @@ class ThroughputTest : public ::testing::Test {
 
         std::string req_str = request.str();
         // Use MSG_NOSIGNAL to avoid SIGPIPE if socket closes
-        send(sock, req_str.c_str(), req_str.size(), MSG_NOSIGNAL);
+        (void)spaznet::detail::socket_send(sock, req_str.c_str(), req_str.size(), MSG_NOSIGNAL);
 
         char buffer[4096];
-        recv(sock, buffer, sizeof(buffer) - 1, 0);
+        (void)spaznet::detail::socket_recv(sock, buffer, sizeof(buffer) - 1, 0);
     }
 
     int create_connection() {
@@ -104,6 +104,9 @@ class ThroughputTest : public ::testing::Test {
             // EADDRNOTAVAIL when connect() can't allocate a port.
             struct linger lin {1, 0};
             spaznet::detail::setsockopt_val(sock, SOL_SOCKET, SO_LINGER, lin);
+            // Bound recv so SustainedLoad workers can exit after running=false
+            // instead of wedging forever in a blocking recv().
+            spaznet::detail::setsockopt_rcvtimeo_ms(sock, 2000);
             if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0) {
                 return sock;
             }

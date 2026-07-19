@@ -77,4 +77,6 @@ jobs:
         run: |
           cd build
           # Tests stay serial: several integration suites bind fixed ports.
-          ctest -C Release --output-on-failure
+          # Per-test timeout prevents a stuck blocking recv from holding the
+          # runner for hours (seen on HttpPerformanceTests without SO_RCVTIMEO).
+          ctest -C Release --output-on-failure --timeout 180
