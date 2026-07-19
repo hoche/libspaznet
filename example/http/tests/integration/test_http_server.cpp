@@ -106,7 +106,7 @@ class HTTPServerTest : public ::testing::Test {
         struct timeval tv;
         tv.tv_sec = 3;
         tv.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        spaznet::detail::setsockopt_val(sock, SOL_SOCKET, SO_RCVTIMEO, tv);
 #endif
 
         // Give the server time to process async coroutines and send response

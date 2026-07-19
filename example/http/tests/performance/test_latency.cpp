@@ -56,7 +56,7 @@ class LatencyTest : public ::testing::Test {
         // SO_LINGER {1, 0}: RST on close, skip TIME_WAIT — without this
         // a long latency run exhausts the client ephemeral port range.
         struct linger lin {1, 0};
-        setsockopt(sock, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+        spaznet::detail::setsockopt_val(sock, SOL_SOCKET, SO_LINGER, lin);
 
         struct sockaddr_in addr {};
         addr.sin_family = AF_INET;
@@ -184,7 +184,7 @@ TEST_F(LatencyTest, ConnectionEstablishmentLatency) {
 
         // RST on close to skip TIME_WAIT — see measure_request_latency().
         struct linger lin {1, 0};
-        setsockopt(sock, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+        spaznet::detail::setsockopt_val(sock, SOL_SOCKET, SO_LINGER, lin);
 
         struct sockaddr_in addr {};
         addr.sin_family = AF_INET;

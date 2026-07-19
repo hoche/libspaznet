@@ -15,8 +15,8 @@
 class Echo : public spaznet::udp::Handler {
   public:
     spaznet::Task handle_packet(const spaznet::udp::Packet& pkt) override {
-        ::sendto(pkt.listen_fd, pkt.data.data(), pkt.data.size(), 0,
-                 reinterpret_cast<const sockaddr*>(&pkt.peer), pkt.peer_len);
+        spaznet::detail::socket_sendto(pkt.listen_fd, pkt.data.data(), pkt.data.size(), 0,
+                                       reinterpret_cast<const sockaddr*>(&pkt.peer), pkt.peer_len);
         co_return;
     }
 };

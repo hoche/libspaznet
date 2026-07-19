@@ -80,19 +80,19 @@ class RFC9113IntegrationTest : public ::testing::Test {
 
     void send_http2_preface(int sock) {
         std::string preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-        send(sock, preface.c_str(), preface.size(), 0);
+        (void)spaznet::detail::socket_send(sock, preface.c_str(), preface.size(), 0);
     }
 
     void send_settings_frame(int sock, const spaznet::http2::Settings& settings) {
         spaznet::http2::Frame frame = spaznet::http2::Parser::build_settings_frame(settings, false);
         auto serialized = frame.serialize();
-        send(sock, serialized.data(), serialized.size(), 0);
+        spaznet::detail::socket_send(sock, serialized.data(), serialized.size(), 0);
     }
 
     void send_headers_frame(int sock, const spaznet::http2::Request& request, uint32_t stream_id) {
         spaznet::http2::Frame frame = spaznet::http2::Parser::build_headers_frame(request, stream_id, true, true);
         auto serialized = frame.serialize();
-        send(sock, serialized.data(), serialized.size(), 0);
+        spaznet::detail::socket_send(sock, serialized.data(), serialized.size(), 0);
     }
 
     std::vector<uint8_t> receive_response(int sock) {
@@ -185,7 +185,7 @@ TEST_F(RFC9113IntegrationTest, DataFrame) {
 
     spaznet::http2::Frame headers = spaznet::http2::Parser::build_headers_frame(request, 1, true, false);
     auto headers_serialized = headers.serialize();
-    send(sock, headers_serialized.data(), headers_serialized.size(), 0);
+    spaznet::detail::socket_send(sock, headers_serialized.data(), headers_serialized.size(), 0);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
@@ -193,7 +193,7 @@ TEST_F(RFC9113IntegrationTest, DataFrame) {
     std::vector<uint8_t> data = {'t', 'e', 's', 't'};
     spaznet::http2::Frame data_frame = spaznet::http2::Parser::build_data_frame(1, data, true);
     auto data_serialized = data_frame.serialize();
-    send(sock, data_serialized.data(), data_serialized.size(), 0);
+    spaznet::detail::socket_send(sock, data_serialized.data(), data_serialized.size(), 0);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -440,13 +440,13 @@ TEST_F(HTTP2MultiplexingTest, FrameLoopUnblockedBySlowHandler) {
 
     // Preface + our SETTINGS.
     const std::string preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    ASSERT_EQ(send(sock, preface.data(), preface.size(), 0),
+    ASSERT_EQ(spaznet::detail::socket_send(sock, preface.data(), preface.size(), 0),
               static_cast<ssize_t>(preface.size()));
 
     spaznet::http2::Settings client_settings;
     auto settings_frame = spaznet::http2::Parser::build_settings_frame(client_settings, false);
     auto settings_bytes = settings_frame.serialize();
-    ASSERT_EQ(send(sock, settings_bytes.data(), settings_bytes.size(), 0),
+    ASSERT_EQ(spaznet::detail::socket_send(sock, settings_bytes.data(), settings_bytes.size(), 0),
               static_cast<ssize_t>(settings_bytes.size()));
 
     // HEADERS+END_STREAM for stream 1 — handler will block.
@@ -459,7 +459,7 @@ TEST_F(HTTP2MultiplexingTest, FrameLoopUnblockedBySlowHandler) {
     req.headers[":path"] = "/slow";
     auto h_frame = spaznet::http2::Parser::build_headers_frame(req, 1, true, true);
     auto h_bytes = h_frame.serialize();
-    ASSERT_EQ(send(sock, h_bytes.data(), h_bytes.size(), 0),
+    ASSERT_EQ(spaznet::detail::socket_send(sock, h_bytes.data(), h_bytes.size(), 0),
               static_cast<ssize_t>(h_bytes.size()));
 
     // Wait briefly for the handler to actually enter handle_request.
@@ -474,7 +474,7 @@ TEST_F(HTTP2MultiplexingTest, FrameLoopUnblockedBySlowHandler) {
                                                      0xCA, 0xFE, 0xBA, 0xBE};
     auto ping = spaznet::http2::Parser::build_ping_frame(ping_payload, false);
     auto ping_bytes = ping.serialize();
-    ASSERT_EQ(send(sock, ping_bytes.data(), ping_bytes.size(), 0),
+    ASSERT_EQ(spaznet::detail::socket_send(sock, ping_bytes.data(), ping_bytes.size(), 0),
               static_cast<ssize_t>(ping_bytes.size()));
 
     // Read until we see a PING-ACK with our payload — with a deadline
@@ -489,7 +489,7 @@ TEST_F(HTTP2MultiplexingTest, FrameLoopUnblockedBySlowHandler) {
         timeval tv{};
         tv.tv_sec = 0;
         tv.tv_usec = 100'000;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        spaznet::detail::setsockopt_val(sock, SOL_SOCKET, SO_RCVTIMEO, tv);
         ssize_t n = recv(sock, buf, sizeof(buf), 0);
         if (n > 0) {
             rx_buf.insert(rx_buf.end(), buf, buf + n);

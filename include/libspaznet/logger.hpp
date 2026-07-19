@@ -410,13 +410,17 @@ struct SimpleFormatter {
 
 // Convenience macros for logging - using std::format syntax (C++20)
 // Note: Users should use {} placeholders instead of %s, %d, etc.
+//
+// Use GNU/MSVC `##__VA_ARGS__` (not C++20 `__VA_OPT__`) so the empty-args
+// form `SPAZNET_INFO("literal")` compiles under MSVC's default
+// preprocessor, which still rejects `__VA_OPT__` without /Zc:preprocessor.
 #define SPAZNET_LOG(level, fmt, ...)                                                               \
     do {                                                                                           \
         auto& logger = spaznet::Logger::instance();                                                \
         if (logger.should_log(level)) {                                                            \
             logger.log(level, [&](char* buf, size_t buf_size, size_t& off) {                       \
                 auto result =                                                                      \
-                    std::format_to_n(buf + off, buf_size - off, fmt __VA_OPT__(, ) __VA_ARGS__);   \
+                    std::format_to_n(buf + off, buf_size - off, fmt, ##__VA_ARGS__);               \
                 off += result.size;                                                                \
             });                                                                                    \
         }                                                                                          \

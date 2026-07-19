@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include "perf_budget.hpp"
+#ifndef _WIN32
 #include <signal.h>
+#endif
 #include <libspaznet/detail/socket_compat.hpp>
 #include <atomic>
 #include <cerrno>
@@ -46,8 +48,10 @@ class ThroughputHTTPHandler : public spaznet::http::HTTPHandler {
 class ThroughputTest : public ::testing::Test {
   protected:
     void SetUp() override {
+#ifndef _WIN32
         // Ignore SIGPIPE to prevent crashes when writing to closed sockets
         signal(SIGPIPE, SIG_IGN);
+#endif
 
         handler = std::make_unique<ThroughputHTTPHandler>();
         server = std::make_unique<Server>(4);
@@ -99,7 +103,7 @@ class ThroughputTest : public ::testing::Test {
             // ~16K-port range and subsequent tests fail with
             // EADDRNOTAVAIL when connect() can't allocate a port.
             struct linger lin {1, 0};
-            setsockopt(sock, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+            spaznet::detail::setsockopt_val(sock, SOL_SOCKET, SO_LINGER, lin);
             if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0) {
                 return sock;
             }

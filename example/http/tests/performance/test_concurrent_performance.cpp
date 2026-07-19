@@ -80,7 +80,7 @@ class ConcurrentPerformanceTest : public ::testing::Test {
             // ~16K, and otherwise connect() starts failing with
             // EADDRNOTAVAIL.
             struct linger lin {1, 0};
-            setsockopt(sock, SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+            spaznet::detail::setsockopt_val(sock, SOL_SOCKET, SO_LINGER, lin);
             if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0) {
                 return sock;
             }

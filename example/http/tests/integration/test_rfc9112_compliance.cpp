@@ -116,7 +116,7 @@ class RFC9112IntegrationTest : public ::testing::Test {
         struct timeval tv;
         tv.tv_sec = 2;
         tv.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        spaznet::detail::setsockopt_val(sock, SOL_SOCKET, SO_RCVTIMEO, tv);
 #endif
 
         // Give server time to process
@@ -283,7 +283,7 @@ TEST_F(RFC9112IntegrationTest, KeepAliveAllowsMultipleRequestsOnSameConnection) 
     struct timeval tv;
     tv.tv_sec = 2;
     tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    spaznet::detail::setsockopt_val(sock, SOL_SOCKET, SO_RCVTIMEO, tv);
 #endif
 
     std::string req1 = "GET /one HTTP/1.1\r\n"

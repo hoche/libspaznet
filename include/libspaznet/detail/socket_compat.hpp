@@ -131,4 +131,28 @@ inline auto setsockopt_int(int fd, int level, int optname, int value) -> int {
 #endif
 }
 
+// Winsock's setsockopt takes `const char*`; POSIX takes `const void*`.
+template <typename T>
+inline auto setsockopt_val(int fd, int level, int optname, const T& value) -> int {
+#ifdef _WIN32
+    return ::setsockopt(static_cast<SOCKET>(fd), level, optname,
+                        reinterpret_cast<const char*>(&value), static_cast<int>(sizeof(value)));
+#else
+    return ::setsockopt(fd, level, optname, &value, sizeof(value));
+#endif
+}
+
+inline auto socket_sendto(int fd, const void* buf, std::size_t len, int flags,
+                          const sockaddr* addr, socklen_t addr_len) -> ssize_t {
+#ifdef _WIN32
+    if (len > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        len = static_cast<std::size_t>((std::numeric_limits<int>::max)());
+    }
+    return ::sendto(static_cast<SOCKET>(fd), static_cast<const char*>(buf), static_cast<int>(len),
+                    flags, addr, static_cast<int>(addr_len));
+#else
+    return ::sendto(fd, buf, len, flags, addr, addr_len);
+#endif
+}
+
 } // namespace spaznet::detail

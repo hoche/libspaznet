@@ -5,7 +5,6 @@
 #include <utility>
 
 #include <libspaznet/detail/socket_compat.hpp>
-#include <sys/types.h>
 
 namespace spaznet {
 namespace http3 {
@@ -27,8 +26,8 @@ QuicHttp3Service::QuicHttp3Service(quic::Listener::Config listener_cfg,
                     // connection will idle out.  We don't have a
                     // notification channel back into application
                     // code from a SendFn.
-                    (void)::sendto(f, bytes.data(), bytes.size(), 0, peer.data(),
-                                   peer.length);
+                    (void)detail::socket_sendto(f, bytes.data(), bytes.size(), 0, peer.data(),
+                                                peer.length);
                 }),
       on_request_(std::move(on_request)) {}
 
