@@ -43,9 +43,12 @@ jobs:
           # updates. vcpkg builds OpenSSL from source — slower first
           # run (~5 min) but cached, and the version tracks vcpkg's
           # port (currently 3.5+).
+          $jobs = [int]$env:NUMBER_OF_PROCESSORS
+          $env:VCPKG_MAX_CONCURRENCY = "$jobs"
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install openssl:x64-windows
           "VCPKG_TOOLCHAIN=$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake" `
             | Out-File -FilePath $env:GITHUB_ENV -Append
+          "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Configure CMake
         shell: pwsh
@@ -64,11 +67,14 @@ jobs:
           }
 
       - name: Build
+        shell: pwsh
         run: |
           cd build
-          cmake --build . --config Release -j
+          cmake --build . --config Release --parallel $env:CMAKE_BUILD_PARALLEL_LEVEL
 
       - name: Run Tests
+        shell: pwsh
         run: |
           cd build
+          # Tests stay serial: several integration suites bind fixed ports.
           ctest -C Release --output-on-failure

@@ -27,19 +27,22 @@ jobs:
           # openssl@3.5 would silently disable QUIC (find_package QUIET)
           # while the job still looked green. CMake comes from the
           # setup-cmake step above; no need to brew it.
-          brew install openssl@3.5 iperf3
+          brew install openssl@3.5 iperf3 ninja
           OPENSSL_PREFIX="$(brew --prefix openssl@3.5)"
           if [[ ! -d "$OPENSSL_PREFIX" ]]; then
             echo "openssl@3.5 prefix missing: $OPENSSL_PREFIX" >&2
             exit 1
           fi
           echo "OPENSSL_ROOT_DIR=$OPENSSL_PREFIX" >> "$GITHUB_ENV"
+          jobs="$(sysctl -n hw.ncpu)"
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=$jobs" >> "$GITHUB_ENV"
 
       - name: Configure CMake
         run: |
           mkdir -p build
           cd build
-          cmake .. -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR"
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT_DIR" ..
 
       - name: Verify QUIC enabled
         run: |
@@ -49,9 +52,10 @@ jobs:
       - name: Build
         run: |
           cd build
-          cmake --build . --config Release -j$(sysctl -n hw.ncpu)
+          cmake --build . --parallel "$CMAKE_BUILD_PARALLEL_LEVEL"
 
       - name: Run Tests
         run: |
           cd build
+          # Tests stay serial: several integration suites bind fixed ports.
           ctest --output-on-failure

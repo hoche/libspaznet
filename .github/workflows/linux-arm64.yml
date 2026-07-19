@@ -33,11 +33,14 @@ jobs:
             set -e
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            apt-get install -y build-essential g++ cmake git ca-certificates \
-                               iperf3 libssl-dev
+            apt-get install -y build-essential g++ cmake ninja-build git \
+                               ca-certificates iperf3 libssl-dev
+            jobs="$(nproc)"
+            export CMAKE_BUILD_PARALLEL_LEVEL="$jobs"
             mkdir -p build && cd build
-            cmake ..
+            cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
             grep -q "SPAZNET_BUILD_QUIC:BOOL=ON" CMakeCache.txt
-            cmake --build . --config Release -j$(nproc)
+            cmake --build . --parallel "$jobs"
+            # Tests stay serial: several integration suites bind fixed ports.
             ctest --output-on-failure
           '
