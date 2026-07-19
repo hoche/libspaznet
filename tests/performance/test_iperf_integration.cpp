@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <libspaznet/detail/socket_compat.hpp>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>

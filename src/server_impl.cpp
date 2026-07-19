@@ -5,6 +5,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <libspaznet/detail/socket_compat.hpp>
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/server.hpp>
 #include <map>
@@ -13,20 +14,11 @@
 #include <stdexcept>
 #include <thread>
 
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#define close_socket closesocket
-#else
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
-#include <cerrno>
-#define close_socket ::close
-#endif
+namespace {
+inline auto close_socket(int fd) -> void {
+    spaznet::detail::close_socket_fd(fd);
+}
+} // namespace
 
 // This translation unit is intentionally low-level (socket I/O, protocol parsing) and uses many
 // protocol-defined constants (e.g. bitmasks, opcodes, fixed header sizes). We suppress a few
@@ -82,14 +74,6 @@ namespace {
 //        result <  0  + EAGAIN/EWOULDBLOCK/EINTR → spurious; re-await.
 //        result <  0  otherwise → hard error, buffer cleared, return.
 
-namespace {
-
-bool is_retryable_errno(int e) {
-    return e == EAGAIN || e == EWOULDBLOCK || e == EINTR;
-}
-
-} // namespace
-
 ValueTask<ssize_t> Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
     buffer.resize(size);
 
@@ -103,13 +87,13 @@ ValueTask<ssize_t> Socket::async_read(std::vector<uint8_t>& buffer, std::size_t 
             mutable bool ready_flag = false;
 
             bool await_ready() const noexcept {
-                result = recv(socket->fd(), buffer->data(), size, 0);
+                result = detail::socket_recv(socket->fd(), buffer->data(), size, 0);
                 if (result >= 0) {
                     ready_flag = true;
                     return true;
                 }
-                saved_errno = errno;
-                if (is_retryable_errno(saved_errno)) {
+                saved_errno = detail::last_socket_error();
+                if (detail::is_retryable_socket_error(saved_errno)) {
                     ready_flag = false;
                     return false;
                 }
@@ -127,8 +111,8 @@ ValueTask<ssize_t> Socket::async_read(std::vector<uint8_t>& buffer, std::size_t 
 
             ssize_t await_resume() noexcept {
                 if (!ready_flag) {
-                    result = recv(socket->fd(), buffer->data(), size, 0);
-                    saved_errno = (result < 0) ? errno : 0;
+                    result = detail::socket_recv(socket->fd(), buffer->data(), size, 0);
+                    saved_errno = (result < 0) ? detail::last_socket_error() : 0;
                 }
                 return result;
             }
@@ -147,7 +131,7 @@ ValueTask<ssize_t> Socket::async_read(std::vector<uint8_t>& buffer, std::size_t 
             co_return 0;
         }
         // result < 0
-        if (is_retryable_errno(awaiter.saved_errno)) {
+        if (detail::is_retryable_socket_error(awaiter.saved_errno)) {
             // Spurious wakeup or interrupted syscall — re-await. No
             // sleeping: the IOContext will resume us when data really is
             // available.
@@ -174,13 +158,13 @@ Task Socket::async_write(std::vector<uint8_t> data) {
             mutable bool ready_flag = false;
 
             bool await_ready() const noexcept {
-                result = send(socket->fd(), data_ptr, remaining, MSG_NOSIGNAL);
+                result = detail::socket_send(socket->fd(), data_ptr, remaining, MSG_NOSIGNAL);
                 if (result >= 0) {
                     ready_flag = true;
                     return true;
                 }
-                saved_errno = errno;
-                if (is_retryable_errno(saved_errno)) {
+                saved_errno = detail::last_socket_error();
+                if (detail::is_retryable_socket_error(saved_errno)) {
                     ready_flag = false;
                     return false;
                 }
@@ -195,8 +179,8 @@ Task Socket::async_write(std::vector<uint8_t> data) {
 
             ssize_t await_resume() noexcept {
                 if (!ready_flag) {
-                    result = send(socket->fd(), data_ptr, remaining, MSG_NOSIGNAL);
-                    saved_errno = (result < 0) ? errno : 0;
+                    result = detail::socket_send(socket->fd(), data_ptr, remaining, MSG_NOSIGNAL);
+                    saved_errno = (result < 0) ? detail::last_socket_error() : 0;
                 }
                 return result;
             }
@@ -217,7 +201,7 @@ Task Socket::async_write(std::vector<uint8_t> data) {
             break;
         }
         // sent < 0
-        if (is_retryable_errno(awaiter.saved_errno)) {
+        if (detail::is_retryable_socket_error(awaiter.saved_errno)) {
             // Spurious EAGAIN — re-await without sleeping.
             continue;
         }
@@ -273,20 +257,12 @@ void Server::listen_tcp(uint16_t port) {
     }
 
     // Set socket options
-    int opt = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    detail::setsockopt_int(listen_fd, SOL_SOCKET, SO_REUSEADDR, 1);
     // Allow IPv4 connections on IPv6 socket
-    int no = 0;
-    setsockopt(listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
+    detail::setsockopt_int(listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, 0);
 
     // Set non-blocking
-#ifdef _WIN32
-    u_long mode = 1;
-    ioctlsocket(listen_fd, FIONBIO, &mode);
-#else
-    int flags = fcntl(listen_fd, F_GETFL, 0);
-    fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK);
-#endif
+    detail::set_nonblocking(listen_fd);
 
     // Bind
     if (bind(listen_fd, result->ai_addr, result->ai_addrlen) < 0) {
@@ -338,20 +314,12 @@ void Server::listen_udp(uint16_t port) {
     }
 
     // Set socket options for reuse
-    int opt = 1;
-    setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    detail::setsockopt_int(udp_fd, SOL_SOCKET, SO_REUSEADDR, 1);
     // Allow IPv4 on IPv6 socket
-    int no = 0;
-    setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
+    detail::setsockopt_int(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, 0);
 
     // Set non-blocking
-#ifdef _WIN32
-    u_long mode = 1;
-    ioctlsocket(udp_fd, FIONBIO, &mode);
-#else
-    int flags = fcntl(udp_fd, F_GETFL, 0);
-    fcntl(udp_fd, F_SETFL, flags | O_NONBLOCK);
-#endif
+    detail::set_nonblocking(udp_fd);
 
     // Bind
     if (bind(udp_fd, result->ai_addr, result->ai_addrlen) < 0) {
@@ -390,14 +358,13 @@ Task Server::receive_udp(int udp_fd) {
         sockaddr_storage addr{};
         socklen_t addr_len = sizeof(addr);
 
-        ssize_t received = recvfrom(udp_fd, buffer.data(), buffer.size(), 0,
-                                    reinterpret_cast<struct sockaddr*>(&addr), &addr_len);
+        ssize_t received = detail::socket_recvfrom(udp_fd, buffer.data(), buffer.size(), 0,
+                                                   reinterpret_cast<struct sockaddr*>(&addr),
+                                                   &addr_len);
 
         if (received < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            const int err = detail::last_socket_error();
+            if (detail::is_retryable_socket_error(err)) {
                 co_await ReadableAwaiter{io_context_.get(), udp_fd};
                 continue;
             }
@@ -465,10 +432,8 @@ Task Server::accept_connections(int listen_fd) {
             accept(listen_fd, reinterpret_cast<struct sockaddr*>(&client_addr), &client_len);
 
         if (client_fd < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            const int err = detail::last_socket_error();
+            if (detail::is_retryable_socket_error(err)) {
                 // Wait until the listening socket becomes readable (new connection ready).
                 co_await ReadableAwaiter{io_context_.get(), listen_fd};
                 continue;
@@ -477,13 +442,7 @@ Task Server::accept_connections(int listen_fd) {
         }
 
         // Set non-blocking
-#ifdef _WIN32
-        u_long mode = 1;
-        ioctlsocket(client_fd, FIONBIO, &mode);
-#else
-        int flags = fcntl(client_fd, F_GETFL, 0);
-        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
-#endif
+        detail::set_nonblocking(client_fd);
 
         // Create socket and handle connection
         Socket socket(client_fd, io_context_.get());

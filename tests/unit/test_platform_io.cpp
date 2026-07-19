@@ -1,19 +1,10 @@
-#include <fcntl.h>
 #include <gtest/gtest.h>
-#include <sys/socket.h>
-#include <unistd.h>
+
 #include <chrono>
+#include <cstring>
+#include <libspaznet/detail/socket_compat.hpp>
 #include <libspaznet/platform_io.hpp>
 #include <thread>
-
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#endif
 
 using namespace spaznet;
 
@@ -35,13 +26,7 @@ class PlatformIOTest : public ::testing::Test {
         if (fd < 0)
             return -1;
 
-#ifdef _WIN32
-        u_long mode = 1;
-        ioctlsocket(fd, FIONBIO, &mode);
-#else
-        int flags = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-#endif
+        detail::set_nonblocking(fd);
         return fd;
     }
 };
@@ -58,11 +43,7 @@ TEST_F(PlatformIOTest, AddRemoveFd) {
     EXPECT_TRUE(platform_io->add_fd(fd, PlatformIO::EVENT_READ, user_data));
     EXPECT_TRUE(platform_io->remove_fd(fd));
 
-#ifdef _WIN32
-    closesocket(fd);
-#else
-    close(fd);
-#endif
+detail::close_socket_fd(fd);
 }
 
 // Regression: kqueue's remove_fd used to issue EV_DELETE for both
@@ -78,11 +59,7 @@ TEST_F(PlatformIOTest, AddOnlyReadThenRemoveSucceeds) {
     EXPECT_TRUE(platform_io->add_fd(fd, PlatformIO::EVENT_READ, user_data));
     EXPECT_TRUE(platform_io->remove_fd(fd));
 
-#ifdef _WIN32
-    closesocket(fd);
-#else
-    close(fd);
-#endif
+detail::close_socket_fd(fd);
 }
 
 TEST_F(PlatformIOTest, AddOnlyWriteThenRemoveSucceeds) {
@@ -93,11 +70,7 @@ TEST_F(PlatformIOTest, AddOnlyWriteThenRemoveSucceeds) {
     EXPECT_TRUE(platform_io->add_fd(fd, PlatformIO::EVENT_WRITE, user_data));
     EXPECT_TRUE(platform_io->remove_fd(fd));
 
-#ifdef _WIN32
-    closesocket(fd);
-#else
-    close(fd);
-#endif
+detail::close_socket_fd(fd);
 }
 
 TEST_F(PlatformIOTest, ModifyFd) {
@@ -113,11 +86,7 @@ TEST_F(PlatformIOTest, ModifyFd) {
 
     EXPECT_TRUE(platform_io->remove_fd(fd));
 
-#ifdef _WIN32
-    closesocket(fd);
-#else
-    close(fd);
-#endif
+detail::close_socket_fd(fd);
 }
 
 TEST_F(PlatformIOTest, WaitForEvents) {
@@ -146,13 +115,7 @@ TEST_F(PlatformIOTest, WaitForEvents) {
 
     // Set non-blocking
     for (int i = 0; i < 2; ++i) {
-#ifdef _WIN32
-        u_long mode = 1;
-        ioctlsocket(fds[i], FIONBIO, &mode);
-#else
-        int flags = fcntl(fds[i], F_GETFL, 0);
-        fcntl(fds[i], F_SETFL, flags | O_NONBLOCK);
-#endif
+detail::set_nonblocking(fds[i]);
     }
 
     void* user_data1 = reinterpret_cast<void*>(0x1111);
@@ -174,13 +137,8 @@ TEST_F(PlatformIOTest, WaitForEvents) {
     platform_io->remove_fd(fds[0]);
     platform_io->remove_fd(fds[1]);
 
-#ifdef _WIN32
-    closesocket(fds[0]);
-    closesocket(fds[1]);
-#else
-    close(fds[0]);
-    close(fds[1]);
-#endif
+detail::close_socket_fd(fds[0]);
+    detail::close_socket_fd(fds[1]);
 }
 
 TEST_F(PlatformIOTest, WaitTimeout) {
@@ -202,11 +160,7 @@ TEST_F(PlatformIOTest, WaitTimeout) {
 
     platform_io->remove_fd(fd);
 
-#ifdef _WIN32
-    closesocket(fd);
-#else
-    close(fd);
-#endif
+detail::close_socket_fd(fd);
 }
 
 TEST_F(PlatformIOTest, MultipleFds) {
@@ -225,10 +179,6 @@ TEST_F(PlatformIOTest, MultipleFds) {
     // Remove all
     for (int fd : fds) {
         EXPECT_TRUE(platform_io->remove_fd(fd));
-#ifdef _WIN32
-        closesocket(fd);
-#else
-        close(fd);
-#endif
+detail::close_socket_fd(fd);
     }
 }

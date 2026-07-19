@@ -1,9 +1,6 @@
-#include <arpa/inet.h>
 #include <gtest/gtest.h>
-#include <netinet/in.h>
 #include <signal.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <libspaznet/detail/socket_compat.hpp>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -18,14 +15,8 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #define close_socket closesocket
 #else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 #define close_socket ::close
 #endif
 

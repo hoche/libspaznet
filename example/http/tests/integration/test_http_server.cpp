@@ -6,16 +6,10 @@
 #include <string>
 #include <thread>
 
+#include <libspaznet/detail/socket_compat.hpp>
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #define close_socket closesocket
-#define inet_addr(x) inet_addr(x)
 #else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 #define close_socket ::close
 #endif
 

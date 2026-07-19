@@ -1,9 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include <libspaznet/detail/socket_compat.hpp>
 
 #include <atomic>
 #include <chrono>

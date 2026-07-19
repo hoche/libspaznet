@@ -1,11 +1,7 @@
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
 #include <signal.h>
-#include <sys/socket.h>
+#include <libspaznet/detail/socket_compat.hpp>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>

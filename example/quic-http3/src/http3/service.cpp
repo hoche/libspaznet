@@ -4,7 +4,7 @@
 #include <memory>
 #include <utility>
 
-#include <sys/socket.h>
+#include <libspaznet/detail/socket_compat.hpp>
 #include <sys/types.h>
 
 namespace spaznet {

@@ -2,13 +2,23 @@
 #ifndef USE_KQUEUE
 #ifndef USE_IOCP
 
-#include <poll.h>
-#include <unistd.h>
-#include <cerrno>
+#include <libspaznet/detail/socket_compat.hpp>
 #include <libspaznet/platform/platform_io.hpp>
+
+#include <cerrno>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+
+#ifdef _WIN32
+// WSAPoll uses the same pollfd layout / event flags as POSIX poll.
+using pollfd = WSAPOLLFD;
+inline auto poll(pollfd* fds, unsigned long nfds, int timeout) -> int {
+    return WSAPoll(fds, static_cast<ULONG>(nfds), timeout);
+}
+#else
+#include <poll.h>
+#endif
 
 namespace spaznet {
 
@@ -57,7 +67,7 @@ class PlatformIOPoll : public PlatformIO {
         }
 
         pollfd pfd{};
-        pfd.fd = file_descriptor;
+        pfd.fd = static_cast<decltype(pfd.fd)>(file_descriptor);
         pfd.events = 0;
         if ((events & EVENT_READ) != 0U) {
             pfd.events |= POLLIN;
@@ -88,7 +98,7 @@ class PlatformIOPoll : public PlatformIO {
         it->second = {user_data, events};
 
         for (auto& pfd : pollfds_) {
-            if (pfd.fd == file_descriptor) {
+            if (pfd.fd == static_cast<decltype(pfd.fd)>(file_descriptor)) {
                 pfd.events = 0;
                 if ((events & EVENT_READ) != 0U) {
                     pfd.events |= POLLIN;
@@ -113,7 +123,7 @@ class PlatformIOPoll : public PlatformIO {
         fd_info_.erase(it);
 
         for (auto pfd_it = pollfds_.begin(); pfd_it != pollfds_.end(); ++pfd_it) {
-            if (pfd_it->fd == file_descriptor) {
+            if (pfd_it->fd == static_cast<decltype(pfd_it->fd)>(file_descriptor)) {
                 pollfds_.erase(pfd_it);
                 break;
             }
@@ -140,8 +150,14 @@ class PlatformIOPoll : public PlatformIO {
         // EINTR is benign; retry so the loop survives signals.
         int nfds;
         do {
-            nfds = poll(snapshot.data(), snapshot.size(), timeout_ms);
-        } while (nfds < 0 && errno == EINTR);
+            nfds = poll(snapshot.data(), static_cast<unsigned long>(snapshot.size()), timeout_ms);
+        } while (nfds < 0 && detail::last_socket_error() ==
+#ifdef _WIN32
+                                 WSAEINTR
+#else
+                                 EINTR
+#endif
+        );
 
         if (nfds < 0) {
             return -1;
@@ -162,13 +178,13 @@ class PlatformIOPoll : public PlatformIO {
                 continue;
             }
 
-            auto info_it = fd_info_.find(pfd.fd);
+            auto info_it = fd_info_.find(static_cast<int>(pfd.fd));
             if (info_it == fd_info_.end()) {
                 continue; // fd was removed after the snapshot
             }
 
             Event event{};
-            event.fd = pfd.fd;
+            event.fd = static_cast<int>(pfd.fd);
             event.events = 0;
 
             if ((pfd.revents & POLLIN) != 0U) {

@@ -4,13 +4,13 @@
 #include <coroutine>
 #include <cstdint>
 #include <functional>
+#include <libspaznet/detail/socket_compat.hpp>
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/platform_io.hpp>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
-#include <sys/socket.h>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>

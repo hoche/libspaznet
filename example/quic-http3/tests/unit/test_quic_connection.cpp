@@ -6,13 +6,12 @@
 // and that both sides agree on transport parameters.
 
 #include <gtest/gtest.h>
+#include <libspaznet/detail/socket_compat.hpp>
 
 #include <libspaznet/quic/connection.hpp>
 #include <libspaznet/quic/listener.hpp>
 #include <libspaznet/quic/varint.hpp>
 
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
 #include <cstring>
 #include <deque>

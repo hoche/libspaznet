@@ -9,7 +9,7 @@
 #include <span>
 #include <vector>
 
-#include <sys/socket.h>
+#include <libspaznet/detail/socket_compat.hpp>
 
 #include <libspaznet/quic/connection.hpp>
 

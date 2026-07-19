@@ -27,7 +27,7 @@
 
 #include <mutex>
 #include <string>
-#include <sys/socket.h>
+#include <libspaznet/detail/socket_compat.hpp>
 #include <unordered_map>
 
 namespace {

@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <libspaznet/io_context.hpp>
 #include <string>
-#include <sys/socket.h>
+#include <libspaznet/detail/socket_compat.hpp>
 #include <vector>
 
 namespace spaznet {

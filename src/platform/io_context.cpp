@@ -1,13 +1,8 @@
-#ifdef _WIN32
-#include <winsock2.h>
-#else
-#include <fcntl.h>
-#include <unistd.h>
-#endif
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <iostream>
+#include <libspaznet/detail/socket_compat.hpp>
 #include <libspaznet/platform/io_context.hpp>
 #include <libspaznet/platform/platform_io.hpp>
 #include <limits>
@@ -15,8 +10,9 @@
 
 namespace spaznet {
 
-#ifdef _WIN32
 namespace {
+
+#ifdef _WIN32
 // Initialize Winsock exactly once per process. Calling WSAStartup is
 // required before any socket() / send() / recv() / etc. — without it,
 // every Winsock call returns WSANOTINITIALISED and connections fail
@@ -35,14 +31,93 @@ void ensure_winsock_initialised() {
         std::atexit([]() { WSACleanup(); });
     });
 }
+
+// Winsock has no pipe(2). A connected TCP loopback pair is pollable the
+// same way and is what every portable event-loop uses on Windows.
+auto create_wakeup_fds(int& read_fd, int& write_fd) -> bool {
+    const SOCKET listener = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET) {
+        return false;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+
+    if (::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        closesocket(listener);
+        return false;
+    }
+
+    int addr_len = sizeof(addr);
+    if (::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addr_len) != 0) {
+        closesocket(listener);
+        return false;
+    }
+
+    if (::listen(listener, 1) != 0) {
+        closesocket(listener);
+        return false;
+    }
+
+    const SOCKET client = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (client == INVALID_SOCKET) {
+        closesocket(listener);
+        return false;
+    }
+
+    if (::connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        closesocket(client);
+        closesocket(listener);
+        return false;
+    }
+
+    const SOCKET server = ::accept(listener, nullptr, nullptr);
+    closesocket(listener);
+    if (server == INVALID_SOCKET) {
+        closesocket(client);
+        return false;
+    }
+
+    if (!detail::set_nonblocking(static_cast<int>(server)) ||
+        !detail::set_nonblocking(static_cast<int>(client))) {
+        closesocket(server);
+        closesocket(client);
+        return false;
+    }
+
+    read_fd = static_cast<int>(server);
+    write_fd = static_cast<int>(client);
+    return true;
+}
+#else
+auto create_wakeup_fds(int& read_fd, int& write_fd) -> bool {
+    std::array<int, 2> fds{-1, -1};
+    if (pipe(fds.data()) != 0) {
+        return false;
+    }
+    read_fd = fds[0];
+    write_fd = fds[1];
+    int flags = fcntl(read_fd, F_GETFL, 0);
+    if (flags != -1) {
+        fcntl(read_fd, F_SETFL, flags | O_NONBLOCK); // NOLINT(cppcoreguidelines-pro-type-vararg)
+    }
+    flags = fcntl(write_fd, F_GETFL, 0);
+    if (flags != -1) {
+        fcntl(write_fd, F_SETFL, flags | O_NONBLOCK); // NOLINT(cppcoreguidelines-pro-type-vararg)
+    }
+    return true;
+}
+#endif
+
 } // namespace
-#endif // _WIN32
 
 IOContext::IOContext(std::size_t num_threads)
     : platform_io_(create_platform_io()),
-      thread_queues_(std::max<std::size_t>(1, num_threads == 0 ? 1 : num_threads)), running_(false),
+      thread_queues_((std::max)(std::size_t{1}, num_threads == 0 ? 1 : num_threads)), running_(false),
       next_queue_(0), num_threads_(num_threads),
-      queue_count_(std::max<std::size_t>(1, num_threads == 0 ? 1 : num_threads)) {
+      queue_count_((std::max)(std::size_t{1}, num_threads == 0 ? 1 : num_threads)) {
 #ifdef _WIN32
     // Must run before platform_io_->init() — IOCP itself, and every
     // socket call the demultiplexer subsequently makes, depends on
@@ -53,23 +128,9 @@ IOContext::IOContext(std::size_t num_threads)
         throw std::runtime_error("Failed to initialize platform I/O");
     }
 
-    // Create wakeup pipe (non-blocking) so timer additions can interrupt wait().
-    std::array<int, 2> fds{-1, -1};
-    if (pipe(fds.data()) == 0) {
-        wake_read_fd_ = fds[0];
-        wake_write_fd_ = fds[1];
-        // Set non-blocking
-        int flags = fcntl(wake_read_fd_, F_GETFL, 0);
-        if (flags != -1) {
-            fcntl(wake_read_fd_, F_SETFL,
-                  flags | O_NONBLOCK); // NOLINT(cppcoreguidelines-pro-type-vararg)
-        }
-        flags = fcntl(wake_write_fd_, F_GETFL, 0);
-        if (flags != -1) {
-            fcntl(wake_write_fd_, F_SETFL,
-                  flags | O_NONBLOCK); // NOLINT(cppcoreguidelines-pro-type-vararg)
-        }
-        // Register wake_read_fd_ for read events
+    // Create wakeup pipe / socket pair (non-blocking) so timer additions
+    // can interrupt wait().
+    if (create_wakeup_fds(wake_read_fd_, wake_write_fd_)) {
         platform_io_->add_fd(wake_read_fd_, PlatformIO::EVENT_READ, nullptr);
     }
 
@@ -104,11 +165,11 @@ IOContext::~IOContext() {
     if (wake_read_fd_ >= 0) {
         // Best-effort remove; ignore failures during shutdown.
         platform_io_->remove_fd(wake_read_fd_);
-        close(wake_read_fd_);
+        detail::close_socket_fd(wake_read_fd_);
         wake_read_fd_ = -1;
     }
     if (wake_write_fd_ >= 0) {
-        close(wake_write_fd_);
+        detail::close_socket_fd(wake_write_fd_);
         wake_write_fd_ = -1;
     }
 }
@@ -117,9 +178,13 @@ auto IOContext::wakeup_event_loop() const -> void {
     if (wake_write_fd_ < 0) {
         return;
     }
-    // Write a single byte; ignore EAGAIN if pipe is full.
+    // Write a single byte; ignore EAGAIN if the pipe/socket is full.
     const uint8_t byte = 1;
-    (void)write(wake_write_fd_, &byte, 1);
+#ifdef _WIN32
+    (void)detail::socket_send(wake_write_fd_, &byte, 1, 0);
+#else
+    (void)::write(wake_write_fd_, &byte, 1);
+#endif
 }
 
 auto IOContext::drain_wakeup_pipe() const -> void {
@@ -129,7 +194,12 @@ auto IOContext::drain_wakeup_pipe() const -> void {
     constexpr std::size_t kDrainChunk = 64;
     std::array<uint8_t, kDrainChunk> buffer{};
     for (;;) {
-        ssize_t bytes_read = read(wake_read_fd_, buffer.data(), buffer.size());
+#ifdef _WIN32
+        const ssize_t bytes_read =
+            detail::socket_recv(wake_read_fd_, buffer.data(), buffer.size(), 0);
+#else
+        const ssize_t bytes_read = ::read(wake_read_fd_, buffer.data(), buffer.size());
+#endif
         if (bytes_read <= 0) {
             break;
         }
@@ -595,7 +665,7 @@ auto IOContext::compute_wait_timeout_ms() -> int {
         }
 
         auto diff = duration_cast<milliseconds>(next_fire - now);
-        auto clamped = std::min<int64_t>(diff.count(), std::numeric_limits<int>::max());
+        auto clamped = (std::min)(diff.count(), static_cast<int64_t>((std::numeric_limits<int>::max)()));
         return static_cast<int>(clamped);
     }
 

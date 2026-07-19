@@ -27,10 +27,8 @@
 #include <string>
 #include <thread>
 
-#include <netinet/in.h>
-#include <sys/socket.h>
+#include <libspaznet/detail/socket_compat.hpp>
 #include <sys/types.h>
-#include <unistd.h>
 
 #include <openssl/bio.h>
 #include <openssl/evp.h>

@@ -173,6 +173,9 @@ endif()
 # Winsock + IOCP support libraries.
 if(WIN32)
     target_link_libraries(spaznet PUBLIC ws2_32 mswsock)
+    # NOMINMAX: winsock2/windows.h otherwise #define min/max and break
+    # std::min / std::max. WIN32_LEAN_AND_MEAN keeps the include set small.
+    target_compile_definitions(spaznet PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
 # Warnings. Applied to library + tests + example via the helper below.

@@ -53,9 +53,12 @@ if(BUILD_TESTING OR TARGET test_unit)
     spaznet_apply_test_warnings(test_http_performance)
     add_test(NAME HttpPerformanceTests COMMAND test_http_performance)
 
-    add_executable(bench_thread_modes tests/performance/bench_thread_modes.cpp)
-    target_link_libraries(bench_thread_modes PRIVATE spaznet_http)
-    spaznet_apply_test_warnings(bench_thread_modes)
+    # fork(2) / waitpid harness — POSIX only.
+    if(NOT WIN32)
+        add_executable(bench_thread_modes tests/performance/bench_thread_modes.cpp)
+        target_link_libraries(bench_thread_modes PRIVATE spaznet_http)
+        spaznet_apply_test_warnings(bench_thread_modes)
+    endif()
 endif()
 
 # Demo

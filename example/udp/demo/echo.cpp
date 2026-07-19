@@ -8,7 +8,7 @@
 #include <libspaznet/udp/dispatcher.hpp>
 #include <libspaznet/udp/handler.hpp>
 
-#include <sys/socket.h>
+#include <libspaznet/detail/socket_compat.hpp>
 
 #include <memory>
 

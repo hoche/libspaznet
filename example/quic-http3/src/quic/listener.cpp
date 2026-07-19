@@ -1,8 +1,8 @@
 #include <libspaznet/quic/listener.hpp>
+#include <libspaznet/detail/socket_compat.hpp>
 
 #include <algorithm>
 #include <cstring>
-#include <netinet/in.h>
 #include <random>
 #include <stdexcept>
 

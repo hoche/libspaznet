@@ -18,9 +18,7 @@
 #include <string>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
+#include <libspaznet/detail/socket_compat.hpp>
 
 #include <openssl/evp.h>
 #include <openssl/pem.h>
