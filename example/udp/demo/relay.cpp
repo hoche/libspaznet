@@ -1,6 +1,7 @@
 // UDP broadcast relay ("chat" over UDP).
 //
-//   $ ./udp_relay
+//   $ ./udp_relay            # coroutine dispatcher (default)
+//   $ ./udp_relay --reactor  # coroutine-free reactor dispatcher
 //   $ nc -u 127.0.0.1 8080     # terminal A
 //   $ nc -u 127.0.0.1 8080     # terminal B
 //   (type a line in A, it shows up in B, and vice versa)
@@ -25,6 +26,7 @@
 #include <libspaznet/udp/dispatcher.hpp>
 #include <libspaznet/udp/handler.hpp>
 
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <libspaznet/detail/socket_compat.hpp>
@@ -48,7 +50,7 @@ std::string peer_key(const spaznet::udp::Packet& pkt) {
 
 class Relay : public spaznet::udp::Handler {
   public:
-    spaznet::Task handle_packet(const spaznet::udp::Packet& pkt) override {
+    void handle_packet(const spaznet::udp::Packet& pkt) override {
         const std::string key = peer_key(pkt);
         std::string join_notice;
 
@@ -80,7 +82,6 @@ class Relay : public spaznet::udp::Handler {
             ::sendto(pkt.listen_fd, message.data(), message.size(), 0,
                      reinterpret_cast<const sockaddr*>(&peer.addr), peer.addr_len);
         }
-        co_return;
     }
 
   private:
@@ -88,9 +89,20 @@ class Relay : public spaznet::udp::Handler {
     std::unordered_map<std::string, Peer> peers_;
 };
 
-int main() {
+int main(int argc, char** argv) {
+    bool use_reactor = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--reactor") == 0) {
+            use_reactor = true;
+        }
+    }
+
     spaznet::Server server(2);
-    server.set_datagram_handler(spaznet::udp::make_dispatcher(std::make_unique<Relay>()));
+    if (use_reactor) {
+        server.set_sync_datagram_handler(spaznet::udp::make_reactor_dispatcher(std::make_unique<Relay>()));
+    } else {
+        server.set_datagram_handler(spaznet::udp::make_dispatcher(std::make_unique<Relay>()));
+    }
     server.listen_udp(8080);
     server.run();
 }

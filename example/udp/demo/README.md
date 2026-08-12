@@ -1,7 +1,11 @@
 # UDP demos
 
 Three small servers built on `spaznet::udp::make_dispatcher`, each on
-its own port so they can run side by side.
+its own port so they can run side by side. Each also accepts a
+`--reactor` flag to run against `spaznet::udp::make_reactor_dispatcher`
+instead — the coroutine-free counterpart, same `Handler` either way (see
+`docs/http.md`'s "Two dispatchers, one handler" section for the HTTP/1.1
+version of this same idea).
 
 ## `echo.cpp` — minimal echo server
 

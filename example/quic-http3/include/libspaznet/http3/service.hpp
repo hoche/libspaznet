@@ -89,5 +89,16 @@ class QuicHttp3Service {
 // reply goes back through the same listening socket.
 auto make_dispatcher(std::unique_ptr<QuicHttp3Service> service) -> ::spaznet::DatagramHandler;
 
+// Coroutine-free counterpart of make_dispatcher: same QuicHttp3Service,
+// same per-datagram work — bind_fd() then handle_datagram() — just
+// invoked directly as a plain function instead of wrapped in a Task.
+// make_dispatcher's Task never actually suspends (the entire QUIC/HTTP3
+// transport underneath is already a synchronous pump; see
+// QuicHttp3Service::handle_datagram/pump_all), so this is a mechanical
+// swap with no behavioral difference. Hand the result to
+// Server::set_sync_datagram_handler instead of set_datagram_handler.
+auto make_reactor_dispatcher(std::unique_ptr<QuicHttp3Service> service)
+    -> ::spaznet::SyncDatagramHandler;
+
 } // namespace http3
 } // namespace spaznet

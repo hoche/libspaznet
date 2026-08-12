@@ -8,6 +8,8 @@
 #include <thread>
 #include <vector>
 
+#include "dispatcher_test_support.hpp"
+
 #include <libspaznet/detail/socket_compat.hpp>
 #ifdef _WIN32
 #define close_socket closesocket
@@ -16,20 +18,23 @@
 #endif
 
 using namespace spaznet;
+using spaznet::udp::testing_support::DispatcherKind;
+using spaznet::udp::testing_support::DispatcherKindName;
+using spaznet::udp::testing_support::install_dispatcher;
 
 class TestUDPHandler : public spaznet::udp::Handler {
   public:
     std::atomic<int> packet_count{0};
     std::vector<spaznet::udp::Packet> received_packets;
 
-    Task handle_packet(const spaznet::udp::Packet& packet) override {
+    void handle_packet(const spaznet::udp::Packet& packet) override {
         packet_count.fetch_add(1);
         received_packets.push_back(packet);
-        co_return;
     }
 };
 
-class UDPServerTest : public ::testing::Test {
+// Parameterized over both UDP dispatchers — see dispatcher_test_support.hpp.
+class UDPServerTest : public ::testing::TestWithParam<DispatcherKind> {
   protected:
     void SetUp() override {
         // Keep a raw pointer to the server-owned handler so packet_count
@@ -38,8 +43,7 @@ class UDPServerTest : public ::testing::Test {
         auto handler_unique = std::make_unique<TestUDPHandler>();
         handler = handler_unique.get();
         server = std::make_unique<Server>(2);
-        server->set_datagram_handler(
-            spaznet::udp::make_dispatcher(std::move(handler_unique)));
+        install_dispatcher(*server, std::move(handler_unique), GetParam());
         server->listen_udp(6666);
 
         server_thread = std::thread([this]() { server->run(); });
@@ -75,14 +79,14 @@ class UDPServerTest : public ::testing::Test {
     std::thread server_thread;
 };
 
-TEST_F(UDPServerTest, UDPListen) {
+TEST_P(UDPServerTest, UDPListen) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // Server should be listening
     EXPECT_NE(server, nullptr);
 }
 
-TEST_F(UDPServerTest, SendUDPPacket) {
+TEST_P(UDPServerTest, SendUDPPacket) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     bool sent = send_udp_packet("Hello UDP", 6666);
@@ -91,7 +95,7 @@ TEST_F(UDPServerTest, SendUDPPacket) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 }
 
-TEST_F(UDPServerTest, MultiplePackets) {
+TEST_P(UDPServerTest, MultiplePackets) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     constexpr int kPackets = 5;
@@ -107,7 +111,7 @@ TEST_F(UDPServerTest, MultiplePackets) {
     EXPECT_EQ(handler->packet_count.load(), kPackets);
 }
 
-TEST_F(UDPServerTest, DifferentPacketSizes) {
+TEST_P(UDPServerTest, DifferentPacketSizes) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // Small packet
@@ -126,7 +130,7 @@ TEST_F(UDPServerTest, DifferentPacketSizes) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 }
 
-TEST_F(UDPServerTest, BinaryData) {
+TEST_P(UDPServerTest, BinaryData) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     std::vector<uint8_t> binary_data = {0x00, 0x01, 0x02, 0xFF, 0xFE, 0xFD};
@@ -135,3 +139,7 @@ TEST_F(UDPServerTest, BinaryData) {
     send_udp_packet(data_str, 6666);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 }
+
+INSTANTIATE_TEST_SUITE_P(Dispatchers, UDPServerTest,
+                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        DispatcherKindName);

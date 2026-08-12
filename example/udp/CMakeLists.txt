@@ -3,6 +3,7 @@
 
 add_library(spaznet_udp STATIC
     src/dispatcher.cpp
+    src/dispatcher_reactor.cpp
 )
 add_library(spaznet::udp ALIAS spaznet_udp)
 

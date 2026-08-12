@@ -10,6 +10,8 @@
 
 #include <gtest/gtest.h>
 
+#include "dispatcher_test_support.hpp"
+
 #include <libspaznet/http3/service.hpp>
 #include <libspaznet/quic/listener.hpp>
 #include <libspaznet/quic/tls.hpp>
@@ -159,7 +161,13 @@ auto pick_free_udp_port() -> uint16_t {
 
 } // namespace
 
-TEST(QuicHttp3CurlInterop, RealCurlReceivesResponseBody) {
+using ::spaznet::http3::testing_support::DispatcherKind;
+using ::spaznet::http3::testing_support::DispatcherKindName;
+using ::spaznet::http3::testing_support::install_dispatcher;
+
+class QuicHttp3CurlInterop : public ::testing::TestWithParam<DispatcherKind> {};
+
+TEST_P(QuicHttp3CurlInterop, RealCurlReceivesResponseBody) {
     if (!curl_supports_http3()) {
         GTEST_SKIP() << "host curl lacks HTTP/3 support — install curl built "
                         "against an HTTP/3-capable libcurl (e.g. on Linux: "
@@ -195,7 +203,6 @@ TEST(QuicHttp3CurlInterop, RealCurlReceivesResponseBody) {
     };
 
     auto service = std::make_unique<http3::QuicHttp3Service>(std::move(lcfg), on_request);
-    auto dispatcher = http3::make_dispatcher(std::move(service));
 
     // Construct Server first so Winsock is initialised before we probe
     // for a free UDP port with raw socket()/bind()/getsockname().
@@ -203,7 +210,7 @@ TEST(QuicHttp3CurlInterop, RealCurlReceivesResponseBody) {
     const uint16_t port = pick_free_udp_port();
     ASSERT_NE(port, 0U);
 
-    srv.set_datagram_handler(std::move(dispatcher));
+    install_dispatcher(srv, std::move(service), GetParam());
     srv.listen_udp(port);
 
     std::thread server_thread([&]() { srv.run(); });
@@ -229,3 +236,7 @@ TEST(QuicHttp3CurlInterop, RealCurlReceivesResponseBody) {
         << "response body mismatch. curl emitted:\n[" << out << "]\nexpected:\n["
         << body << "]";
 }
+
+INSTANTIATE_TEST_SUITE_P(Dispatchers, QuicHttp3CurlInterop,
+                         ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                         DispatcherKindName);

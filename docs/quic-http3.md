@@ -97,6 +97,22 @@ Three things to notice:
    `spaznet::quic::` / `spaznet::http3::` types — the QUIC stack
    is in `example/quic-http3` and isn't part of the core
    `spaznet` library.
+
+There's also a coroutine-free counterpart,
+`http3::make_reactor_dispatcher(...)`, registered via
+`Server::set_sync_datagram_handler` instead of `set_datagram_handler`:
+
+```cpp
+server.set_sync_datagram_handler(
+    spaznet::http3::make_reactor_dispatcher(std::move(service)));
+```
+
+Both wrap the exact same `QuicHttp3Service::handle_datagram` call —
+`make_dispatcher`'s `Task` never actually suspends, since the whole
+QUIC/HTTP3 transport underneath is already a synchronous pump, so the two
+dispatchers are behaviorally identical. Pick whichever matches the rest of
+your `Server` setup (or run both, on separate `Server`s / ports, if you're
+comparing).
 3. **Transport parameters** are advertised to the peer at handshake
    time. Set the `initial_max_*` knobs to non-zero or the peer can't
    send any STREAM bytes.

@@ -24,11 +24,11 @@ This document explains how `libspaznet` schedules work, how coroutines move betw
 > runtime internally (see `CHANGELOG.md`'s Milestone 5 entry), though
 > `Server::set_connection_factory`/`set_sync_datagram_handler` let a
 > reactor-side handler ride along without needing one. `example/http`'s
-> HTTP/1.1 dispatcher now has a coroutine-free reactor counterpart
-> (`make_reactor_dispatcher`, see `docs/http.md`); HTTP/2, WebSocket, and
-> UDP still only have the original coroutine dispatcher, each pending its
-> own milestone. A full rewrite of this document for the dual-runtime
-> model is tracked alongside that work.
+> HTTP/1.1, UDP, and QUIC/HTTP3 dispatchers now each have a coroutine-free
+> reactor counterpart (`make_reactor_dispatcher`, see `docs/http.md`);
+> HTTP/2 and WebSocket still only have the original coroutine dispatcher,
+> each pending its own milestone. A full rewrite of this document for the
+> dual-runtime model is tracked alongside that work.
 
 ## Architecture Overview
 

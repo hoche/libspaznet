@@ -1,6 +1,7 @@
 // Fire-and-forget UDP metrics aggregator (a tiny statsd).
 //
-//   $ ./udp_statsd
+//   $ ./udp_statsd            # coroutine dispatcher (default)
+//   $ ./udp_statsd --reactor  # coroutine-free reactor dispatcher
 //   $ printf 'requests:1|c\ntemp:21.5|g' | nc -u -w0 127.0.0.1 8081
 //   $ echo -n 'requests:1|c' | nc -u -w0 127.0.0.1 8081
 //   # every ~2s, a report like this prints to stdout:
@@ -29,6 +30,7 @@
 #include <libspaznet/udp/handler.hpp>
 
 #include <chrono>
+#include <cstring>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -55,7 +57,7 @@ std::string format_value(double value) {
 
 class StatsdAggregator : public spaznet::udp::Handler {
   public:
-    spaznet::Task handle_packet(const spaznet::udp::Packet& pkt) override {
+    void handle_packet(const spaznet::udp::Packet& pkt) override {
         const std::string text(pkt.data.begin(), pkt.data.end());
         std::istringstream lines(text);
         std::string line;
@@ -64,7 +66,6 @@ class StatsdAggregator : public spaznet::udp::Handler {
         }
         // No sendto() here at all — this handler only ever consumes
         // datagrams. That's the whole point of the demo.
-        co_return;
     }
 
     // Prints the current snapshot and resets counters (statsd-style
@@ -122,11 +123,22 @@ class StatsdAggregator : public spaznet::udp::Handler {
     std::unordered_map<std::string, double> gauges_;
 };
 
-int main() {
+int main(int argc, char** argv) {
+    bool use_reactor = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--reactor") == 0) {
+            use_reactor = true;
+        }
+    }
+
     spaznet::Server server(2);
     auto handler = std::make_unique<StatsdAggregator>();
     StatsdAggregator* handler_raw = handler.get();
-    server.set_datagram_handler(spaznet::udp::make_dispatcher(std::move(handler)));
+    if (use_reactor) {
+        server.set_sync_datagram_handler(spaznet::udp::make_reactor_dispatcher(std::move(handler)));
+    } else {
+        server.set_datagram_handler(spaznet::udp::make_dispatcher(std::move(handler)));
+    }
     server.listen_udp(8081);
 
     // udp::Handler is a plain callback with no IOContext handed to it,

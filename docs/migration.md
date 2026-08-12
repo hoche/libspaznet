@@ -7,6 +7,33 @@ for the full list of what changed.
 The library has not yet shipped versioned releases — pin a SHA, read
 this page, and re-run your test suite when you bump.
 
+## 2026-08-12 — `spaznet::udp::Handler::handle_packet` is now synchronous
+
+Part of the reactor port (see `CHANGELOG.md`). `handle_packet` no longer
+returns `Task` / uses `co_await`/`co_return` — it's now a plain `void`
+function, matching every existing implementation, which never actually
+suspended in the first place.
+
+```cpp
+// Before:
+spaznet::Task handle_packet(const spaznet::udp::Packet& pkt) override {
+    // ...
+    co_return;
+}
+
+// After:
+void handle_packet(const spaznet::udp::Packet& pkt) override {
+    // ...
+}
+```
+
+`make_dispatcher(...)` (coroutine runtime, `Server::set_datagram_handler`)
+is unchanged at the call site — it now just calls the synchronous
+`handle_packet` and wraps it in a `Task` that never suspends. A new
+`make_reactor_dispatcher(...)` is also available for the coroutine-free
+runtime (`Server::set_sync_datagram_handler`); same `Handler`, either
+dispatcher.
+
 ## 2026-05-31 — protocol handlers pulled out of core (Phases 1–5)
 
 Commits `a7fab2d`, `aefbd64`, `e8f372f`, `d812849`, `63da693`,

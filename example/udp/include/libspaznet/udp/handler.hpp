@@ -12,8 +12,6 @@ class Socket;
 
 namespace spaznet::udp {
 
-using ::spaznet::Task;
-
 // One received UDP datagram, with the peer address parsed into a
 // human-readable dotted-quad / colon-hex string and the raw kernel
 // sockaddr preserved so handlers can sendto() a reply without
@@ -28,10 +26,23 @@ struct Packet {
     socklen_t peer_len{0};
 };
 
-// Handler-interface idiom over the low-level
-// Server::set_datagram_handler callback.  Subclass + override
-// handle_packet, then wrap with spaznet::udp::make_dispatcher and
-// install via set_datagram_handler.
+// Handler-interface idiom over the low-level Server callbacks.  Subclass
+// + override handle_packet, then wrap with either
+// spaznet::udp::make_dispatcher (coroutine runtime,
+// Server::set_datagram_handler) or spaznet::udp::make_reactor_dispatcher
+// (coroutine-free, Server::set_sync_datagram_handler) — same Handler,
+// same protocol behavior, pick a runtime.
+//
+// Runtime-neutral by design: plain synchronous function, no Task, no
+// co_await, no completion token. Every UDP interaction in this codebase
+// (echo, fire-and-forget reply, broadcast relay, telemetry aggregation)
+// is answered — or not answered at all — entirely within one
+// handle_packet call, unlike HTTP/1.1's HTTPHandler there's no
+// request/response pairing that could need to defer; there is simply
+// nothing to defer. If a future handler ever needs to do that, it can
+// stash whatever it needs and reply asynchronously via
+// packet.listen_fd/peer/peer_len on its own schedule — handle_packet
+// itself never blocks on it either way.
 class Handler {
   public:
     virtual ~Handler() = default;
@@ -46,7 +57,7 @@ class Handler {
     //   ::sendto(packet.listen_fd, body, body_len, 0,
     //            reinterpret_cast<sockaddr*>(&packet.peer),
     //            packet.peer_len);
-    virtual auto handle_packet(const Packet& packet) -> Task = 0;
+    virtual void handle_packet(const Packet& packet) = 0;
 };
 
 } // namespace spaznet::udp

@@ -50,21 +50,39 @@ auto QuicHttp3Service::pump_all() -> void {
     });
 }
 
+namespace {
+
+void dispatch_one(QuicHttp3Service& service, ::spaznet::Datagram& dg) {
+    // First-datagram bind: the listening UDP fd lives in the
+    // incoming Datagram, so we install it here.  The service's
+    // self-routing SendFn reads `fd_` atomically on every call.
+    service.bind_fd(dg.fd);
+    ::spaznet::quic::PeerAddr peer{};
+    peer.length = dg.peer_len;
+    std::memcpy(&peer.storage, &dg.peer, dg.peer_len);
+    service.handle_datagram(peer, {dg.data.data(), dg.data.size()});
+}
+
+} // namespace
+
 auto make_dispatcher(std::unique_ptr<QuicHttp3Service> service)
     -> ::spaznet::DatagramHandler {
     // shared_ptr so the std::function payload stays copyable.
     std::shared_ptr<QuicHttp3Service> shared(service.release());
     return [shared](::spaznet::Datagram dg) -> ::spaznet::Task {
-        // First-datagram bind: the listening UDP fd lives in the
-        // incoming Datagram, so we install it here.  The service's
-        // self-routing SendFn reads `fd_` atomically on every call.
-        shared->bind_fd(dg.fd);
-        ::spaznet::quic::PeerAddr peer{};
-        peer.length = dg.peer_len;
-        std::memcpy(&peer.storage, &dg.peer, dg.peer_len);
-        shared->handle_datagram(peer, {dg.data.data(), dg.data.size()});
+        // dispatch_one is fully synchronous — no co_await — so this
+        // Task never actually suspends; it exists purely to satisfy
+        // DatagramHandler's signature. See make_reactor_dispatcher below
+        // for the coroutine-free equivalent.
+        dispatch_one(*shared, dg);
         co_return;
     };
+}
+
+auto make_reactor_dispatcher(std::unique_ptr<QuicHttp3Service> service)
+    -> ::spaznet::SyncDatagramHandler {
+    std::shared_ptr<QuicHttp3Service> shared(service.release());
+    return [shared](::spaznet::Datagram dg) { dispatch_one(*shared, dg); };
 }
 
 } // namespace http3

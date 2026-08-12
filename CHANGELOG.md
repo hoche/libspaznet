@@ -6,6 +6,56 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
+## 2026-08-12 — UDP + QUIC/HTTP3 reactor dispatchers
+
+Seventh milestone of the reactor port (see the "Milestone udp-quic-reactor
+progress note" in the reactor-port plan). Both protocols reuse the exact
+transport/codec code the coroutine dispatchers already had — no `quic/` or
+`http3/` source changed — because both were already synchronous under the
+hood; this milestone is purely about exposing that as a coroutine-free
+entry point.
+
+### Changed
+- `spaznet::udp::Handler::handle_packet` is now `void handle_packet(const
+  Packet&)` instead of `Task handle_packet(const Packet&)`
+  (`example/udp/include/libspaznet/udp/handler.hpp`). Every existing
+  implementation (`echo`, `relay`, `statsd`, the test harness) already ran
+  to completion synchronously with no `co_await`, so this is a signature
+  change with no behavioral change. The coroutine dispatcher
+  (`example/udp/src/dispatcher.cpp`) now calls the synchronous method and
+  `co_return`s immediately afterward. See `docs/migration.md`.
+
+### Added
+- `spaznet::udp::make_reactor_dispatcher(std::unique_ptr<Handler>) ->
+  SyncDatagramHandler` (`example/udp/src/dispatcher_reactor.cpp`) — calls
+  `handle_packet` directly, no `Task` involved. Install via
+  `Server::set_sync_datagram_handler()`.
+- `spaznet::http3::make_reactor_dispatcher(std::unique_ptr<QuicHttp3Service>)
+  -> SyncDatagramHandler` (`example/quic-http3/src/http3/service.cpp`) —
+  the coroutine-free counterpart of `make_dispatcher`. `make_dispatcher`'s
+  `Task` never actually suspends (the whole QUIC/HTTP3 transport underneath
+  is already a synchronous pump), so this is a mechanical swap: both now
+  share a `dispatch_one()` helper, one wrapped in a no-op-suspend `Task`,
+  the other called directly.
+- `udp_echo --reactor` / `udp_relay --reactor` / `udp_statsd --reactor` —
+  opt-in CLI flag on all three UDP demos to run the reactor dispatcher
+  instead of the default coroutine one.
+- `example/udp/tests/integration/dispatcher_test_support.hpp` and
+  `example/quic-http3/tests/integration/dispatcher_test_support.hpp` — the
+  same `DispatcherKind {Coroutine, Reactor}` / `install_dispatcher()`
+  pattern `example/http` established, applied to these two protocols.
+  `test_udp_server.cpp` and `test_curl_http3_interop.cpp` are now
+  `TEST_P`-parameterized over both dispatchers.
+
+Verified with the full suite (15 ctest targets) under
+`-DSPAZNET_ENABLE_COROUTINES=ON` plus `-DSPAZNET_BUILD_QUIC=ON` (against a
+local OpenSSL 3.5 build), and `bench_quic_steady_state` as a regression
+sanity check (~87k pkts/sec, unchanged from prior runs — it drives the
+QUIC/HTTP3 codec directly and doesn't exercise either dispatcher). The
+curl-HTTP/3 interop test self-skips on hosts whose `curl` lacks HTTP/3
+support (true in this dev environment) but now does so for both
+parameterizations rather than only covering the coroutine path.
+
 ## 2026-08-12 — HTTP/1.1 reactor dispatcher (coroutine-free Http1Connection)
 
 Sixth milestone of the reactor port (see the "Milestone http1-reactor
