@@ -12,15 +12,14 @@
 
 class Hello : public spaznet::http::HTTPHandler {
   public:
-    spaznet::Task handle_request(const spaznet::http::HTTPRequest&,
-                                 spaznet::http::HTTPResponse& resp,
-                                 spaznet::Socket&) override {
+    void handle_request(const spaznet::http::HTTPRequest&, spaznet::http::ResponseWriter writer) override {
+        spaznet::http::HTTPResponse resp;
         resp.status_code = 200;
         resp.reason_phrase = "OK";
         resp.set_header("Content-Type", "text/plain");
         const char body[] = "Hello, libspaznet!\n";
         resp.body.assign(body, body + sizeof(body) - 1);
-        co_return;
+        writer.complete(std::move(resp));
     }
 };
 

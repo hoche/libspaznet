@@ -21,19 +21,19 @@ class ConcurrentHTTPHandler : public spaznet::http::HTTPHandler {
   public:
     std::atomic<int> request_count{0};
 
-    Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response,
-                        Socket& socket) override {
+    void handle_request(const spaznet::http::HTTPRequest&, spaznet::http::ResponseWriter writer) override {
         request_count.fetch_add(1);
 
         // Simulate some work
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
+        spaznet::http::HTTPResponse response;
         response.status_code = 200;
         response.reason_phrase = "OK";
         response.set_header("Content-Type", "text/plain");
         response.body = {'O', 'K'};
 
-        co_return;
+        writer.complete(std::move(response));
     }
 };
 

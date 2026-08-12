@@ -34,12 +34,12 @@ public:
 
 class HttpFallback : public spaznet::http::HTTPHandler {
 public:
-    spaznet::Task handle_request(const spaznet::http::HTTPRequest&,
-                                 spaznet::http::HTTPResponse& r,
-                                 spaznet::Socket&) override {
+    void handle_request(const spaznet::http::HTTPRequest&,
+                        spaznet::http::ResponseWriter writer) override {
+        spaznet::http::HTTPResponse r;
         r.status_code = 200;
         r.body = {'O','K'};
-        co_return;
+        writer.complete(std::move(r));
     }
 };
 

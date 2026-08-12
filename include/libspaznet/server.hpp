@@ -112,12 +112,49 @@ using ConnectionHandler = std::function<Task(Socket)>;
 // datagram received on any port it's listening on.
 using DatagramHandler = std::function<Task(Datagram)>;
 
+// Reactor-side per-connection callback: invoked once for each accepted TCP
+// connection with the fd (already set non-blocking), the IOContext it was
+// accepted on, and an on_closed callback. The factory mints and returns
+// whatever IoHandler drives that connection's state machine — typically a
+// BufferedConnection or a protocol dispatcher wrapping one — and registers
+// its own read/write interest before returning (see
+// BufferedConnection::start()). It must arrange for on_closed to be
+// invoked exactly once, whenever that connection is done with itself (the
+// same contract as BufferedConnection::set_on_closed) — typically by
+// passing it straight through to set_on_closed, or chaining it after the
+// factory's own cleanup. Server uses on_closed only to drop its reference
+// and update statistics; it takes no other action on the fd itself.
+//
+// The Server keeps the returned shared_ptr alive in a registry keyed by
+// fd from the moment the factory returns until on_closed fires (or, on
+// Server::stop(), until IoHandler::shutdown() forces it to).
+//
+// Returning nullptr declines the connection; Server closes the fd itself
+// in that case, so the factory must NOT close it first (that would race
+// Server's cleanup against whatever fd number the kernel reassigns in
+// between).
+//
+// A Server has at most one active TCP acceptance strategy: setting a
+// ConnectionFactory here takes precedence over set_connection_handler() —
+// accepted connections go to whichever was set most recently.
+using ConnectionFactory =
+    std::function<std::shared_ptr<IoHandler>(int, IOContext&, std::function<void()>)>;
+
+// Reactor-side per-datagram callback: invoked synchronously (no coroutine
+// involved) for each UDP datagram received on any port the Server is
+// listening on. Runs on whichever IOContext worker thread received the
+// packet; like ConnectionFactory, setting this takes precedence over
+// set_datagram_handler() for datagrams delivered afterward.
+using SyncDatagramHandler = std::function<void(Datagram)>;
+
 // Server class
 class Server {
   private:
     std::unique_ptr<IOContext> io_context_;
     ConnectionHandler connection_handler_;
     DatagramHandler datagram_handler_;
+    ConnectionFactory connection_factory_;
+    SyncDatagramHandler sync_datagram_handler_;
     std::unordered_map<int, std::coroutine_handle<>> socket_handles_;
     // Track active listening sockets so stop()/destructor can close them even if coroutines are
     // currently suspended on accept.
@@ -132,11 +169,25 @@ class Server {
     std::mutex client_fds_mutex_;
     std::unordered_set<int> active_client_fds_;
     std::atomic<int> active_connections_{0};
+    // Reactor-side counterpart of active_client_fds_: connections minted by
+    // connection_factory_, keyed by fd. Server owns the shared_ptr from the
+    // point the factory returns it until the connection reports itself
+    // closed (erased from here by finish_reactor_connection, invoked as an
+    // on_closed-style hook) or until stop() shuts every remaining one down.
+    std::mutex reactor_conns_mutex_;
+    std::unordered_map<int, std::shared_ptr<IoHandler>> reactor_connections_;
     std::atomic<bool> running_;
 
     Task handle_connection(Socket socket);
     Task accept_connections(int listen_fd);
     Task receive_udp(int udp_fd);
+    // Drops fd from reactor_connections_ (called once the connection is
+    // done with itself) and updates the shared active-connection count.
+    // Safe to call from any thread; safe to call from inside the very
+    // IoHandler callback that's finishing, since it only erases this
+    // Server's map entry — the object itself stays alive for the rest of
+    // that callback via the shared_ptr the caller already holds.
+    void finish_reactor_connection(int fd);
 
   public:
     // `num_threads` is the number of IO worker threads to spawn (0 = non-threaded default).
@@ -155,6 +206,15 @@ class Server {
     // build these callbacks from higher-level handler interfaces.
     void set_connection_handler(ConnectionHandler handler);
     void set_datagram_handler(DatagramHandler handler);
+
+    // ---- Reactor-side callbacks. ----
+    // set_connection_factory / set_sync_datagram_handler are the
+    // coroutine-free counterparts of the two setters above: no Task, no
+    // co_await, just an IoHandler and a synchronous callback respectively.
+    // See the ConnectionFactory / SyncDatagramHandler typedefs above for
+    // the precedence rules against the coroutine-based setters.
+    void set_connection_factory(ConnectionFactory factory);
+    void set_sync_datagram_handler(SyncDatagramHandler handler);
 
     // ---- Legacy handler-pattern setters (deprecated). ----
     // These remain as compatibility wrappers around

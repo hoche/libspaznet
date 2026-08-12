@@ -21,7 +21,7 @@ PlatformIO.
 | Core | `spaznet::Task` | **Stable** | C++20 coroutine return type. Symmetric transfer + ref-counted control block. |
 | Core | `spaznet::codec::huffman_{encode,decode}` | **Stable** | RFC 7541 §B codec. Shared by HPACK (example/http2) and QPACK (example/quic-http3). |
 | Logger | `spaznet::Logger` | **Stable** | Optional; no I/O on the hot path unless enabled. |
-| **example/http** | `spaznet::http::HTTPHandler` + `make_dispatcher(...)` | **Stable** | Full HTTP/1.1 keep-alive, chunked **request** body, header CR/LF sanitization on responses. See `docs/http.md`. |
+| **example/http** | `spaznet::http::HTTPHandler` + `make_dispatcher(...)` | **Stable** | Full HTTP/1.1 keep-alive, chunked **request** body, header CR/LF sanitization on responses. `handle_request(const HTTPRequest&, ResponseWriter)` is now a plain synchronous virtual (no `Task`/`co_await`) — answer via `writer.complete(response)`, inline or deferred. See `docs/http.md`. |
 | example/http | Chunked **trailer** parsing | **Stable** | RFC 9112 §7.1.2 trailer-field lines between the last-chunk and the final CRLF are consumed and dropped (we don't expose trailers on `HTTPRequest`). |
 | example/http | Chunk-extension line length | **Limited** | 4 KiB cap; well above real-world integrity-tag extensions but still bounds the per-line scan. |
 | **example/http-websocket** | `spaznet::websocket::Handler` + `make_dispatcher(http_handler, ws_handler)` | **Stable** | RFC 6455 compliant. Combined dispatcher: sniffs each connection for a WS upgrade and routes to the WS frame loop, otherwise hands off to example/http. Both `handle_message` overloads (`const&` and `&&`) supported. See `docs/websocket.md`. |

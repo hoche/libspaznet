@@ -13,12 +13,39 @@
 
 #include <algorithm>
 #include <cctype>
+#include <coroutine>
 #include <cstdint>
 #include <memory>
 #include <utility>
 #include <vector>
 
 namespace spaznet::http {
+
+namespace {
+
+// Bridges a ResponseWriter's completion into this coroutine's resumption.
+// HTTPHandler::handle_request() is called as a plain synchronous function
+// below — no co_await at the call site — so in the (currently universal)
+// case where a handler completes the writer before returning,
+// await_ready() is already true and this awaiter suspends nothing at all.
+// It only matters for a handler that defers: it parks this coroutine and
+// resumes it, via ctx->post() (so always off whichever call stack actually
+// completes the writer, never inline), once complete() eventually runs.
+struct AwaitResponseReady {
+    ResponseWriter writer;
+    ::spaznet::IOContext* ctx;
+
+    [[nodiscard]] auto await_ready() const -> bool {
+        return writer.is_completed();
+    }
+    void await_suspend(std::coroutine_handle<> handle) const {
+        auto* ctx_ptr = ctx;
+        writer.on_ready([ctx_ptr, handle]() mutable { ctx_ptr->post([handle]() mutable { handle.resume(); }); });
+    }
+    void await_resume() const {}
+};
+
+} // namespace
 
 auto serve_keep_alive(::spaznet::Socket socket, HTTPHandler& handler,
                       std::vector<std::uint8_t> initial_buffer) -> ::spaznet::Task {
@@ -75,10 +102,19 @@ auto serve_keep_alive(::spaznet::Socket socket, HTTPHandler& handler,
 
         socket.context()->increment_active_requests();
         try {
+            // Filled in by ResponseWriter's deliver callback below (which
+            // replaces this wholesale); HTTPResponse::version already
+            // defaults to "1.1", matching what used to be set explicitly
+            // here.
             spaznet::http::HTTPResponse response;
-            response.version = "1.1";
 
-            co_await handler.handle_request(request, response, socket);
+            // No co_await here: handle_request() is now a plain synchronous
+            // call. ResponseWriter's deliver callback below fills `response`
+            // in place, so a handler that completes before returning (the
+            // common case) needs no suspension at all.
+            ResponseWriter writer([&response](HTTPResponse r) { response = std::move(r); });
+            handler.handle_request(request, writer);
+            co_await AwaitResponseReady{writer, socket.context()};
 
             const bool keep_alive = request.should_keep_alive();
             response.set_header("Connection", keep_alive ? "keep-alive" : "close");

@@ -96,7 +96,10 @@ auto create_wakeup_fds(int& read_fd, int& write_fd) -> bool {
 
 IOContext::IOContext(std::size_t num_threads)
     : platform_io_(create_platform_io()),
-      thread_queues_((std::max)(std::size_t{1}, num_threads == 0 ? 1 : num_threads)), running_(false),
+#ifdef SPAZNET_HAS_COROUTINES
+      thread_queues_((std::max)(std::size_t{1}, num_threads == 0 ? 1 : num_threads)),
+#endif
+      callback_queues_((std::max)(std::size_t{1}, num_threads == 0 ? 1 : num_threads)), running_(false),
       next_queue_(0), num_threads_(num_threads),
       queue_count_((std::max)(std::size_t{1}, num_threads == 0 ? 1 : num_threads)) {
 #ifdef _WIN32
@@ -115,8 +118,10 @@ IOContext::IOContext(std::size_t num_threads)
         platform_io_->add_fd(wake_read_fd_, PlatformIO::EVENT_READ, nullptr);
     }
 
+#ifdef SPAZNET_HAS_COROUTINES
     // Set global statistics pointer for lock-free tracking
     g_statistics.store(&statistics_, std::memory_order_release);
+#endif
 }
 
 void IOContext::join_workers() {
@@ -137,9 +142,11 @@ IOContext::~IOContext() {
     stop();
     join_workers();
 
+#ifdef SPAZNET_HAS_COROUTINES
     // Clear global statistics pointer
     StatisticsInternal* expected = &statistics_;
     g_statistics.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
+#endif
 
     platform_io_->cleanup();
 
@@ -233,6 +240,7 @@ void IOContext::run() {
         // Process timers that became due while handling events
         process_timers();
 
+#ifdef SPAZNET_HAS_COROUTINES
         // Steal work from queues if needed
         for (auto& queue : thread_queues_) {
             Task task;
@@ -252,6 +260,22 @@ void IOContext::run() {
                 drain_pending_resumes();
             }
         }
+#endif
+
+        // Drain posted callbacks (reactor primitive; never coroutine-related).
+        for (auto& queue : callback_queues_) {
+            std::function<void()> fn;
+            while (queue.dequeue(fn)) {
+                if (fn) {
+                    fn();
+                }
+            }
+        }
+
+        // Reap anything deferred during this iteration's IO/timer/callback
+        // dispatch, now that nothing from this iteration is still on the
+        // stack.
+        drain_reap_list();
     }
 }
 
@@ -268,6 +292,7 @@ void IOContext::stop() {
     wakeup_event_loop();
 }
 
+#ifdef SPAZNET_HAS_COROUTINES
 void IOContext::schedule(Task task) {
     // Single-thread fast path: with no worker threads to hand off to,
     // putting the task on a queue just so the I/O thread will dequeue
@@ -301,10 +326,52 @@ void IOContext::schedule(Task task) {
     // and help drain the queues promptly.
     wakeup_event_loop();
 }
+#endif // SPAZNET_HAS_COROUTINES
+
+void IOContext::defer_destruction(std::shared_ptr<void> obj) {
+    if (!obj) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(reap_mutex_);
+    reap_list_.push_back(std::move(obj));
+}
+
+void IOContext::drain_reap_list() {
+    // Swap out under the lock, destroy outside it: a reaped object's
+    // destructor might itself call defer_destruction (e.g. tearing down
+    // a child connection), which would deadlock on reap_mutex_ if held
+    // across the destroy.
+    std::vector<std::shared_ptr<void>> to_destroy;
+    {
+        std::lock_guard<std::mutex> lock(reap_mutex_);
+        if (reap_list_.empty()) {
+            return;
+        }
+        to_destroy.swap(reap_list_);
+    }
+    // Destructors run here as `to_destroy` goes out of scope.
+}
+
+void IOContext::post(std::function<void()> fn) {
+    // Unlike schedule(), there is no non-threaded fast path here: post()
+    // always queues, even with num_threads_ == 0. Reactor-flavored callers
+    // (timers firing plain callbacks, future non-coroutine I/O handlers)
+    // rely on that to avoid growing the caller's stack through chained
+    // synchronous invocations, mirroring why schedule()'s coroutine fast
+    // path needs resume_with_depth_bound in the first place.
+    std::size_t index = next_callback_queue_.fetch_add(1, std::memory_order_acq_rel) % queue_count_;
+    callback_queues_[index].enqueue(std::move(fn));
+    {
+        std::lock_guard<std::mutex> lock(worker_wake_mutex_);
+        worker_wake_cv_.notify_one();
+    }
+    wakeup_event_loop();
+}
 
 void IOContext::worker_thread(std::size_t queue_index) {
-    const std::size_t queue_n = thread_queues_.size();
+    const std::size_t queue_n = callback_queues_.size();
 
+#ifdef SPAZNET_HAS_COROUTINES
     // True if any thread queue currently holds a task. Called both to grab
     // work and as the CV predicate, so a worker never parks while work is
     // pending. Workers steal across all queues (not just their own) so a
@@ -318,8 +385,20 @@ void IOContext::worker_thread(std::size_t queue_index) {
         }
         return false;
     };
+#endif
+
+    // Same stealing pattern as try_take, for the callback queues.
+    auto try_take_callback = [&](std::function<void()>& out) -> bool {
+        for (std::size_t k = 0; k < queue_n; ++k) {
+            if (callback_queues_[(queue_index + k) % queue_n].dequeue(out)) {
+                return true;
+            }
+        }
+        return false;
+    };
 
     while (running_.load(std::memory_order_acquire)) {
+#ifdef SPAZNET_HAS_COROUTINES
         Task task;
         if (try_take(task)) {
             // Check if task handle is valid before accessing it
@@ -332,21 +411,39 @@ void IOContext::worker_thread(std::size_t queue_index) {
             // so a deep synchronous chain that exceeded the threshold
             // makes forward progress before the next dequeue.
             drain_pending_resumes();
+            drain_reap_list();
+            continue;
+        }
+#endif
+
+        std::function<void()> fn;
+        if (try_take_callback(fn)) {
+            if (fn) {
+                fn();
+            }
+            drain_reap_list();
             continue;
         }
 
-        // No work: park until schedule() enqueues something or stop() runs.
-        // The predicate is re-checked under worker_wake_mutex_, and schedule()
-        // takes that same mutex after enqueuing, so an enqueue that races this
-        // park cannot be lost (either the predicate sees it, or the notify
-        // arrives after we begin waiting).
+        // No work: park until schedule()/post() enqueues something or stop()
+        // runs. The predicate is re-checked under worker_wake_mutex_, and
+        // both schedule() and post() take that same mutex after enqueuing,
+        // so an enqueue that races this park cannot be lost (either the
+        // predicate sees it, or the notify arrives after we begin waiting).
         std::unique_lock<std::mutex> lock(worker_wake_mutex_);
         worker_wake_cv_.wait(lock, [this, queue_n] {
             if (!running_.load(std::memory_order_acquire)) {
                 return true;
             }
+#ifdef SPAZNET_HAS_COROUTINES
             for (std::size_t i = 0; i < queue_n; ++i) {
                 if (!thread_queues_[i].empty()) {
+                    return true;
+                }
+            }
+#endif
+            for (std::size_t i = 0; i < queue_n; ++i) {
+                if (!callback_queues_[i].empty()) {
                     return true;
                 }
             }
@@ -355,7 +452,18 @@ void IOContext::worker_thread(std::size_t queue_index) {
     }
 }
 
+#ifdef SPAZNET_HAS_COROUTINES
 void IOContext::register_io(int file_descriptor, uint32_t events, CoroutineHandle handle) {
+    // Thin coroutine-flavored wrapper: adapt the handle to the generic
+    // IoHandler interface and register it the same way any other readiness
+    // callback would be. See set_io_handler for the shared implementation.
+    auto resume_handler = std::make_shared<CoroutineResumeHandler>(*this, std::move(handle));
+    set_io_handler(file_descriptor, events, std::move(resume_handler));
+}
+#endif // SPAZNET_HAS_COROUTINES
+
+void IOContext::set_io_handler(int file_descriptor, uint32_t events,
+                               std::shared_ptr<IoHandler> handler) {
     // Guard the pending-io map AND the platform-IO side-table mutation
     // below. This was an atomic_flag spinlock, but add_fd / modify_fd
     // issue a syscall while the lock is held, and a blocked syscall under
@@ -395,17 +503,17 @@ void IOContext::register_io(int file_descriptor, uint32_t events, CoroutineHandl
         }
         pending.generation = generation;
 
-        // Keep the awaiting coroutine alive while it is registered. The handle
-        // arrives already ref-counted (the awaiter built it from its concrete
-        // promise type), so storing it here retains a strong reference — the
-        // coroutine frame would otherwise be destroyed while suspended.
+        // Keep the handler alive while it is registered (shared_ptr, not a
+        // raw pointer): for the coroutine adapter this transitively keeps
+        // the coroutine frame alive — it would otherwise be destroyed while
+        // suspended.
         uint32_t new_events = 0;
-        if (handle) {
+        if (handler) {
             if ((events & PlatformIO::EVENT_READ) != 0) {
-                pending.read = handle;
+                pending.read = handler;
             }
             if ((events & PlatformIO::EVENT_WRITE) != 0) {
-                pending.write = handle;
+                pending.write = handler;
             }
         }
 
@@ -451,8 +559,14 @@ void IOContext::remove_io(int file_descriptor) {
 }
 
 void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) {
-    // Extract tasks to schedule BEFORE scheduling (avoid holding lock during schedule)
-    std::vector<Task> tasks_to_schedule;
+    // Extract fired handlers BEFORE invoking them (avoid holding the lock
+    // while a handler runs — it may call back into set_io_handler/
+    // remove_io, e.g. a BufferedConnection re-arming write interest).
+    struct FiredHandler {
+        std::shared_ptr<IoHandler> handler;
+        bool readable; // true => on_readable(), false => on_writable()
+    };
+    std::vector<FiredHandler> fired;
 
     {
         std::lock_guard<std::mutex> lock(map_lock_);
@@ -484,15 +598,15 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
             bool changed = false;
             if ((evt.events & PlatformIO::EVENT_READ) != 0) {
                 if (pending.read) {
-                    tasks_to_schedule.emplace_back(std::move(pending.read));
-                    pending.read = {};
+                    fired.push_back({std::move(pending.read), true});
+                    pending.read = nullptr;
                     changed = true;
                 }
             }
             if ((evt.events & PlatformIO::EVENT_WRITE) != 0) {
                 if (pending.write) {
-                    tasks_to_schedule.emplace_back(std::move(pending.write));
-                    pending.write = {};
+                    fired.push_back({std::move(pending.write), false});
+                    pending.write = nullptr;
                     changed = true;
                 }
             }
@@ -514,12 +628,19 @@ void IOContext::process_io_events(const std::vector<PlatformIO::Event>& events) 
     }
     // Lock released here
 
-    // Now schedule all tasks without holding the lock.
-    for (auto& task : tasks_to_schedule) {
-        schedule(std::move(task));
+    // Invoke every fired handler without holding the lock. For the
+    // coroutine adapter, on_readable()/on_writable() calls schedule(),
+    // reproducing the previous "resume via Task" behavior exactly.
+    for (auto& entry : fired) {
+        if (entry.readable) {
+            entry.handler->on_readable();
+        } else {
+            entry.handler->on_writable();
+        }
     }
 }
 
+#ifdef SPAZNET_HAS_COROUTINES
 auto IOContext::add_timer(std::chrono::steady_clock::time_point first_fire,
                           std::chrono::nanoseconds interval, bool repeat,
                           const std::shared_ptr<Task>& task_ptr) -> uint64_t {
@@ -545,17 +666,49 @@ auto IOContext::add_timer(std::chrono::steady_clock::time_point first_fire,
         if (task_ptr && task_ptr->handle) {
             suspended_tasks_[task_ptr->handle.address()] = task_ptr;
         }
-        timers_.push(TimerEntry{timer_id, first_fire, interval, repeat, task_ptr});
+        timers_.push(TimerEntry{timer_id, first_fire, interval, repeat, task_ptr, /*callback=*/{}});
     }
     if (should_wake) {
         wakeup_event_loop();
     }
     return timer_id;
 }
+#endif // SPAZNET_HAS_COROUTINES
 
 void IOContext::cancel_timer(uint64_t timer_id) {
     std::lock_guard<std::mutex> lock(timer_mutex_);
     cancelled_timers_[timer_id] = true;
+}
+
+auto IOContext::add_timer_callback(std::chrono::steady_clock::time_point first_fire,
+                                   std::chrono::nanoseconds interval, bool repeat,
+                                   std::function<void()> callback) -> uint64_t {
+    uint64_t timer_id = next_timer_id_.fetch_add(1, std::memory_order_relaxed);
+    if (repeat && interval.count() <= 0) {
+        interval = std::chrono::milliseconds(1);
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (first_fire <= now) {
+        first_fire = now + std::chrono::milliseconds(1);
+    }
+    bool should_wake = false;
+    {
+        std::lock_guard<std::mutex> lock(timer_mutex_);
+        if (timers_.empty() || first_fire < timers_.top().next_fire) {
+            should_wake = true;
+        }
+        TimerEntry entry;
+        entry.id = timer_id;
+        entry.next_fire = first_fire;
+        entry.interval = interval;
+        entry.repeat = repeat;
+        entry.callback = std::move(callback);
+        timers_.push(std::move(entry));
+    }
+    if (should_wake) {
+        wakeup_event_loop();
+    }
+    return timer_id;
 }
 
 void IOContext::process_timers() {
@@ -567,7 +720,8 @@ void IOContext::process_timers() {
     }
 
     auto now = steady_clock::now();
-    std::vector<std::shared_ptr<Task>> ready_tasks;
+    // Exactly one of task_ptr/callback is set per entry (see TimerEntry).
+    std::vector<TimerEntry> ready_entries;
 
     {
         std::lock_guard<std::mutex> lock(timer_mutex_);
@@ -587,8 +741,8 @@ void IOContext::process_timers() {
 
             timers_.pop();
 
-            // Store task for later resumption
-            ready_tasks.push_back(entry.task_ptr);
+            // Store the entry for later resumption/invocation
+            ready_entries.push_back(entry);
 
             if (entry.repeat) {
                 // Keep intervals stable: schedule next fire relative to "now".
@@ -605,36 +759,41 @@ void IOContext::process_timers() {
         return;
     }
 
-    for (auto& task_ptr : ready_tasks) {
-        // Check if context is still running before scheduling
+    for (auto& entry : ready_entries) {
+        // Check if context is still running before dispatching
         if (!running_.load(std::memory_order_acquire)) {
             continue;
         }
 
-        // Check if task_ptr is valid
-        if (!task_ptr) {
-            continue;
-        }
+#ifdef SPAZNET_HAS_COROUTINES
+        if (entry.task_ptr) {
+            // Coroutine-flavored path (TimerAwaiter / sleep_for / interval).
+            auto handle = entry.task_ptr->handle;
+            if (!handle) {
+                continue;
+            }
 
-        // Extract the handle first
-        auto handle = task_ptr->handle;
-        if (!handle) {
-            continue;
-        }
+            // Remove from suspended_tasks_ map since timer is firing
+            {
+                std::lock_guard<std::mutex> lock(timer_mutex_);
+                suspended_tasks_.erase(handle.address());
+            }
 
-        // Remove from suspended_tasks_ map since timer is firing
-        {
-            std::lock_guard<std::mutex> lock(timer_mutex_);
-            suspended_tasks_.erase(handle.address());
-        }
-
-        // Create new Task from the handle - reference counting handles ownership
-        // The handle from task_ptr is already reference-counted, so we can safely
-        // create a new Task from it
-        if (handle) {
+            // Create new Task from the handle - reference counting handles ownership
+            // The handle from task_ptr is already reference-counted, so we can safely
+            // create a new Task from it
             Task task_to_schedule{handle};
             // Schedule the task - Task::resume() will check if handle is done
             schedule(std::move(task_to_schedule));
+            continue;
+        }
+#endif
+        if (entry.callback) {
+            // Reactor-flavored path (add_timer_callback). Routed through
+            // post() (always queues) rather than invoked inline here, so a
+            // user callback never runs with timer_mutex_-adjacent state on
+            // the stack and can't recursively re-enter process_timers.
+            post(entry.callback);
         }
     }
 }

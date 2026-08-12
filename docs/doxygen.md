@@ -62,21 +62,38 @@ defaults.
   plain lambdas don't participate in continuation chaining. See
   [`coroutine-pitfalls.md`](coroutine-pitfalls.md) for why.
 
-Example for a coroutine handler:
+Example for a coroutine handler (HTTP/2's `Handler::handle_request`
+still uses this shape):
 
 ```cpp
-/// \brief Handles an HTTP request asynchronously using libspaznet
+/// \brief Handles an HTTP/2 request asynchronously using libspaznet
 ///        coroutines.
 /// \details Starts on the dispatching thread, may resume on any
 ///          worker after I/O readiness.  Avoid mixing with ad-hoc
 ///          lambdas; keep the coroutine in Task.
-/// \param request   Parsed HTTP request.
+/// \param request   Parsed request.
 /// \param response  Mutable response to fill.
 /// \param socket    Connected client socket; non-owning.
 /// \return Task that completes when the response is ready to send.
-Task handle_request(const HTTPRequest& request,
-                    HTTPResponse& response,
+Task handle_request(const Request& request,
+                    Response& response,
                     Socket& socket) override;
+```
+
+Example for a synchronous handler (HTTP/1.1's
+`HTTPHandler::handle_request`, and the shape any future reactor
+dispatcher's handlers will use):
+
+```cpp
+/// \brief Handles an HTTP/1.1 request synchronously.
+/// \details No coroutine involved. Answer immediately by calling
+///          `writer.complete(response)` before returning, or defer
+///          by moving/copying `writer` elsewhere and completing it
+///          later, from any thread.
+/// \param request  Parsed HTTP request.
+/// \param writer    Completion token; see include/libspaznet/reactor/response_writer.hpp.
+void handle_request(const HTTPRequest& request,
+                    ResponseWriter writer) override;
 ```
 
 ## Groups

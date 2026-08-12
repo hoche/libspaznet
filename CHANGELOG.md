@@ -6,6 +6,139 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
+## 2026-08-12 — reactor entry points on Server (ConnectionFactory, sync UDP, destroy-based shutdown)
+
+Fifth milestone of the reactor port (see the "Milestone 5 progress note"
+in the reactor-port plan for full design rationale). `Server` gains a
+coroutine-free way to accept TCP connections and receive UDP datagrams,
+alongside — not instead of — its existing `Task`-based API. Non-breaking:
+nothing changes for existing `set_connection_handler`/`set_datagram_handler`
+users.
+
+### Added
+- `Server::set_connection_factory(ConnectionFactory)` —
+  `ConnectionFactory = std::function<std::shared_ptr<IoHandler>(int fd, IOContext&, std::function<void()> on_closed)>`.
+  Takes precedence over `set_connection_handler` for newly accepted
+  connections. The factory mints whatever `IoHandler` drives the
+  connection (typically a `BufferedConnection`) and must arrange for
+  `on_closed` to fire exactly once when it's done; returning `nullptr`
+  declines the connection (`Server` closes the fd itself in that case).
+- `Server::set_sync_datagram_handler(SyncDatagramHandler)` —
+  `SyncDatagramHandler = std::function<void(Datagram)>`, called as a
+  plain function with no coroutine involved. Takes precedence over
+  `set_datagram_handler` for datagrams received afterward.
+- `IoHandler::shutdown()` — new virtual hook (default no-op) letting
+  callers holding a `shared_ptr<IoHandler>` tear it down generically.
+  `BufferedConnection::shutdown()` overrides it to call `close()`.
+- `Statistics::active_connections` and `Statistics::bytes_buffered`
+  are now populated: `active_connections` by both runtimes (the
+  coroutine path's `ConnGuard` and the reactor path's
+  factory/`finish_reactor_connection` hooks feed the same counter);
+  `bytes_buffered` by `BufferedConnection` (always 0 for coroutine
+  connections, which have no equivalent buffer).
+- `tests/integration/test_server_reactor.cpp` — core-level,
+  protocol-agnostic coverage of the above: an echoing
+  `ConnectionFactory` end to end over a real socket,
+  `active_connections` tracking, `stop()` tearing down a live reactor
+  connection within its bounded deadline, a `SyncDatagramHandler`
+  round trip, and a declined-connection fd-leak check.
+  `BufferedConnectionTest.BytesBufferedStat*` unit tests cover the new
+  gauge.
+
+### Changed
+- `Server::stop()` gained a step, between closing listening sockets
+  and draining in-flight coroutines, that force-closes every
+  registered reactor connection: posted to an IO thread (via
+  `IOContext::post()`, avoiding a race between `stop()`'s caller
+  thread and live `on_readable()`/`on_writable()` calls) and bounded
+  to the same 1s deadline the coroutine drain already uses. No
+  `shutdown(2)` involved — these connections have no suspended call
+  stack to unwind, so their `IoHandler::shutdown()` is called directly.
+
+## 2026-08-12 — synchronous handler API + ResponseWriter (HTTP/1.1)
+
+Fourth milestone of the reactor port (see the "Milestone 4 progress
+note" in the reactor-port plan for the full design rationale).
+**Breaking change for HTTP/1.1 handlers** — `example/http`'s
+`HTTPHandler::handle_request` is no longer a coroutine. HTTP/2,
+WebSocket, and UDP are untouched and still `Task`-based; each gets
+this same treatment alongside its own reactor-dispatcher milestone.
+
+### Added
+- `spaznet::ResponseWriter<Response>`
+  (`include/libspaznet/reactor/response_writer.hpp`) — a movable/
+  copyable completion token. A handler answers by calling
+  `writer.complete(response)`, either inline (indistinguishable from
+  a plain synchronous function call) or later, from anywhere — a
+  stashed copy, a different thread, a timer. Only the first
+  `complete()` call across all copies takes effect. Core, header-only,
+  zero coroutine dependency; unit-tested standalone
+  (`test_response_writer.cpp`) and confirmed to build/link under
+  `-DSPAZNET_ENABLE_COROUTINES=OFF`.
+
+### Changed
+- `spaznet::http::HTTPHandler::handle_request` is now
+  `void handle_request(const HTTPRequest&, ResponseWriter)` — no
+  `Task`, no `co_await`, no `Socket&`. All demos (`http_hello`,
+  `http_showcase`, `ws_echo`'s/`ws_chat`'s HTTP fallback) and tests
+  updated. See `docs/http.md` for the new contract.
+- `example/http/src/dispatcher.cpp`'s `serve_keep_alive` (still a
+  coroutine itself — its own reactor dispatcher is a later milestone)
+  now calls `handle_request()` synchronously and only suspends
+  (`co_await`s a small internal `AwaitResponseReady` bridge) if the
+  handler actually deferred completion. Added
+  `test_deferred_handler.cpp` — a handler that completes from a
+  detached background thread after a delay — since no pre-existing
+  handler ever exercised that suspend/resume path.
+
+## 2026-08-12 — reactor core extracted from IOContext; coroutines now optional
+
+First three milestones of the reactor port (see
+`docs/concurrency-and-coroutines.md` for the execution model). No
+public coroutine API changed; `Server`/`Socket`/every protocol
+dispatcher are unaffected and still coroutine-only pending their own
+reactor-side dispatchers.
+
+### Added
+- `spaznet::IoHandler` — readiness callback interface (`on_readable`/
+  `on_writable`/`on_error`). `IOContext`'s fd table now stores
+  `shared_ptr<IoHandler>` instead of a raw `CoroutineHandle`;
+  `CoroutineResumeHandler` is the coroutine runtime's implementation
+  of it, and `IOContext::set_io_handler()` is the generic primitive
+  `register_io(fd, events, CoroutineHandle)` now wraps.
+- `IOContext::post(std::function<void()>)` — always-queueing callback
+  primitive (never resumes/invokes inline, unlike `schedule()`'s
+  non-threaded fast path), backed by a new `CallbackQueue` sibling to
+  `TaskQueue`.
+- `IOContext::add_timer_callback(...)` — callback-flavored timer,
+  dispatched via `post()`, alongside the existing `Task`-flavored
+  `add_timer()` used by `sleep_for`/`sleep_until`/`interval`.
+- `IOContext::defer_destruction(shared_ptr<void>)` / `drain_reap_list()`
+  — a reap list for the standard reactor re-entrancy hazard: a
+  connection dropping its own last owning reference from inside a
+  callback `IOContext` is currently invoking on it. Objects handed to
+  `defer_destruction` are kept alive until the current run()/worker
+  loop iteration finishes, instead of being destroyed synchronously
+  mid-callback.
+- `spaznet::InputBuffer` / `OutputBuffer` / `BufferedConnection`
+  (`include/libspaznet/reactor/buffered_connection.hpp`) — the
+  reactor-side buffered I/O layer: a growable/compacting read buffer,
+  a write buffer with optimistic-write-then-queue semantics and
+  automatic write-interest toggling, and an `IoHandler` that ties them
+  to a raw non-blocking fd via `set_io_handler`/`defer_destruction`.
+  Operates on a raw fd directly rather than through `Socket` (which
+  remains coroutine-only pending its own reactor entry point), so it
+  has no coroutine dependency at all.
+- `SPAZNET_ENABLE_COROUTINES` CMake option (default `ON`). When
+  `OFF`, `SPAZNET_HAS_COROUTINES` is not defined, `Task`/`ValueTask`/
+  `CoroutineHandle`/`schedule()`/`register_io(CoroutineHandle)` and
+  all coroutine-only `IOContext` state are compiled out entirely, and
+  the core library (fd table, timers, `post()`, `PlatformIO`,
+  `BufferedConnection`) builds and links with zero coroutine code.
+  `Server` and `SPAZNET_BUILD_EXAMPLES` still require coroutines today
+  (forced `OFF` with a warning otherwise) — their reactor counterparts
+  are later milestones.
+
 ## 2026-05-31 — protocol handlers pulled out of core
 
 Across `a7fab2d`, `aefbd64`, `e8f372f`, `d812849`, `63da693`,

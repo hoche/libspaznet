@@ -59,6 +59,19 @@ if(SPAZNET_BUILD_QUIC)
     endif()
 endif()
 
+# ---- Coroutine runtime toggle --------------------------------------------
+# The reactor (IoHandler, the fd table, post(), timers) is always built and
+# has no coroutine dependency. Task/ValueTask, CoroutineHandle, and
+# IOContext::schedule()/register_io(CoroutineHandle) are gated behind
+# SPAZNET_HAS_COROUTINES (set below from this option) so a toolchain that
+# can't or doesn't want a C++20 coroutine dependency can build just the
+# reactor kernel. Defaults ON: every current consumer (Server, all five
+# protocol dispatchers) is still coroutine-only until they grow reactor
+# counterparts, so turning this OFF today only builds the core reactor
+# primitives — not Server or example/. See docs/concurrency-and-coroutines.md.
+option(SPAZNET_ENABLE_COROUTINES
+    "Build the C++20 coroutine runtime (Task/ValueTask) on top of the reactor core" ON)
+
 # ---- Fuzzing ------------------------------------------------------------
 # Optional libFuzzer harnesses for every untrusted-byte parser in the
 # tree.  Requires a Clang-family compiler (libFuzzer ships with clang).
@@ -113,12 +126,12 @@ endif()
 set(SOURCES
     src/platform/io_context.cpp
     src/platform/platform_io.cpp
+    src/reactor/buffered_connection.cpp
     src/codec/huffman.cpp
     src/utils/string_utils.cpp
     src/utils/number_utils.cpp
     src/utils/binary_utils.cpp
     src/utils/header_utils.cpp
-    src/server_impl.cpp
 )
 
 set(HEADERS
@@ -126,14 +139,24 @@ set(HEADERS
     include/libspaznet/platform_io.hpp
     include/libspaznet/platform/io_context.hpp
     include/libspaznet/platform/platform_io.hpp
+    include/libspaznet/reactor/buffered_connection.hpp
+    include/libspaznet/reactor/response_writer.hpp
     include/libspaznet/logger.hpp
     include/libspaznet/codec/huffman.hpp
     include/libspaznet/utils/string_utils.hpp
     include/libspaznet/utils/number_utils.hpp
     include/libspaznet/utils/binary_utils.hpp
     include/libspaznet/utils/header_utils.hpp
-    include/libspaznet/server.hpp
 )
+
+# Server (and its Socket wrapper) is still 100% coroutine-based today — its
+# reactor counterpart is a later milestone (server-reactor-entry, then a
+# reactor dispatcher per protocol). Only add it, and the example/ protocol
+# libraries that depend on it, when coroutines are enabled.
+if(SPAZNET_ENABLE_COROUTINES)
+    list(APPEND SOURCES src/server_impl.cpp)
+    list(APPEND HEADERS include/libspaznet/server.hpp)
+endif()
 
 # ---- Library target -----------------------------------------------------
 add_library(spaznet STATIC ${SOURCES} ${HEADERS})
@@ -152,6 +175,12 @@ target_include_directories(spaznet
 )
 
 target_link_libraries(spaznet PUBLIC Threads::Threads)
+if(SPAZNET_ENABLE_COROUTINES)
+    # PUBLIC: downstream headers (io_context.hpp) branch on this too, so
+    # consumers linking spaznet::spaznet must see the same definition the
+    # library itself was built with.
+    target_compile_definitions(spaznet PUBLIC SPAZNET_HAS_COROUTINES)
+endif()
 if(SPAZNET_BUILD_QUIC)
     target_link_libraries(spaznet PUBLIC OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(spaznet PUBLIC SPAZNET_HAS_QUIC)
@@ -304,33 +333,67 @@ endforeach()
 
 set(SPAZNET_UNIT_TEST_SOURCES
     tests/test_main.cpp
-    tests/unit/test_task_queue.cpp
     tests/unit/test_platform_io.cpp
-    tests/unit/test_io_context.cpp
-    tests/unit/test_timer.cpp
     tests/unit/test_logger.cpp
     tests/unit/test_number_utils.cpp
+    tests/unit/test_reactor_primitives.cpp
+    tests/unit/test_buffered_connection.cpp
+    tests/unit/test_response_writer.cpp
 )
+if(SPAZNET_ENABLE_COROUTINES)
+    # All of these drive Task/ValueTask/CoroutineHandle, IOContext::schedule(),
+    # or ctx.sleep_for()/interval() (the TimerAwaiter-based coroutine timer
+    # API) directly; every one is compiled out when coroutines are disabled.
+    list(APPEND SPAZNET_UNIT_TEST_SOURCES
+        tests/unit/test_task_queue.cpp
+        tests/unit/test_io_context.cpp
+        tests/unit/test_timer.cpp
+    )
+endif()
 add_executable(test_unit ${SPAZNET_UNIT_TEST_SOURCES})
 target_link_libraries(test_unit PRIVATE spaznet GTest::gtest GTest::gmock)
 spaznet_apply_test_warnings(test_unit)
 
-# All core integration tests have moved to example/<protocol>/tests
-# alongside their handler implementations.  Re-add this when there's
-# truly transport-level integration code to test here.
-
-add_executable(test_performance
-    tests/test_main.cpp
-    tests/performance/test_iperf_integration.cpp
-)
-target_link_libraries(test_performance PRIVATE spaznet GTest::gtest GTest::gmock)
-spaznet_apply_test_warnings(test_performance)
+# Most core integration tests have moved to example/<protocol>/tests
+# alongside their handler implementations. test_server_reactor is the
+# exception: it drives Server's reactor entry points (ConnectionFactory /
+# SyncDatagramHandler / destroy-based shutdown) directly, with no protocol
+# parsing involved, so it belongs here rather than under any one example.
 
 add_test(NAME UnitTests COMMAND test_unit)
-add_test(NAME PerformanceTests COMMAND test_performance)
+
+if(SPAZNET_ENABLE_COROUTINES)
+    # Drives Server::listen_tcp/connect, i.e. the coroutine-only Server API.
+    add_executable(test_performance
+        tests/test_main.cpp
+        tests/performance/test_iperf_integration.cpp
+    )
+    target_link_libraries(test_performance PRIVATE spaznet GTest::gtest GTest::gmock)
+    spaznet_apply_test_warnings(test_performance)
+    add_test(NAME PerformanceTests COMMAND test_performance)
+
+    # Server (and thus its reactor entry points) is coroutine-only today —
+    # see the SOURCES/HEADERS comment above.
+    add_executable(test_server_reactor
+        tests/test_main.cpp
+        tests/integration/test_server_reactor.cpp
+    )
+    target_link_libraries(test_server_reactor PRIVATE spaznet GTest::gtest GTest::gmock)
+    spaznet_apply_test_warnings(test_server_reactor)
+    add_test(NAME ServerReactorTests COMMAND test_server_reactor)
+endif()
 
 # ---- example/ subprojects ----
 option(SPAZNET_BUILD_EXAMPLES "Build example protocol libraries (HTTP, etc.)" ON)
+if(SPAZNET_BUILD_EXAMPLES AND NOT SPAZNET_ENABLE_COROUTINES)
+    message(WARNING
+        "SPAZNET_ENABLE_COROUTINES=OFF: Server and every example/ protocol "
+        "dispatcher are still coroutine-only (their reactor counterparts "
+        "haven't landed yet), so SPAZNET_BUILD_EXAMPLES is being forced OFF. "
+        "Only the reactor-kernel parts of the core library (fd table, "
+        "timers, post()) will build.")
+    set(SPAZNET_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+endif()
 if(SPAZNET_BUILD_EXAMPLES)
     add_subdirectory(example/http)
     add_subdirectory(example/http-websocket)

@@ -2,6 +2,29 @@
 
 This document explains how `libspaznet` schedules work, how coroutines move between threads, and why coroutine-native handlers cannot be mixed with ad-hoc lambdas.
 
+> **Scope note (2026-08-12):** everything below describes the coroutine
+> runtime specifically (`Task`/`ValueTask`, `schedule()`,
+> `register_io(fd, events, CoroutineHandle)`), which remains exactly as
+> documented — no public coroutine API changed. `IOContext` now also
+> hosts a separate, lambda-based reactor runtime underneath it:
+> `IoHandler` (a virtual `on_readable`/`on_writable`/`on_error`
+> interface), `IOContext::post(std::function<void()>)`,
+> `IOContext::add_timer_callback(...)`, `IOContext::defer_destruction(...)`
+> (a reap list for safe self-destruction inside a callback), and
+> `BufferedConnection` (`include/libspaznet/reactor/buffered_connection.hpp`)
+> built on top of them. The coroutine path is one `IoHandler`
+> implementation (`CoroutineResumeHandler`) among others, not a
+> privileged special case, and it is entirely optional at build time via
+> `-DSPAZNET_ENABLE_COROUTINES=OFF` (see `CHANGELOG.md`). "Do not mix
+> lambdas and coroutines" still holds *within* the coroutine runtime —
+> do not stash a `CoroutineHandle` in a bare `std::function` instead of
+> a `Task` — but it does not apply to this separate reactor runtime,
+> which is lambdas and callbacks by design and has no coroutine
+> dependency at all. `Server`/`Socket`/every protocol dispatcher still
+> only speak the coroutine runtime today; their reactor-side
+> counterparts are a later milestone. A full rewrite of this document
+> for the dual-runtime model is tracked alongside that work.
+
 ## Architecture Overview
 
 ![Architecture overview](svgs/architecture-overview.svg)
@@ -79,9 +102,13 @@ The scheduler expects **coroutine-aware callables** that return `Task` and yield
 - **Write coroutine functions that return `Task`.** Define named member functions or free functions with `co_await` and let the scheduler handle thread hops.
 
 ```cpp
-Task MyHTTPHandler::handle_request(const HTTPRequest& req,
-                                   HTTPResponse& res,
-                                   Socket& sock) {
+// Illustrative coroutine handler shape, not the literal current
+// HTTPHandler interface (which is now synchronous — see docs/http.md).
+// This still applies as-is to HTTP/2's Handler::handle_request, which
+// remains Task-based.
+Task MyHandler::handle_request(const Request& req,
+                               Response& res,
+                               Socket& sock) {
     auto read = co_await sock.read_some(buffer);
     co_await ctx.sleep_for(10ms);
     res.status_code = 200;

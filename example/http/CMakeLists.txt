@@ -35,6 +35,7 @@ if(BUILD_TESTING OR TARGET test_unit)
         tests/integration/test_thread_modes.cpp
         tests/integration/test_concurrent_connections.cpp
         tests/integration/test_rfc9112_compliance.cpp
+        tests/integration/test_deferred_handler.cpp
     )
     add_executable(test_http_integration ${SPAZNET_HTTP_INTEGRATION_SOURCES})
     target_link_libraries(test_http_integration PRIVATE spaznet_http GTest::gtest GTest::gmock)

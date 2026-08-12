@@ -161,9 +161,8 @@ void handle_status(const std::string& target, HTTPResponse& resp) {
 
 class Showcase : public spaznet::http::HTTPHandler {
   public:
-    spaznet::Task handle_request(const spaznet::http::HTTPRequest& req,
-                                 spaznet::http::HTTPResponse& resp,
-                                 spaznet::Socket&) override {
+    void handle_request(const spaznet::http::HTTPRequest& req, spaznet::http::ResponseWriter writer) override {
+        spaznet::http::HTTPResponse resp;
         resp.status_code = 200;
         resp.reason_phrase = "OK";
 
@@ -183,7 +182,7 @@ class Showcase : public spaznet::http::HTTPHandler {
             resp.reason_phrase = "Not Found";
             set_text(resp, "No such route: " + req.method + " " + req.request_target + "\n");
         }
-        co_return;
+        writer.complete(std::move(resp));
     }
 };
 

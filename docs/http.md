@@ -14,16 +14,16 @@ the low-level `set_connection_handler` callback that
 
 class MyHandler : public spaznet::http::HTTPHandler {
 public:
-    spaznet::Task handle_request(
+    void handle_request(
         const spaznet::http::HTTPRequest& request,
-        spaznet::http::HTTPResponse& response,
-        spaznet::Socket& socket
+        spaznet::http::ResponseWriter writer
     ) override {
+        spaznet::http::HTTPResponse response;
         response.status_code = 200;
         response.reason_phrase = "OK";
         response.set_header("Content-Type", "text/plain");
         response.body = {'H', 'i', '\n'};
-        co_return;
+        writer.complete(std::move(response));
     }
 };
 
@@ -88,16 +88,30 @@ willing — it always is, unless you set `Connection: close` yourself).
 
 ### Lifecycle
 
-`handle_request` is a `Task` — a C++20 coroutine.  You can `co_await`
-inside it (database calls, downstream HTTP fetches, file I/O) and the
-connection won't block other connections on the same IOContext thread.
+`handle_request` is a plain, synchronous, non-coroutine virtual
+function — no `co_await`, no `Task`. Answer immediately by building an
+`HTTPResponse` and calling `writer.complete(std::move(response))`
+before returning; that's the entire handler for the common case, and
+it's indistinguishable from any other synchronous function call.
+
+If you need to defer — background work, a downstream call that
+finishes later, a timer — move or copy `writer` (it's cheap: a
+`shared_ptr` under the hood) into whatever will eventually have the
+answer, and call `.complete()` from there instead, on whatever thread
+or callback that ends up being. Only the first `complete()` call
+across all copies of a given `writer` takes effect; later ones are
+silently ignored, so a handler racing a timeout against real work
+never double-answers. Internally, the dispatcher suspends its
+coroutine until your `writer.complete()` runs — but that's dispatcher
+plumbing, not something your handler needs to know about.
 
 The handler instance is shared across all connections (a single
 `unique_ptr` is wrapped in a `shared_ptr` inside `make_dispatcher`).
-Don't store per-connection state on `this` — use a coroutine local,
-or a member keyed by `socket.fd()`.
+Don't store per-connection state on `this` — use a local in
+`handle_request`, capture it into whatever you hand `writer` off to,
+or keep a member map keyed by something request-derived.
 
-Keep-alive is automatic: after `handle_request` returns and the
+Keep-alive is automatic: after `writer.complete()` runs and the
 response is written, the server reads the next request on the same
 TCP connection.  The handler is invoked again with a fresh
 `HTTPRequest`.
@@ -244,38 +258,48 @@ OpenSSL 3.5+.
 > dispatcher — that bypasses the writer and races with other
 > handlers' frames.  Use the `Response` object instead.
 
-## The `Socket&` parameter (both protocols)
+## The `Socket&` parameter (HTTP/2 only)
 
-You usually don't need to touch the `Socket&`. It's exposed so that
-handlers needing to send raw bytes (SSE streaming, manual chunked
-output) can.  If you do touch it:
+HTTP/1.1's `handle_request` has no `Socket&` parameter — writes are
+entirely mediated by `ResponseWriter`, so there's nothing to expose.
+HTTP/2's `handle_request` still takes one (its handler is still
+coroutine-based; see below). You usually don't need to touch it —
+it's exposed so that handlers needing to send raw bytes can — and if
+you do:
 
-- `socket.async_write(...)` writes raw bytes.  Anything you write
-  here will be prepended to the response the server sends after
-  `handle_request` returns, which is almost never what you want.
-- `socket.close()` ends the connection.  The dispatcher will skip
-  the response serialize/write step if you call this.
+- `socket.async_write(...)` writes raw bytes, bypassing the
+  per-connection writer. **Never do this under the HTTP/2
+  dispatcher** — see the multiplexing warning above.
 - It is **not safe** to capture `socket` and use it from another
   coroutine running on a different IOContext thread.
 
 ## Errors
 
-There's no explicit error path from `handle_request`.  To return an
-error response, set `response.status_code` and `response.body` as
-usual:
+HTTP/1.1's `handle_request` has no explicit error path: build the
+response you want to send (including error responses) and complete
+`writer` with it.
 
 ```cpp
-if (!authenticated(request)) {
-    response.status_code = 401;
-    response.reason_phrase = "Unauthorized";        // HTTP/1.1
-    response.set_header("WWW-Authenticate", "Basic realm=\"app\"");
-    co_return;
+void handle_request(const HTTPRequest& request, ResponseWriter writer) override {
+    if (!authenticated(request)) {
+        HTTPResponse response;
+        response.status_code = 401;
+        response.reason_phrase = "Unauthorized";
+        response.set_header("WWW-Authenticate", "Basic realm=\"app\"");
+        writer.complete(std::move(response));
+        return;
+    }
+    // ...
 }
 ```
 
-If `handle_request` throws, HTTP/1.1 closes the connection and
-HTTP/2 sends `RST_STREAM(INTERNAL_ERROR)` and continues serving
-other streams on the same connection.
+HTTP/2's `handle_request` is still a coroutine (`Task`); the
+equivalent there is `co_return` after setting `response.status_code`.
+
+If HTTP/1.1's `handle_request` throws (synchronously, before
+returning) the connection is closed. HTTP/2 sends
+`RST_STREAM(INTERNAL_ERROR)` and continues serving other streams on
+the same connection.
 
 ## Related
 

@@ -154,13 +154,13 @@ deep in compilation.
 
 class Hello : public spaznet::http::HTTPHandler {
 public:
-    spaznet::Task handle_request(
+    void handle_request(
         const spaznet::http::HTTPRequest&,
-        spaznet::http::HTTPResponse& r,
-        spaznet::Socket&
+        spaznet::http::ResponseWriter writer
     ) override {
+        spaznet::http::HTTPResponse r;
         r.body = {'O','K'};
-        co_return;
+        writer.complete(std::move(r));
     }
 };
 

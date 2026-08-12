@@ -21,13 +21,80 @@
 
 namespace spaznet {
 
+// Forward declaration needed unconditionally: IoHandler (just below) and
+// the reactor-only parts of IOContext don't depend on coroutines at all.
+class IOContext;
+
+// Reactor primitive: readiness callback interface. The fd table
+// (IOContext::pending_io_) stores one of these per registered read/write
+// interest instead of anything coroutine-specific. When SPAZNET_HAS_COROUTINES
+// is defined, the coroutine runtime is one implementation
+// (CoroutineResumeHandler, further below); non-coroutine consumers (e.g. a
+// buffered connection) can implement this directly and register themselves
+// the same way via IOContext::set_io_handler. This interface — and
+// everything else in this header outside the SPAZNET_HAS_COROUTINES block —
+// has no coroutine dependency and is always built.
+class IoHandler {
+  public:
+    virtual ~IoHandler() = default;
+    virtual void on_readable() = 0;
+    virtual void on_writable() = 0;
+    virtual void on_error() {}
+
+    // Generic "give this connection up" hook for callers (e.g. Server::stop())
+    // that hold an IoHandler through this base interface and need to tear it
+    // down without knowing its concrete type. Default is a no-op so existing
+    // handlers that manage their own lifetime some other way aren't forced to
+    // implement it. Implementations that own an fd (BufferedConnection) should
+    // override this to close it and fire whatever "closed" notification they
+    // offer, exactly as if the peer had disappeared.
+    virtual void shutdown() {}
+};
+
+// Statistics structure for lock-free tracking. Kept unconditional (rather
+// than split across the coroutine boundary) so Server and downstream code
+// see one stable struct either way; the coroutine-only counters below
+// simply stay at zero when SPAZNET_HAS_COROUTINES is off.
+// Internal structure uses atomics, snapshot uses plain values for copying
+struct Statistics {
+    std::size_t active_requests{0};          // Currently active HTTP requests
+    std::size_t total_coroutines_created{0}; // Total coroutines created (0 if coroutines disabled)
+    std::size_t active_coroutines{0};        // Currently active coroutines (0 if coroutines disabled)
+    std::size_t total_memory_bytes{0};       // Estimated memory in use (bytes; coroutine frames only)
+    // Live connection count, tracked by Server for both runtimes: the
+    // coroutine path's ConnGuard and the reactor path's ConnectionFactory
+    // accept/finish hooks both feed the same counter, so this is accurate
+    // regardless of which (or both) a given Server uses.
+    std::size_t active_connections{0};
+    // Sum of bytes currently queued in reactor-side OutputBuffers across
+    // all connections (i.e. written but not yet accepted by the kernel).
+    // Always 0 for coroutine connections, which have no equivalent
+    // buffer — Socket::async_write blocks the calling coroutine on
+    // backpressure instead of queuing.
+    std::size_t bytes_buffered{0};
+
+    // Helper to estimate coroutine frame size (approximate)
+    static constexpr std::size_t ESTIMATED_COROUTINE_FRAME_SIZE = 512; // bytes per coroutine frame
+};
+
+// Internal statistics storage with atomics
+struct StatisticsInternal {
+    std::atomic<std::size_t> active_requests{0};
+    std::atomic<std::size_t> total_coroutines_created{0};
+    std::atomic<std::size_t> active_coroutines{0};
+    std::atomic<std::size_t> total_memory_bytes{0};
+    std::atomic<std::size_t> active_connections{0};
+    std::atomic<std::size_t> bytes_buffered{0};
+};
+
+#ifdef SPAZNET_HAS_COROUTINES
+
 // Forward declarations
 struct TaskPromiseBase;
 struct TaskPromise;
 struct Task;
 template <typename T> struct ValueTaskPromise;
 template <typename T> struct ValueTask;
-class IOContext;
 struct CoroutineControlBlock;
 void add_ref_coroutine_control_block(CoroutineControlBlock* cb) noexcept;
 void release_coroutine_control_block(CoroutineControlBlock* cb) noexcept;
@@ -96,26 +163,6 @@ inline void drain_pending_resumes() noexcept {
         }
     }
 }
-
-// Statistics structure for lock-free tracking
-// Internal structure uses atomics, snapshot uses plain values for copying
-struct Statistics {
-    std::size_t active_requests{0};          // Currently active HTTP requests
-    std::size_t total_coroutines_created{0}; // Total coroutines created
-    std::size_t active_coroutines{0};        // Currently active coroutines
-    std::size_t total_memory_bytes{0};       // Estimated memory in use (bytes)
-
-    // Helper to estimate coroutine frame size (approximate)
-    static constexpr std::size_t ESTIMATED_COROUTINE_FRAME_SIZE = 512; // bytes per coroutine frame
-};
-
-// Internal statistics storage with atomics
-struct StatisticsInternal {
-    std::atomic<std::size_t> active_requests{0};
-    std::atomic<std::size_t> total_coroutines_created{0};
-    std::atomic<std::size_t> active_coroutines{0};
-    std::atomic<std::size_t> total_memory_bytes{0};
-};
 
 // Global pointer to current IOContext statistics (set by IOContext constructor)
 inline std::atomic<StatisticsInternal*> g_statistics{nullptr};
@@ -386,6 +433,27 @@ class CoroutineHandle {
                                      const CoroutineHandle& rhs) noexcept -> bool {
     return rhs != lhs;
 }
+
+// Adapts a suspended coroutine handle to the IoHandler interface (defined
+// unconditionally near the top of this header) so the fd
+// table can treat "resume a coroutine" and "invoke an arbitrary readiness
+// callback" identically. Reproduces the one-shot semantics register_io /
+// process_io_events always had: firing resumes the coroutine exactly once
+// (via IOContext::schedule) and does not re-arm itself. Method bodies are
+// defined after IOContext's full definition, below, since they call one of
+// its member functions.
+class CoroutineResumeHandler : public IoHandler {
+  public:
+    CoroutineResumeHandler(IOContext& ctx, CoroutineHandle handle) noexcept
+        : ctx_(ctx), handle_(std::move(handle)) {}
+
+    void on_readable() override;
+    void on_writable() override;
+
+  private:
+    IOContext& ctx_;
+    CoroutineHandle handle_;
+};
 
 // Shared suspend logic for the Task/ValueTask awaiters. `awaited` is the
 // coroutine being co_awaited; `awaiter_cb` is the awaiting coroutine's
@@ -692,11 +760,85 @@ class TaskQueue {
     }
 };
 
+#endif // SPAZNET_HAS_COROUTINES
+
+// Reactor primitive: a queue of type-erased callables, mirroring
+// TaskQueue's locking discipline (single mutex guarding both ends) but
+// carrying plain std::function<void()> instead of coroutine Tasks. Backs
+// IOContext::post(), which — unlike schedule() — always queues and never
+// resumes/invokes inline, even in non-threaded mode.
+class CallbackQueue {
+  private:
+    struct Node {
+        std::function<void()> fn;
+        Node* next;
+        explicit Node(std::function<void()> fn_param) : fn(std::move(fn_param)), next(nullptr) {}
+    };
+
+    Node* head_;
+    Node* tail_;
+    mutable std::mutex mutex_;
+
+  public:
+    CallbackQueue() {
+        Node* dummy = new Node({});
+        head_ = dummy;
+        tail_ = dummy;
+    }
+
+    CallbackQueue(const CallbackQueue&) = delete;
+    auto operator=(const CallbackQueue&) -> CallbackQueue& = delete;
+    CallbackQueue(CallbackQueue&&) = delete;
+    auto operator=(CallbackQueue&&) -> CallbackQueue& = delete;
+
+    ~CallbackQueue() {
+        Node* node = head_;
+        while (node != nullptr) {
+            Node* next = node->next;
+            delete node;
+            node = next;
+        }
+    }
+
+    void enqueue(std::function<void()> fn) {
+        Node* node = new Node(std::move(fn));
+        std::lock_guard<std::mutex> lock(mutex_);
+        tail_->next = node;
+        tail_ = node;
+    }
+
+    auto dequeue(std::function<void()>& fn) -> bool {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Node* head = head_;
+        Node* next = head->next;
+        if (next == nullptr) {
+            return false;
+        }
+        head_ = next;
+        fn = std::move(next->fn);
+        delete head;
+        return true;
+    }
+
+    [[nodiscard]] auto empty() const -> bool {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return head_->next == nullptr;
+    }
+};
+
 // IO Context - manages coroutines and I/O events
 class IOContext {
   private:
     std::unique_ptr<PlatformIO> platform_io_;
+#ifdef SPAZNET_HAS_COROUTINES
     std::vector<TaskQueue> thread_queues_;
+#endif
+    // Reactor primitive sibling to thread_queues_: plain callables posted
+    // via post(), drained the same way (main loop + worker_thread) but
+    // never resumed inline the way schedule()'s non-threaded fast path
+    // resumes coroutines.
+    std::vector<CallbackQueue> callback_queues_;
+    std::atomic<std::size_t> next_callback_queue_{0};
     // Idle worker threads park on this CV instead of busy-yielding when their
     // queues are empty. schedule() notifies after enqueuing; stop() wakes all
     // so they can observe running_ == false and exit. See worker_thread().
@@ -731,7 +873,13 @@ class IOContext {
         std::chrono::steady_clock::time_point next_fire;
         std::chrono::nanoseconds interval;
         bool repeat;
+        // Exactly one of these is set. task_ptr backs the coroutine-flavored
+        // TimerAwaiter (sleep_for/sleep_until/interval); callback backs the
+        // reactor-flavored add_timer_callback used by non-coroutine callers.
+#ifdef SPAZNET_HAS_COROUTINES
         std::shared_ptr<Task> task_ptr; // Store shared_ptr to keep Task and coroutine alive
+#endif
+        std::function<void()> callback;
     };
 
     struct TimerCompare {
@@ -742,8 +890,10 @@ class IOContext {
 
     std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerCompare> timers_;
     std::unordered_map<uint64_t, bool> cancelled_timers_;
+#ifdef SPAZNET_HAS_COROUTINES
     std::unordered_map<void*, std::shared_ptr<Task>>
         suspended_tasks_; // Track tasks suspended on timers
+#endif
     std::mutex timer_mutex_;
     std::atomic<uint64_t> next_timer_id_{1};
 
@@ -757,8 +907,8 @@ class IOContext {
     // race where a close()+accept() reuses a numeric fd while an
     // event for the old registration was still queued.
     struct PendingIO {
-        CoroutineHandle read;
-        CoroutineHandle write;
+        std::shared_ptr<IoHandler> read;
+        std::shared_ptr<IoHandler> write;
         uint32_t generation = 0;
 
         PendingIO() = default;
@@ -790,6 +940,15 @@ class IOContext {
     // Statistics tracking (lock-free)
     StatisticsInternal statistics_;
 
+    // Reap list backing defer_destruction(): objects handed here are kept
+    // alive until drain_reap_list() runs, which happens once per run()
+    // iteration and once per worker_thread() unit of work — i.e. only
+    // after every callback currently on the stack has returned to a safe
+    // point. See defer_destruction() below for the intended usage.
+    std::mutex reap_mutex_;
+    std::vector<std::shared_ptr<void>> reap_list_;
+    void drain_reap_list();
+
     auto wakeup_event_loop() const -> void;
     auto drain_wakeup_pipe() const -> void;
 
@@ -801,9 +960,11 @@ class IOContext {
     void process_io_events(const std::vector<PlatformIO::Event>& events);
     void process_timers();
     auto compute_wait_timeout_ms() -> int;
+#ifdef SPAZNET_HAS_COROUTINES
     auto add_timer(std::chrono::steady_clock::time_point first_fire,
                    std::chrono::nanoseconds interval, bool repeat,
                    const std::shared_ptr<Task>& task_ptr) -> uint64_t;
+#endif
 
   public:
     // `num_threads` is the number of worker threads to spawn (not counting the calling thread
@@ -823,21 +984,59 @@ class IOContext {
     // Stop the event loop
     auto stop() -> void;
 
+#ifdef SPAZNET_HAS_COROUTINES
     // Schedule a coroutine task
     auto schedule(Task task) -> void;
+#endif
 
+    // Reactor primitive: post a plain callback to run on the event loop or
+    // a worker thread. Unlike schedule(Task), this ALWAYS queues — even in
+    // non-threaded mode — so callers never get schedule()'s "may resume
+    // synchronously on this call stack" fast path. Move-only closures are
+    // fine; std::function only requires copyability of the underlying
+    // target if you copy the std::function itself.
+    auto post(std::function<void()> fn) -> void;
+
+    // Reactor primitive: register (or update) readiness interest for
+    // `file_descriptor`, backed by an arbitrary IoHandler. register_io
+    // (below) is a thin coroutine-flavored wrapper over this — the fd
+    // table (pending_io_) always stores IoHandlers; CoroutineResumeHandler
+    // is just one implementation.
+    auto set_io_handler(int file_descriptor, uint32_t events,
+                        std::shared_ptr<IoHandler> handler) -> void;
+
+    // Reactor primitive: the standard defense against a state machine
+    // (e.g. BufferedConnection) destroying itself from inside its own
+    // on_readable()/on_writable()/post() callback. Rather than dropping
+    // your last owning shared_ptr synchronously — which would destroy
+    // the object while it may still be on the call stack above you —
+    // hand it here. It is kept alive until drain_reap_list() runs at a
+    // point where nothing can still be executing inside it.
+    auto defer_destruction(std::shared_ptr<void> obj) -> void;
+
+#ifdef SPAZNET_HAS_COROUTINES
     // Register I/O operation. The handle is the awaiting coroutine,
     // already wrapped in a ref-counted CoroutineHandle by the awaiter
     // (which knows its concrete promise type); register_io keeps it alive
     // until the matching event fires.
     auto register_io(int file_descriptor, uint32_t events, CoroutineHandle handle) -> void;
+#endif
 
     // Remove I/O registration for a file descriptor
     auto remove_io(int file_descriptor) -> void;
 
-    // Cancel a scheduled timer
+    // Cancel a scheduled timer (works for both add_timer and
+    // add_timer_callback entries).
     auto cancel_timer(uint64_t timer_id) -> void;
 
+    // Reactor primitive: fire `callback` once (or repeatedly, if `repeat`)
+    // without involving the coroutine runtime. This is the callback-flavored
+    // sibling of add_timer (which TimerAwaiter/sleep_for/interval build on).
+    auto add_timer_callback(std::chrono::steady_clock::time_point first_fire,
+                            std::chrono::nanoseconds interval, bool repeat,
+                            std::function<void()> callback) -> uint64_t;
+
+#ifdef SPAZNET_HAS_COROUTINES
     // Awaitables for timers
     struct TimerAwaiter {
         IOContext* context;
@@ -892,6 +1091,7 @@ class IOContext {
         // So we schedule a one-shot timer for now+period here.
         return TimerAwaiter{this, now + period, period_ns, false};
     }
+#endif // SPAZNET_HAS_COROUTINES
 
     // Get platform I/O interface
     PlatformIO& platform_io() {
@@ -906,6 +1106,8 @@ class IOContext {
             statistics_.total_coroutines_created.load(std::memory_order_acquire);
         stats.active_coroutines = statistics_.active_coroutines.load(std::memory_order_acquire);
         stats.total_memory_bytes = statistics_.total_memory_bytes.load(std::memory_order_acquire);
+        stats.active_connections = statistics_.active_connections.load(std::memory_order_acquire);
+        stats.bytes_buffered = statistics_.bytes_buffered.load(std::memory_order_acquire);
         return stats;
     }
 
@@ -919,6 +1121,31 @@ class IOContext {
         statistics_.active_requests.fetch_sub(1, std::memory_order_relaxed);
     }
 
+    // Connection-count tracking, shared by both runtimes (Server's
+    // coroutine ConnGuard and reactor ConnectionFactory hooks both call
+    // these; see Statistics::active_connections above).
+    void increment_active_connections() {
+        statistics_.active_connections.fetch_add(1, std::memory_order_relaxed);
+    }
+    void decrement_active_connections() {
+        statistics_.active_connections.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    // Reactor-side buffered-bytes gauge. `delta` may be negative (e.g. a
+    // successful flush draining previously-queued bytes); callers report
+    // the net change in whatever they're buffering (see
+    // BufferedConnection::write() / on_writable()).
+    void adjust_bytes_buffered(std::int64_t delta) {
+        if (delta >= 0) {
+            statistics_.bytes_buffered.fetch_add(static_cast<std::size_t>(delta),
+                                                 std::memory_order_relaxed);
+        } else {
+            statistics_.bytes_buffered.fetch_sub(static_cast<std::size_t>(-delta),
+                                                 std::memory_order_relaxed);
+        }
+    }
+
+#ifdef SPAZNET_HAS_COROUTINES
     // Awaitable for async operations
     template <typename T> struct Awaiter {
         T value;
@@ -937,8 +1164,10 @@ class IOContext {
             return value;
         }
     };
+#endif
 };
 
+#ifdef SPAZNET_HAS_COROUTINES
 // Helper to create awaitable
 template <typename T> IOContext::Awaiter<T> make_awaiter(T value) {
     IOContext::Awaiter<T> awaiter;
@@ -946,6 +1175,21 @@ template <typename T> IOContext::Awaiter<T> make_awaiter(T value) {
     awaiter.ready = true;
     return awaiter;
 }
+
+// Out-of-line CoroutineResumeHandler bodies: need IOContext::schedule,
+// declared above but not defined until the full class body is visible.
+// handle_ is copied (not moved) into the Task: the CoroutineResumeHandler
+// itself is kept alive by a shared_ptr held across the on_readable/
+// on_writable call (see process_io_events), so this is a transient extra
+// ref/deref pair around the resume, not a leak or a use-after-free.
+inline void CoroutineResumeHandler::on_readable() {
+    ctx_.schedule(Task(handle_));
+}
+
+inline void CoroutineResumeHandler::on_writable() {
+    ctx_.schedule(Task(handle_));
+}
+#endif // SPAZNET_HAS_COROUTINES
 
 // NOLINTEND
 

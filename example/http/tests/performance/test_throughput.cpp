@@ -30,10 +30,10 @@ class ThroughputHTTPHandler : public spaznet::http::HTTPHandler {
     std::atomic<uint64_t> request_count{0};
     std::atomic<uint64_t> total_bytes_sent{0};
 
-    Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response,
-                        Socket& socket) override {
+    void handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::ResponseWriter writer) override {
         request_count.fetch_add(1);
 
+        spaznet::http::HTTPResponse response;
         response.status_code = 200;
         response.reason_phrase = "OK";
         response.set_header("Content-Type", "text/plain");
@@ -41,7 +41,7 @@ class ThroughputHTTPHandler : public spaznet::http::HTTPHandler {
 
         total_bytes_sent.fetch_add(response.body.size() + 100); // Approximate
 
-        co_return;
+        writer.complete(std::move(response));
     }
 };
 
@@ -238,12 +238,12 @@ TEST_F(ThroughputTest, SustainedLoadThroughput) {
 TEST_F(ThroughputTest, LargeResponseThroughput) {
     class LargeResponseHandler : public spaznet::http::HTTPHandler {
       public:
-        Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response,
-                            Socket& socket) override {
+        void handle_request(const spaznet::http::HTTPRequest&, spaznet::http::ResponseWriter writer) override {
+            spaznet::http::HTTPResponse response;
             response.status_code = 200;
             response.set_header("Content-Type", "application/octet-stream");
             response.body.resize(1024 * 10, 'X'); // 10KB response
-            co_return;
+            writer.complete(std::move(response));
         }
     };
 

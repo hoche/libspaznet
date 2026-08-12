@@ -184,15 +184,15 @@ make lint
 
 class MyHTTPHandler : public spaznet::http::HTTPHandler {
 public:
-    spaznet::Task handle_request(
+    void handle_request(
         const spaznet::http::HTTPRequest& request,
-        spaznet::http::HTTPResponse& response,
-        spaznet::Socket& socket
+        spaznet::http::ResponseWriter writer
     ) override {
+        spaznet::http::HTTPResponse response;
         response.status_code = 200;
         response.set_header("Content-Type", "text/plain");
         response.body = {'H', 'e', 'l', 'l', 'o'};
-        co_return;
+        writer.complete(std::move(response));
     }
 };
 

@@ -3,19 +3,13 @@
 #include <cctype>
 #include <cstdint>
 #include <libspaznet/io_context.hpp>
+#include <libspaznet/reactor/response_writer.hpp>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-namespace spaznet {
-class Socket;
-}
-
 namespace spaznet::http {
-
-using ::spaznet::Socket;
-using ::spaznet::Task;
 
 // HTTP/1.1 Request structure per RFC 9112
 struct HTTPRequest {
@@ -117,6 +111,19 @@ class HTTPParser {
     static auto parse_chunk_size(const std::string& line) -> std::optional<size_t>;
 };
 
+// Runtime-neutral: no Task, no co_await, no Socket. Implementations that
+// can answer immediately just build an HTTPResponse and call
+// `writer.complete(std::move(response))` before returning — that's the
+// entire handler, indistinguishable from a plain synchronous function.
+// Implementations that must defer (issue background work, wait on another
+// service, etc.) instead move/copy `writer` somewhere durable and call
+// `.complete()` from wherever the answer eventually becomes available —
+// a callback, a different thread, a timer, or (today) a coroutine
+// suspended on it by the dispatcher. Calling `writer.complete()` more than
+// once (including via a stashed copy) is safe; only the first call has any
+// effect. See include/libspaznet/reactor/response_writer.hpp.
+using ResponseWriter = ::spaznet::ResponseWriter<HTTPResponse>;
+
 class HTTPHandler {
   public:
     HTTPHandler() = default;
@@ -128,9 +135,9 @@ class HTTPHandler {
     HTTPHandler(HTTPHandler&&) = delete;
     auto operator=(HTTPHandler&&) -> HTTPHandler& = delete;
 
-    // Handle HTTP request
-    virtual auto handle_request(const HTTPRequest& request, HTTPResponse& response,
-                                Socket& socket) -> Task = 0;
+    // Handle HTTP request. See ResponseWriter above for the synchronous
+    // vs. deferred contract.
+    virtual void handle_request(const HTTPRequest& request, ResponseWriter writer) = 0;
 };
 
 } // namespace spaznet::http

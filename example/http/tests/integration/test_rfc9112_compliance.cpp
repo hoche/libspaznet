@@ -22,12 +22,12 @@ class RFC9112TestHandler : public spaznet::http::HTTPHandler {
     std::atomic<int> request_count{0};
     spaznet::http::HTTPRequest last_request;
 
-    Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response,
-                        Socket& socket) override {
+    void handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::ResponseWriter writer) override {
         request_count.fetch_add(1);
         last_request = request;
 
         // RFC 9112 compliant response
+        spaznet::http::HTTPResponse response;
         response.version = "1.1";
         response.status_code = 200;
         response.reason_phrase = "OK";
@@ -48,7 +48,7 @@ class RFC9112TestHandler : public spaznet::http::HTTPHandler {
         // Set Content-Length
         response.set_content_length(response.body.size());
 
-        co_return;
+        writer.complete(std::move(response));
     }
 };
 

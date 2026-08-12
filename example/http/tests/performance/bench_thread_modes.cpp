@@ -278,18 +278,19 @@ static auto percentile_ms(std::vector<double>& samples, double p) -> double {
 
 class BenchHandler : public spaznet::http::HTTPHandler {
   public:
-    Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response, Socket&) override {
+    void handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::ResponseWriter writer) override {
         std::size_t resp_size = 0;
         if (auto hdr = request.get_header("X-Resp-Size")) {
             if (auto v = parse_uint(*hdr)) {
                 resp_size = *v;
             }
         }
+        spaznet::http::HTTPResponse response;
         response.status_code = 200;
         response.reason_phrase = "OK";
         response.set_header("Content-Type", "application/octet-stream");
         response.body = make_body(resp_size);
-        co_return;
+        writer.complete(std::move(response));
     }
 };
 

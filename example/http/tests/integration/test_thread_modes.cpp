@@ -90,13 +90,14 @@ class SimpleOKHandler : public spaznet::http::HTTPHandler {
   public:
     std::atomic<int> requests{0};
 
-    Task handle_request(const spaznet::http::HTTPRequest&, spaznet::http::HTTPResponse& response, Socket&) override {
+    void handle_request(const spaznet::http::HTTPRequest&, spaznet::http::ResponseWriter writer) override {
         requests.fetch_add(1, std::memory_order_relaxed);
+        spaznet::http::HTTPResponse response;
         response.status_code = 200;
         response.reason_phrase = "OK";
         response.set_header("Content-Type", "text/plain");
         response.body = {'O', 'K'};
-        co_return;
+        writer.complete(std::move(response));
     }
 };
 

@@ -137,15 +137,14 @@ constexpr char kChatPage[] = R"HTML(<!DOCTYPE html>
 
 class HttpFallback : public spaznet::http::HTTPHandler {
   public:
-    spaznet::Task handle_request(const spaznet::http::HTTPRequest&,
-                                 spaznet::http::HTTPResponse& resp,
-                                 spaznet::Socket&) override {
+    void handle_request(const spaznet::http::HTTPRequest&, spaznet::http::ResponseWriter writer) override {
+        spaznet::http::HTTPResponse resp;
         resp.status_code = 200;
         resp.reason_phrase = "OK";
         resp.set_header("Content-Type", "text/html; charset=utf-8");
         // -1 to drop the trailing NUL of the string literal.
         resp.body.assign(kChatPage, kChatPage + sizeof(kChatPage) - 1);
-        co_return;
+        writer.complete(std::move(resp));
     }
 };
 

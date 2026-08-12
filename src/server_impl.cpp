@@ -237,6 +237,22 @@ void Server::set_datagram_handler(DatagramHandler handler) {
     datagram_handler_ = std::move(handler);
 }
 
+void Server::set_connection_factory(ConnectionFactory factory) {
+    connection_factory_ = std::move(factory);
+}
+
+void Server::set_sync_datagram_handler(SyncDatagramHandler handler) {
+    sync_datagram_handler_ = std::move(handler);
+}
+
+void Server::finish_reactor_connection(int fd) {
+    {
+        std::lock_guard<std::mutex> lock(reactor_conns_mutex_);
+        reactor_connections_.erase(fd);
+    }
+    io_context_->decrement_active_connections();
+}
+
 void Server::listen_tcp(uint16_t port) {
     // Use getaddrinfo for IPv4/IPv6 compatibility
     struct addrinfo hints {
@@ -390,9 +406,22 @@ Task Server::receive_udp(int udp_fd) {
             port = ntohs(a6->sin6_port);
         }
 
-        // Low-level path: deliver the raw datagram to the user's
-        // datagram_handler if one is installed.
-        if (datagram_handler_) {
+        // Reactor path takes precedence: a plain synchronous call, no
+        // coroutine involved. Falls back to the coroutine-based
+        // datagram_handler_ if no sync handler is installed.
+        if (sync_datagram_handler_) {
+            Datagram dg;
+            dg.data = buffer;
+            dg.peer_addr = host;
+            dg.peer_port = port;
+            std::memcpy(&dg.peer, &addr, addr_len);
+            dg.peer_len = addr_len;
+            dg.fd = udp_fd;
+            try {
+                sync_datagram_handler_(std::move(dg));
+            } catch (...) {
+            }
+        } else if (datagram_handler_) {
             Datagram dg;
             dg.data = buffer;
             dg.peer_addr = host;
@@ -444,6 +473,27 @@ Task Server::accept_connections(int listen_fd) {
         // Set non-blocking
         detail::set_nonblocking(client_fd);
 
+        // Reactor path takes precedence over the coroutine-based
+        // connection_handler_ (see ConnectionFactory's docs above).
+        if (connection_factory_) {
+            int fd = client_fd; // captured by value below; client_fd is reused next loop iteration
+            auto on_closed = [this, fd]() { finish_reactor_connection(fd); };
+            auto handler = connection_factory_(client_fd, *io_context_, std::move(on_closed));
+            if (handler) {
+                {
+                    std::lock_guard<std::mutex> lock(reactor_conns_mutex_);
+                    reactor_connections_[client_fd] = std::move(handler);
+                }
+                io_context_->increment_active_connections();
+            } else {
+                // Factory declined the connection outright (e.g. some
+                // limit); nothing registered it for events, so close it
+                // ourselves rather than leaking the fd.
+                close_socket(client_fd);
+            }
+            continue;
+        }
+
         // Create socket and handle connection
         Socket socket(client_fd, io_context_.get());
         io_context_->schedule(handle_connection(std::move(socket)));
@@ -484,6 +534,11 @@ Task Server::handle_connection(Socket socket) {
                     server->active_client_fds_.insert(fd);
                 }
                 server->active_connections_.fetch_add(1, std::memory_order_acq_rel);
+                // Also feed the runtime-neutral IOContext-level gauge (see
+                // Statistics::active_connections) so get_statistics() is
+                // accurate whether this Server uses the coroutine path,
+                // the reactor path, or — during migration — both.
+                server->io_context_->increment_active_connections();
             }
             ~ConnGuard() {
                 {
@@ -491,6 +546,7 @@ Task Server::handle_connection(Socket socket) {
                     server->active_client_fds_.erase(fd);
                 }
                 server->active_connections_.fetch_sub(1, std::memory_order_acq_rel);
+                server->io_context_->decrement_active_connections();
             }
             ConnGuard(const ConnGuard&) = delete;
             ConnGuard& operator=(const ConnGuard&) = delete;
@@ -548,6 +604,42 @@ void Server::stop() {
 #else
             ::shutdown(fd, SHUT_RDWR);
 #endif
+        }
+    }
+
+    // Step 3.5: force-close every reactor connection still registered.
+    // Unlike coroutines, these have no suspended call stack to unwind —
+    // just hand each one's shared_ptr to IoHandler::shutdown() (which, for
+    // BufferedConnection, closes the fd and fires its on_closed hook,
+    // which in turn calls finish_reactor_connection() below). Routed
+    // through IOContext::post() so this always runs on an IO thread
+    // instead of racing this thread (stop() may be called from any
+    // thread) against in-flight on_readable()/on_writable() calls for the
+    // same connections — see set_io_handler()'s per-fd dispatch.
+    //
+    // `done` is heap-allocated (not captured by reference) because if
+    // run() was never called, or the loop has already exited, this post()
+    // never executes and the bounded wait below simply times out; the
+    // lambda — and the connections it would have shut down — leak, on the
+    // same "don't deadlock stop()" basis the coroutine drain below
+    // accepts.
+    {
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        io_context_->post([this, done]() {
+            std::unordered_map<int, std::shared_ptr<IoHandler>> conns;
+            {
+                std::lock_guard<std::mutex> lock(reactor_conns_mutex_);
+                conns.swap(reactor_connections_);
+            }
+            for (auto& [fd, handler] : conns) {
+                handler->shutdown();
+            }
+            done->store(true, std::memory_order_release);
+        });
+        const auto reactor_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!done->load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < reactor_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
 

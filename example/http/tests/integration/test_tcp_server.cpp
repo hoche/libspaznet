@@ -17,13 +17,13 @@ using namespace spaznet;
 // Simple test HTTP handler
 class TestHTTPHandler : public spaznet::http::HTTPHandler {
   public:
-    Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response,
-                        Socket& socket) override {
+    void handle_request(const spaznet::http::HTTPRequest&, spaznet::http::ResponseWriter writer) override {
+        spaznet::http::HTTPResponse response;
         response.status_code = 200;
         response.reason_phrase = "OK";
         response.set_header("Content-Type", "text/plain");
         response.body = {'O', 'K'};
-        co_return;
+        writer.complete(std::move(response));
     }
 };
 

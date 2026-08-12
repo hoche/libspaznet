@@ -26,19 +26,19 @@ class HTTPServerTestHandler : public spaznet::http::HTTPHandler {
     std::string last_method;
     std::string last_path;
 
-    Task handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::HTTPResponse& response,
-                        Socket& socket) override {
+    void handle_request(const spaznet::http::HTTPRequest& request, spaznet::http::ResponseWriter writer) override {
         request_count.fetch_add(1);
         last_method = request.method;
         last_path = request.request_target;
 
+        spaznet::http::HTTPResponse response;
         response.status_code = 200;
         response.reason_phrase = "OK";
         response.set_header("Content-Type", "text/plain");
         // Set body - serialize() will automatically add Content-Length
         response.body = {'H', 'e', 'l', 'l', 'o'};
 
-        co_return;
+        writer.complete(std::move(response));
     }
 };
 
