@@ -5,6 +5,8 @@
 #include <thread>
 #include <vector>
 
+#include "dispatcher_test_support.hpp"
+
 #include <libspaznet/detail/socket_compat.hpp>
 #ifdef _WIN32
 #define close_socket closesocket
@@ -13,6 +15,9 @@
 #endif
 
 using namespace spaznet;
+using spaznet::http::testing_support::DispatcherKind;
+using spaznet::http::testing_support::DispatcherKindName;
+using spaznet::http::testing_support::install_dispatcher;
 
 // Simple test HTTP handler
 class TestHTTPHandler : public spaznet::http::HTTPHandler {
@@ -27,12 +32,16 @@ class TestHTTPHandler : public spaznet::http::HTTPHandler {
     }
 };
 
-class TCPServerTest : public ::testing::Test {
+// Parameterized over both HTTP/1.1 dispatchers (see
+// dispatcher_test_support.hpp): every scenario here — including the
+// stop()-drain ones, which exercise Server's coroutine-drain and
+// reactor-connection-teardown paths respectively — runs against both.
+class TCPServerTest : public ::testing::TestWithParam<DispatcherKind> {
   protected:
     void SetUp() override {
         server = std::make_unique<Server>(2);
         // Set up a simple handler to handle connections
-        server->set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<TestHTTPHandler>()));
+        install_dispatcher(*server, std::make_unique<TestHTTPHandler>(), GetParam());
         server_thread = std::thread([this]() { server->run(); });
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -78,12 +87,12 @@ class TCPServerTest : public ::testing::Test {
     std::thread server_thread;
 };
 
-TEST_F(TCPServerTest, ServerStartup) {
+TEST_P(TCPServerTest, ServerStartup) {
     // Server should start without errors
     EXPECT_NE(server, nullptr);
 }
 
-TEST_F(TCPServerTest, ListenOnPort) {
+TEST_P(TCPServerTest, ListenOnPort) {
     EXPECT_NO_THROW(server->listen_tcp(9999));
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -95,7 +104,7 @@ TEST_F(TCPServerTest, ListenOnPort) {
     // Connection may succeed or fail depending on handler, but shouldn't crash
 }
 
-TEST_F(TCPServerTest, MultiplePorts) {
+TEST_P(TCPServerTest, MultiplePorts) {
     EXPECT_NO_THROW(server->listen_tcp(9998));
     EXPECT_NO_THROW(server->listen_tcp(9997));
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -110,35 +119,36 @@ TEST_F(TCPServerTest, MultiplePorts) {
         close_socket(client2);
 }
 
-TEST_F(TCPServerTest, ServerShutdown) {
+TEST_P(TCPServerTest, ServerShutdown) {
     EXPECT_NO_THROW(server->stop());
 }
 
-// Server::stop() must drain in-flight connection coroutines before
-// returning so the IOContext isn't torn down with suspended awaiters
-// still pointing into it. We open an idle keep-alive connection (server
-// suspended on recv), then call stop() and assert it returns inside the
-// drain deadline.
-TEST_F(TCPServerTest, StopDrainsIdleConnection) {
+// Server::stop() must drain in-flight connections before returning so the
+// IOContext isn't torn down with a suspended coroutine (or, for the
+// reactor dispatcher, a live BufferedConnection) still pointing into it.
+// We open an idle keep-alive connection (server parked waiting for more
+// data), then call stop() and assert it returns inside the drain
+// deadline.
+TEST_P(TCPServerTest, StopDrainsIdleConnection) {
     server->listen_tcp(9996);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     int client = connect_to_server(9996);
     ASSERT_GE(client, 0);
 
-    // Send one full request and read the response so the server-side
-    // coroutine has cycled back to async_read for the next request — i.e.,
-    // it is now suspended on recv waiting for keep-alive bytes that will
-    // never come.
+    // Send one full request and read the response so the server side has
+    // cycled back to waiting for the next request's bytes — i.e., it is
+    // now parked waiting for keep-alive bytes that will never come.
     std::string req = "GET /x HTTP/1.1\r\nHost: localhost\r\n\r\n";
     ASSERT_EQ(send(client, req.data(), req.size(), 0), static_cast<ssize_t>(req.size()));
     char buf[512]{};
     ssize_t n = recv(client, buf, sizeof(buf) - 1, 0);
     ASSERT_GT(n, 0);
 
-    // The server coroutine is now parked on async_read. stop() must
-    // shutdown() the client fd, wake the coroutine with an error, and
-    // wait for it to unwind. Must return well inside the 1s deadline.
+    // The server side is now parked waiting for more bytes on this
+    // connection. stop() must force it closed (shutdown(2)+unwind for the
+    // coroutine dispatcher, IoHandler::shutdown() for the reactor one) and
+    // wait for it to finish. Must return well inside the 1s deadline.
     auto t0 = std::chrono::steady_clock::now();
     server->stop();
     auto elapsed = std::chrono::steady_clock::now() - t0;
@@ -152,13 +162,15 @@ TEST_F(TCPServerTest, StopDrainsIdleConnection) {
 // BEFORE Socket::close() returns the fd to the kernel, otherwise a
 // subsequent accept() could reuse the fd number while it's still
 // "tracked", and a concurrent Server::stop() would shutdown(2) the
-// foreign socket.
+// foreign socket. (For the reactor dispatcher, the equivalent hazard is
+// finish_reactor_connection() vs. fd reuse; same test, same guarantee,
+// different mechanism underneath.)
 //
 // We can't easily inspect active_client_fds_ from a test, but we
 // CAN drive many short-lived connections in sequence and then call
 // stop(); if the guard's release path is wrong, stop() will block
-// for ~1s waiting on a phantom active_connections_ count.
-TEST_F(TCPServerTest, StopReturnsImmediatelyAfterShortLivedConnections) {
+// for ~1s waiting on a phantom active-connection count.
+TEST_P(TCPServerTest, StopReturnsImmediatelyAfterShortLivedConnections) {
     server->listen_tcp(9995);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -171,19 +183,23 @@ TEST_F(TCPServerTest, StopReturnsImmediatelyAfterShortLivedConnections) {
                           "Connection: close\r\n\r\n";
         ASSERT_EQ(send(client, req.data(), req.size(), 0), static_cast<ssize_t>(req.size()));
         char buf[512]{};
-        // Drain until peer closes; this lets the server-side coroutine
-        // run its socket.close() + guard.release() and exit cleanly.
+        // Drain until peer closes; this lets the server side run its
+        // close + guard-release and exit cleanly.
         while (recv(client, buf, sizeof(buf), 0) > 0) {
         }
         close_socket(client);
     }
 
-    // All 25 coroutines should have unwound by now. stop() must
+    // All 25 connections should have unwound by now. stop() must
     // return promptly — anything close to the 1 s drain deadline
-    // means stale entries are still in active_client_fds_.
+    // means stale entries are still tracked.
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     auto t0 = std::chrono::steady_clock::now();
     server->stop();
     auto elapsed = std::chrono::steady_clock::now() - t0;
     EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 250);
 }
+
+INSTANTIATE_TEST_SUITE_P(Dispatchers, TCPServerTest,
+                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        DispatcherKindName);

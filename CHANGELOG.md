@@ -6,6 +6,58 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
+## 2026-08-12 — HTTP/1.1 reactor dispatcher (coroutine-free Http1Connection)
+
+Sixth milestone of the reactor port (see the "Milestone http1-reactor
+progress note" in the reactor-port plan). `example/http` gains a second,
+coroutine-free dispatcher that plugs into `Server::set_connection_factory`
+from Milestone 5, speaking the exact same HTTP/1.1 protocol against the
+exact same `HTTPHandler`/`HTTPParser`/`HTTPRequest`/`HTTPResponse` as the
+existing coroutine dispatcher — unchanged, not forked. Non-breaking:
+`make_dispatcher`/`serve_keep_alive` and every existing caller are
+untouched.
+
+### Added
+- `spaznet::http::make_reactor_dispatcher(std::unique_ptr<HTTPHandler>) -> ConnectionFactory`
+  (`example/http/src/dispatcher_reactor.cpp`) — the reactor counterpart of
+  `make_dispatcher`. Internally, `Http1Connection` is a small phase state
+  machine (`ReadingRequest` / `Dispatching`) built on `BufferedConnection`;
+  handles keep-alive, pipelining (answered in place, without recursion —
+  see the plan note), chunked responses, and the 400-Bad-Request/parse-error
+  path identically to the coroutine dispatcher.
+- `BufferedConnection::close_after_flush()` — closes immediately if
+  nothing is queued in `output()`, otherwise waits for `on_writable()` to
+  finish draining it first. Needed anywhere a dispatcher wants to send a
+  final response and then close: `write()` immediately followed by
+  `close()` would race the write against the fd closing.
+- `http_hello --reactor` / `http_showcase --reactor` — opt-in CLI flag on
+  both HTTP/1.1 demos to run the new dispatcher instead of the default
+  coroutine one, same handler either way.
+- `example/http/tests/integration/dispatcher_test_support.hpp` — a
+  `DispatcherKind {Coroutine, Reactor}` enum plus an `install_dispatcher()`
+  helper, establishing the differential-testing harness later protocol
+  milestones will reuse.
+
+### Changed
+- `test_tcp_server.cpp`, `test_http_server.cpp`,
+  `test_rfc9112_compliance.cpp`, `test_concurrent_connections.cpp`,
+  `test_thread_modes.cpp`, and `test_deferred_handler.cpp` are now
+  parameterized (`TEST_P`/`INSTANTIATE_TEST_SUITE_P`) over
+  `DispatcherKind`, so every scenario they already covered — RFC 9112
+  protocol details, chunked encoding, keep-alive, concurrent/burst
+  connections, both threading modes, `stop()`-drain timing, and the
+  async-completion (`ResponseWriter` deferred) path — now runs against
+  both dispatchers. Added `RFC9112IntegrationTest.PipelinedRequestsAnsweredInOrderOnOneConnection`
+  and `RFC9112IntegrationTest.MalformedRequestLineGetsFullBadRequestResponseThenCloses`
+  specifically to exercise the reactor dispatcher's pipelining loop and
+  `close_after_flush()` path (both pass identically on the coroutine side
+  too). Performance tests are unchanged (coroutine-only) for this
+  milestone.
+
+Verified under both `-DSPAZNET_ENABLE_COROUTINES=ON` (full suite, 13
+ctest targets, `HttpIntegrationTests` now covering 66 tests) and `=OFF`
+(core `UnitTests`, including the new `close_after_flush()` coverage).
+
 ## 2026-08-12 — reactor entry points on Server (ConnectionFactory, sync UDP, destroy-based shutdown)
 
 Fifth milestone of the reactor port (see the "Milestone 5 progress note"

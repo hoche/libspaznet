@@ -360,6 +360,57 @@ TEST_F(BufferedConnectionTest, BytesBufferedStatDroppedOnCloseWithPendingData) {
     EXPECT_EQ(context->get_statistics().bytes_buffered, 0u);
 }
 
+TEST_F(BufferedConnectionTest, CloseAfterFlushClosesImmediatelyWhenNothingQueued) {
+    SocketPair pair;
+    ASSERT_GE(pair.a, 0);
+    ASSERT_GE(pair.b, 0);
+
+    auto conn = std::make_shared<BufferedConnection>(*context, pair.a);
+    pair.a = -1;
+    conn->start();
+
+    conn->close_after_flush();
+    EXPECT_TRUE(conn->closed());
+}
+
+TEST_F(BufferedConnectionTest, CloseAfterFlushWaitsForPendingWriteToDrainFirst) {
+    SocketPair pair;
+    ASSERT_GE(pair.a, 0);
+    ASSERT_GE(pair.b, 0);
+    int small_buf = 4096;
+    detail::setsockopt_int(pair.a, SOL_SOCKET, SO_SNDBUF, small_buf);
+
+    auto conn = std::make_shared<BufferedConnection>(*context, pair.a);
+    pair.a = -1;
+    conn->start();
+
+    std::vector<uint8_t> payload(1 << 20, 'q'); // 1 MiB; peer will drain it below
+    conn->write(payload);
+    conn->close_after_flush();
+    // Must not have closed yet — bytes are still queued and the peer
+    // hasn't read anything.
+    EXPECT_FALSE(conn->closed());
+
+    std::size_t total_received = 0;
+    std::array<char, 65536> recv_buf{};
+    ASSERT_TRUE(wait_until(
+        [&]() {
+            for (;;) {
+                ssize_t n = detail::socket_recv(pair.b, recv_buf.data(), recv_buf.size(), 0);
+                if (n <= 0) {
+                    break;
+                }
+                total_received += static_cast<std::size_t>(n);
+            }
+            return conn->closed();
+        },
+        5000ms));
+
+    EXPECT_EQ(total_received, payload.size())
+        << "close_after_flush() must not truncate data queued before it was called";
+    EXPECT_TRUE(conn->closed());
+}
+
 TEST_F(BufferedConnectionTest, PeerCloseFiresOnClosedExactlyOnce) {
     SocketPair pair;
     ASSERT_GE(pair.a, 0);

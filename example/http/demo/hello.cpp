@@ -1,6 +1,7 @@
 // Minimal HTTP/1.1 server using example/http.
 //
-//   $ ./http_hello
+//   $ ./http_hello           # coroutine dispatcher (default)
+//   $ ./http_hello --reactor # coroutine-free reactor dispatcher
 //   $ curl http://localhost:8080/
 //   Hello, libspaznet!
 
@@ -8,6 +9,7 @@
 #include <libspaznet/http/handler.hpp>
 #include <libspaznet/server.hpp>
 
+#include <cstring>
 #include <memory>
 
 class Hello : public spaznet::http::HTTPHandler {
@@ -23,10 +25,24 @@ class Hello : public spaznet::http::HTTPHandler {
     }
 };
 
-int main() {
+int main(int argc, char** argv) {
+    bool use_reactor = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--reactor") == 0) {
+            use_reactor = true;
+        }
+    }
+
     spaznet::Server server(4);
-    server.set_connection_handler(
-        spaznet::http::make_dispatcher(std::make_unique<Hello>()));
+    // Same handler, same protocol, same port either way — the two
+    // dispatchers are interchangeable from a client's point of view.
+    if (use_reactor) {
+        server.set_connection_factory(
+            spaznet::http::make_reactor_dispatcher(std::make_unique<Hello>()));
+    } else {
+        server.set_connection_handler(
+            spaznet::http::make_dispatcher(std::make_unique<Hello>()));
+    }
     server.listen_tcp(8080);
     server.run();
 }

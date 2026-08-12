@@ -156,7 +156,18 @@ class BufferedConnection : public IoHandler, public std::enable_shared_from_this
     // already run. Safe to call from within one of this object's own
     // callbacks (on_data/on_closed/on_readable/on_writable): closing does
     // not destroy `this`, it just releases the fd and flips `closed_`.
+    //
+    // Closes immediately regardless of anything still queued in
+    // output() — see close_after_flush() below if that's not what you
+    // want.
     void close();
+
+    // Like close(), but waits for everything currently queued in
+    // output() to actually go out first (immediately, if nothing is
+    // queued right now). Use this instead of write() followed directly
+    // by close() whenever the write might not have gone out yet —
+    // close() alone would silently truncate whatever's still buffered.
+    void close_after_flush();
 
     void on_readable() override;
     void on_writable() override;
@@ -180,6 +191,7 @@ class BufferedConnection : public IoHandler, public std::enable_shared_from_this
     ClosedCallback on_closed_;
     bool closed_{false};
     bool write_interest_armed_{false};
+    bool close_after_flush_{false};
 };
 
 } // namespace spaznet

@@ -4,7 +4,8 @@
 // between HTTP/1.0 and HTTP/1.1 *observable* by hitting the same routes
 // with each protocol version:
 //
-//   $ ./http_showcase
+//   $ ./http_showcase             # coroutine dispatcher (default)
+//   $ ./http_showcase --reactor   # coroutine-free reactor dispatcher
 //   $ curl -v --http1.0 http://localhost:8080/info   # Connection: close by default
 //   $ curl -v --http1.1 http://localhost:8080/info   # Connection: keep-alive by default
 //   $ curl -v --http1.1 http://localhost:8080/chunked   # Transfer-Encoding: chunked
@@ -25,6 +26,7 @@
 #include <libspaznet/server.hpp>
 #include <libspaznet/utils/number_utils.hpp>
 
+#include <cstring>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -186,10 +188,22 @@ class Showcase : public spaznet::http::HTTPHandler {
     }
 };
 
-int main() {
+int main(int argc, char** argv) {
+    bool use_reactor = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--reactor") == 0) {
+            use_reactor = true;
+        }
+    }
+
     spaznet::Server server(4);
-    server.set_connection_handler(
-        spaznet::http::make_dispatcher(std::make_unique<Showcase>()));
+    if (use_reactor) {
+        server.set_connection_factory(
+            spaznet::http::make_reactor_dispatcher(std::make_unique<Showcase>()));
+    } else {
+        server.set_connection_handler(
+            spaznet::http::make_dispatcher(std::make_unique<Showcase>()));
+    }
     server.listen_tcp(8080);
     server.run();
 }

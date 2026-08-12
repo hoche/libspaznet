@@ -15,6 +15,8 @@
 #include <string>
 #include <thread>
 
+#include "dispatcher_test_support.hpp"
+
 #ifdef _WIN32
 #define close_socket closesocket
 #else
@@ -22,6 +24,9 @@
 #endif
 
 using namespace spaznet;
+using spaznet::http::testing_support::DispatcherKind;
+using spaznet::http::testing_support::DispatcherKindName;
+using spaznet::http::testing_support::install_dispatcher;
 
 namespace {
 
@@ -55,13 +60,18 @@ class DeferredHandler : public spaznet::http::HTTPHandler {
 
 } // namespace
 
-class DeferredHandlerTest : public ::testing::Test {
+// Parameterized over both HTTP/1.1 dispatchers (see
+// dispatcher_test_support.hpp): the reactor dispatcher's on_response_ready
+// asynchronous-completion branch (as opposed to the far more common
+// synchronous one) has no other coverage anywhere else, so this is the
+// one test file that actually exercises it.
+class DeferredHandlerTest : public ::testing::TestWithParam<DispatcherKind> {
   protected:
     void SetUp() override {
         auto handler_unique = std::make_unique<DeferredHandler>();
         handler = handler_unique.get();
         server = std::make_unique<Server>(2);
-        server->set_connection_handler(spaznet::http::make_dispatcher(std::move(handler_unique)));
+        install_dispatcher(*server, std::move(handler_unique), GetParam());
         server->listen_tcp(8891);
         server_thread = std::thread([this]() { server->run(); });
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -112,7 +122,7 @@ class DeferredHandlerTest : public ::testing::Test {
     std::thread server_thread;
 };
 
-TEST_F(DeferredHandlerTest, ResponseArrivesAfterHandlerDefersCompletion) {
+TEST_P(DeferredHandlerTest, ResponseArrivesAfterHandlerDefersCompletion) {
     std::string response = send_get("/hello");
 
     ASSERT_NE(response.find("HTTP/1.1 200"), std::string::npos) << response;
@@ -121,7 +131,7 @@ TEST_F(DeferredHandlerTest, ResponseArrivesAfterHandlerDefersCompletion) {
     EXPECT_EQ(handler->requests_completed.load(), 1);
 }
 
-TEST_F(DeferredHandlerTest, MultipleSequentialDeferredRequestsAllComplete) {
+TEST_P(DeferredHandlerTest, MultipleSequentialDeferredRequestsAllComplete) {
     for (int i = 0; i < 3; ++i) {
         std::string path = "/req" + std::to_string(i);
         std::string response = send_get(path);
@@ -131,3 +141,7 @@ TEST_F(DeferredHandlerTest, MultipleSequentialDeferredRequestsAllComplete) {
     EXPECT_EQ(handler->requests_started.load(), 3);
     EXPECT_EQ(handler->requests_completed.load(), 3);
 }
+
+INSTANTIATE_TEST_SUITE_P(Dispatchers, DeferredHandlerTest,
+                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        DispatcherKindName);

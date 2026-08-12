@@ -8,6 +8,8 @@
 #include <thread>
 #include <vector>
 
+#include "dispatcher_test_support.hpp"
+
 #include <libspaznet/detail/socket_compat.hpp>
 #ifdef _WIN32
 #define close_socket closesocket
@@ -16,6 +18,9 @@
 #endif
 
 using namespace spaznet;
+using spaznet::http::testing_support::DispatcherKind;
+using spaznet::http::testing_support::DispatcherKindName;
+using spaznet::http::testing_support::install_dispatcher;
 
 class ConcurrentHTTPHandler : public spaznet::http::HTTPHandler {
   public:
@@ -37,11 +42,12 @@ class ConcurrentHTTPHandler : public spaznet::http::HTTPHandler {
     }
 };
 
-class ConcurrentConnectionsTest : public ::testing::Test {
+// Parameterized over both HTTP/1.1 dispatchers — see dispatcher_test_support.hpp.
+class ConcurrentConnectionsTest : public ::testing::TestWithParam<DispatcherKind> {
   protected:
     void SetUp() override {
         server = std::make_unique<Server>(4); // 4 threads for concurrency
-        server->set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<ConcurrentHTTPHandler>()));
+        install_dispatcher(*server, std::make_unique<ConcurrentHTTPHandler>(), GetParam());
         server->listen_tcp(5555);
 
         server_thread = std::thread([this]() { server->run(); });
@@ -89,7 +95,7 @@ class ConcurrentConnectionsTest : public ::testing::Test {
     std::thread server_thread;
 };
 
-TEST_F(ConcurrentConnectionsTest, MultipleSequentialConnections) {
+TEST_P(ConcurrentConnectionsTest, MultipleSequentialConnections) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     for (int i = 0; i < 10; ++i) {
@@ -100,7 +106,7 @@ TEST_F(ConcurrentConnectionsTest, MultipleSequentialConnections) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 }
 
-TEST_F(ConcurrentConnectionsTest, ConcurrentConnections) {
+TEST_P(ConcurrentConnectionsTest, ConcurrentConnections) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     const int num_clients = 20;
@@ -117,7 +123,7 @@ TEST_F(ConcurrentConnectionsTest, ConcurrentConnections) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 }
 
-TEST_F(ConcurrentConnectionsTest, BurstConnections) {
+TEST_P(ConcurrentConnectionsTest, BurstConnections) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     const int num_clients = 50;
@@ -135,7 +141,7 @@ TEST_F(ConcurrentConnectionsTest, BurstConnections) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 }
 
-TEST_F(ConcurrentConnectionsTest, SustainedLoad) {
+TEST_P(ConcurrentConnectionsTest, SustainedLoad) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     const int num_rounds = 5;
@@ -158,7 +164,7 @@ TEST_F(ConcurrentConnectionsTest, SustainedLoad) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 }
 
-TEST_F(ConcurrentConnectionsTest, MixedRequestTypes) {
+TEST_P(ConcurrentConnectionsTest, MixedRequestTypes) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     std::vector<std::thread> clients;
@@ -174,3 +180,7 @@ TEST_F(ConcurrentConnectionsTest, MixedRequestTypes) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 }
+
+INSTANTIATE_TEST_SUITE_P(Dispatchers, ConcurrentConnectionsTest,
+                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        DispatcherKindName);

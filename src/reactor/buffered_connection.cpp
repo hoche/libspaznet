@@ -168,6 +168,10 @@ void BufferedConnection::on_writable() {
         return;
     }
     if (result == OutputBuffer::Result::Flushed) {
+        if (close_after_flush_) {
+            close();
+            return;
+        }
         write_interest_armed_ = false;
         ctx_.set_io_handler(fd_, PlatformIO::EVENT_READ, shared_from_this());
         return;
@@ -229,6 +233,17 @@ void BufferedConnection::close() {
     if (on_closed_) {
         on_closed_();
     }
+}
+
+void BufferedConnection::close_after_flush() {
+    if (closed_) {
+        return;
+    }
+    if (output_.empty()) {
+        close();
+        return;
+    }
+    close_after_flush_ = true;
 }
 
 void BufferedConnection::fail() {

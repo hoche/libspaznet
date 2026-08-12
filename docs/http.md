@@ -44,6 +44,35 @@ find_package(spaznet REQUIRED)        # or add_subdirectory(libspaznet)
 target_link_libraries(myapp PRIVATE spaznet::spaznet spaznet::http)
 ```
 
+### Two dispatchers, one handler
+
+`example/http` ships two interchangeable dispatchers for the same
+`HTTPHandler` interface — pick one, or run both side by side:
+
+- **`make_dispatcher(...)`** (above) — coroutine-based, registered via
+  `Server::set_connection_handler`. Each connection runs as a `Task`
+  (`serve_keep_alive` in `dispatcher.cpp`).
+- **`make_reactor_dispatcher(...)`** — coroutine-free, registered via
+  `Server::set_connection_factory`. Each connection is a small explicit
+  state machine (`Http1Connection` in `dispatcher_reactor.cpp`) built on
+  `BufferedConnection` instead of a suspended coroutine frame.
+
+```cpp
+server.set_connection_factory(
+    spaznet::http::make_reactor_dispatcher(std::make_unique<MyHandler>()));
+```
+
+Both parse requests with the same `HTTPParser`, serialize responses with
+the same `HTTPResponse::serialize()`/`serialize_chunked()`, and answer
+through the same `ResponseWriter` — from a client's point of view they
+are indistinguishable. `example/http/demo/hello.cpp` and `showcase.cpp`
+both accept a `--reactor` flag to switch, and the integration test suite
+(`example/http/tests/integration/`) runs every scenario against both via
+`dispatcher_test_support.hpp`'s `DispatcherKind` parameterization — any
+behavioral divergence between them is treated as a bug. See
+`docs/concurrency-and-coroutines.md` for how the two execution models
+differ under the hood.
+
 ### `HTTPRequest`
 
 The handler receives a fully-parsed request:

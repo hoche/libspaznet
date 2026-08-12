@@ -6,6 +6,8 @@
 #include <string>
 #include <thread>
 
+#include "dispatcher_test_support.hpp"
+
 #include <libspaznet/detail/socket_compat.hpp>
 #ifdef _WIN32
 #define close_socket closesocket
@@ -14,6 +16,9 @@
 #endif
 
 using namespace spaznet;
+using spaznet::http::testing_support::DispatcherKind;
+using spaznet::http::testing_support::DispatcherKindName;
+using spaznet::http::testing_support::install_dispatcher;
 
 // Use a unique test handler name to avoid ODR clashes with handlers in other
 // test translation units (e.g., test_tcp_server.cpp) that also define
@@ -42,7 +47,8 @@ class HTTPServerTestHandler : public spaznet::http::HTTPHandler {
     }
 };
 
-class HTTPServerTest : public ::testing::Test {
+// Parameterized over both HTTP/1.1 dispatchers — see dispatcher_test_support.hpp.
+class HTTPServerTest : public ::testing::TestWithParam<DispatcherKind> {
   protected:
     void SetUp() override {
         // Keep a raw pointer to the handler the server owns, so tests
@@ -53,7 +59,7 @@ class HTTPServerTest : public ::testing::Test {
         auto handler_unique = std::make_unique<HTTPServerTestHandler>();
         handler = handler_unique.get();
         server = std::make_unique<Server>(2);
-        server->set_connection_handler(spaznet::http::make_dispatcher(std::move(handler_unique)));
+        install_dispatcher(*server, std::move(handler_unique), GetParam());
         server->listen_tcp(8888);
 
         server_thread = std::thread([this]() { server->run(); });
@@ -170,7 +176,7 @@ class HTTPServerTest : public ::testing::Test {
     std::thread server_thread;
 };
 
-TEST_F(HTTPServerTest, HandleGETRequest) {
+TEST_P(HTTPServerTest, HandleGETRequest) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     std::string response = send_http_request("GET", "/test");
@@ -180,7 +186,7 @@ TEST_F(HTTPServerTest, HandleGETRequest) {
     EXPECT_NE(response.find("OK"), std::string::npos);
 }
 
-TEST_F(HTTPServerTest, HandlePOSTRequest) {
+TEST_P(HTTPServerTest, HandlePOSTRequest) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     std::string response = send_http_request("POST", "/api/data");
@@ -188,7 +194,7 @@ TEST_F(HTTPServerTest, HandlePOSTRequest) {
     EXPECT_NE(response.find("200"), std::string::npos);
 }
 
-TEST_F(HTTPServerTest, MultipleRequests) {
+TEST_P(HTTPServerTest, MultipleRequests) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     for (int i = 0; i < 5; ++i) {
@@ -198,7 +204,7 @@ TEST_F(HTTPServerTest, MultipleRequests) {
     }
 }
 
-TEST_F(HTTPServerTest, ResponseHeaders) {
+TEST_P(HTTPServerTest, ResponseHeaders) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     std::string response = send_http_request("GET", "/");
@@ -207,7 +213,7 @@ TEST_F(HTTPServerTest, ResponseHeaders) {
     EXPECT_NE(response.find("Content-Length"), std::string::npos);
 }
 
-TEST_F(HTTPServerTest, ResponseBody) {
+TEST_P(HTTPServerTest, ResponseBody) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     std::string response = send_http_request("GET", "/");
@@ -219,3 +225,7 @@ TEST_F(HTTPServerTest, ResponseBody) {
     // never moved).
     EXPECT_GE(handler->request_count.load(), 1);
 }
+
+INSTANTIATE_TEST_SUITE_P(Dispatchers, HTTPServerTest,
+                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        DispatcherKindName);

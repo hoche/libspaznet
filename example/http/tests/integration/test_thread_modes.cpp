@@ -12,9 +12,14 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
+#include "dispatcher_test_support.hpp"
+
 using namespace spaznet;
+using spaznet::http::testing_support::DispatcherKind;
+using spaznet::http::testing_support::install_dispatcher;
 
 namespace {
 
@@ -103,15 +108,19 @@ class SimpleOKHandler : public spaznet::http::HTTPHandler {
 
 } // namespace
 
-class ServerThreadModeTest : public ::testing::TestWithParam<std::size_t> {};
+// Parameterized over both {0, 4} worker threads AND both HTTP/1.1
+// dispatchers, so every combination of threading mode x execution model
+// gets the same correctness check.
+class ServerThreadModeTest : public ::testing::TestWithParam<std::tuple<std::size_t, DispatcherKind>> {};
 
 TEST_P(ServerThreadModeTest, HandlesRequestsInBothModes) {
-    const std::size_t worker_threads = GetParam(); // 0 = non-threaded, >0 = multi-threaded
+    const std::size_t worker_threads = std::get<0>(GetParam()); // 0 = non-threaded, >0 = multi-threaded
+    const DispatcherKind dispatcher_kind = std::get<1>(GetParam());
     auto handler = std::make_unique<SimpleOKHandler>();
     auto* handler_ptr = handler.get();
 
     Server server(worker_threads);
-    server.set_connection_handler(spaznet::http::make_dispatcher(std::move(handler)));
+    install_dispatcher(server, std::move(handler), dispatcher_kind);
     uint16_t port = listen_on_random_port(server);
     ASSERT_NE(port, 0) << "Failed to bind any test port";
 
@@ -144,12 +153,21 @@ TEST_P(ServerThreadModeTest, HandlesRequestsInBothModes) {
     EXPECT_GE(handler_ptr->requests.load(), 15);
 }
 
-INSTANTIATE_TEST_SUITE_P(ThreadModes, ServerThreadModeTest,
-                         ::testing::Values(std::size_t{0}, std::size_t{4}));
+INSTANTIATE_TEST_SUITE_P(
+    ThreadModes, ServerThreadModeTest,
+    ::testing::Combine(::testing::Values(std::size_t{0}, std::size_t{4}),
+                       ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor)),
+    [](const ::testing::TestParamInfo<std::tuple<std::size_t, DispatcherKind>>& info) {
+        std::string name = std::get<0>(info.param) == 0 ? "NonThreaded" : "Threaded";
+        name += (std::get<1>(info.param) == DispatcherKind::Reactor) ? "_Reactor" : "_Coroutine";
+        return name;
+    });
 
-TEST(ServerDefaultModeTest, DefaultIsNonThreadedAndWorks) {
+class ServerDefaultModeTest : public ::testing::TestWithParam<DispatcherKind> {};
+
+TEST_P(ServerDefaultModeTest, DefaultIsNonThreadedAndWorks) {
     Server server; // default should be non-threaded
-    server.set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<SimpleOKHandler>()));
+    install_dispatcher(server, std::make_unique<SimpleOKHandler>(), GetParam());
     uint16_t port = listen_on_random_port(server);
     ASSERT_NE(port, 0) << "Failed to bind any test port";
 
@@ -163,3 +181,7 @@ TEST(ServerDefaultModeTest, DefaultIsNonThreadedAndWorks) {
     server.stop();
     server_thread.join();
 }
+
+INSTANTIATE_TEST_SUITE_P(Dispatchers, ServerDefaultModeTest,
+                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        spaznet::http::testing_support::DispatcherKindName);

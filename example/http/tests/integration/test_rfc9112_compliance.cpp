@@ -7,6 +7,8 @@
 #include <thread>
 #include <vector>
 
+#include "dispatcher_test_support.hpp"
+
 #include <libspaznet/detail/socket_compat.hpp>
 #ifdef _WIN32
 #define close_socket closesocket
@@ -15,6 +17,9 @@
 #endif
 
 using namespace spaznet;
+using spaznet::http::testing_support::DispatcherKind;
+using spaznet::http::testing_support::DispatcherKindName;
+using spaznet::http::testing_support::install_dispatcher;
 
 // RFC 9112 Compliant Test Handler
 class RFC9112TestHandler : public spaznet::http::HTTPHandler {
@@ -52,7 +57,8 @@ class RFC9112TestHandler : public spaznet::http::HTTPHandler {
     }
 };
 
-class RFC9112IntegrationTest : public ::testing::Test {
+// Parameterized over both HTTP/1.1 dispatchers — see dispatcher_test_support.hpp.
+class RFC9112IntegrationTest : public ::testing::TestWithParam<DispatcherKind> {
   protected:
     void SetUp() override {
         // Create handler first and keep a raw pointer for test assertions
@@ -60,8 +66,7 @@ class RFC9112IntegrationTest : public ::testing::Test {
         handler = handler_unique.get();
 
         server = std::make_unique<Server>(2);
-        // Transfer ownership to server
-        server->set_connection_handler(spaznet::http::make_dispatcher(std::move(handler_unique)));
+        install_dispatcher(*server, std::move(handler_unique), GetParam());
 
         server->listen_tcp(9996);
 
@@ -191,7 +196,7 @@ class RFC9112IntegrationTest : public ::testing::Test {
 };
 
 // Test RFC 9112 Section 3.1.1 - Request Line Format
-TEST_F(RFC9112IntegrationTest, RequestLineFormat) {
+TEST_P(RFC9112IntegrationTest, RequestLineFormat) {
     std::string request = "GET /test HTTP/1.1\r\n"
                           "Host: localhost:9996\r\n"
                           "\r\n";
@@ -203,7 +208,7 @@ TEST_F(RFC9112IntegrationTest, RequestLineFormat) {
 }
 
 // Test RFC 9112 Section 5.5 - Header Fields
-TEST_F(RFC9112IntegrationTest, HeaderFieldParsing) {
+TEST_P(RFC9112IntegrationTest, HeaderFieldParsing) {
     std::string request = "GET /test HTTP/1.1\r\n"
                           "Host: localhost:9996\r\n"
                           "User-Agent: test-agent/1.0\r\n"
@@ -220,7 +225,7 @@ TEST_F(RFC9112IntegrationTest, HeaderFieldParsing) {
 }
 
 // Test RFC 9112 Section 8.6 - Content-Length
-TEST_F(RFC9112IntegrationTest, ContentLengthHandling) {
+TEST_P(RFC9112IntegrationTest, ContentLengthHandling) {
     std::string request = "POST /test HTTP/1.1\r\n"
                           "Host: localhost:9996\r\n"
                           "Content-Length: 11\r\n"
@@ -234,7 +239,7 @@ TEST_F(RFC9112IntegrationTest, ContentLengthHandling) {
 }
 
 // Test RFC 9112 Section 7.1 - Chunked Transfer Encoding
-TEST_F(RFC9112IntegrationTest, ChunkedTransferEncoding) {
+TEST_P(RFC9112IntegrationTest, ChunkedTransferEncoding) {
     std::string request = "POST /test HTTP/1.1\r\n"
                           "Host: localhost:9996\r\n"
                           "Transfer-Encoding: chunked\r\n"
@@ -252,7 +257,7 @@ TEST_F(RFC9112IntegrationTest, ChunkedTransferEncoding) {
 }
 
 // Test RFC 9112 Section 9.6 - Connection Management
-TEST_F(RFC9112IntegrationTest, ConnectionKeepAlive) {
+TEST_P(RFC9112IntegrationTest, ConnectionKeepAlive) {
     std::string request = "GET /test HTTP/1.1\r\n"
                           "Host: localhost:9996\r\n"
                           "Connection: keep-alive\r\n"
@@ -263,7 +268,7 @@ TEST_F(RFC9112IntegrationTest, ConnectionKeepAlive) {
     EXPECT_NE(response.find("Connection: keep-alive"), std::string::npos);
 }
 
-TEST_F(RFC9112IntegrationTest, KeepAliveAllowsMultipleRequestsOnSameConnection) {
+TEST_P(RFC9112IntegrationTest, KeepAliveAllowsMultipleRequestsOnSameConnection) {
     int sock = connect_to_server();
     ASSERT_GE(sock, 0);
 
@@ -299,7 +304,7 @@ TEST_F(RFC9112IntegrationTest, KeepAliveAllowsMultipleRequestsOnSameConnection) 
     EXPECT_GE(handler->request_count.load(), 2);
 }
 
-TEST_F(RFC9112IntegrationTest, ConnectionClose) {
+TEST_P(RFC9112IntegrationTest, ConnectionClose) {
     std::string request = "GET /test HTTP/1.1\r\n"
                           "Host: localhost:9996\r\n"
                           "Connection: close\r\n"
@@ -311,7 +316,7 @@ TEST_F(RFC9112IntegrationTest, ConnectionClose) {
 }
 
 // Test RFC 9112 Section 6.1 - Status Line
-TEST_F(RFC9112IntegrationTest, StatusLineFormat) {
+TEST_P(RFC9112IntegrationTest, StatusLineFormat) {
     std::string request = "GET /test HTTP/1.1\r\n"
                           "Host: localhost:9996\r\n"
                           "\r\n";
@@ -330,7 +335,7 @@ TEST_F(RFC9112IntegrationTest, StatusLineFormat) {
 }
 
 // Test RFC 9112 Section 9 - HTTP Methods
-TEST_F(RFC9112IntegrationTest, HTTPMethods) {
+TEST_P(RFC9112IntegrationTest, HTTPMethods) {
     const char* methods[] = {"GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"};
 
     for (const char* method : methods) {
@@ -347,7 +352,7 @@ TEST_F(RFC9112IntegrationTest, HTTPMethods) {
 }
 
 // Test RFC 9112 Section 3.2 - Request Target Forms
-TEST_F(RFC9112IntegrationTest, RequestTargetOriginForm) {
+TEST_P(RFC9112IntegrationTest, RequestTargetOriginForm) {
     std::string request = "GET /path/to/resource?query=value HTTP/1.1\r\n"
                           "Host: localhost:9996\r\n"
                           "\r\n";
@@ -357,7 +362,7 @@ TEST_F(RFC9112IntegrationTest, RequestTargetOriginForm) {
 }
 
 // Test case-insensitive header field names per RFC 9112 Section 5.1
-TEST_F(RFC9112IntegrationTest, CaseInsensitiveHeaders) {
+TEST_P(RFC9112IntegrationTest, CaseInsensitiveHeaders) {
     std::string request = "GET /test HTTP/1.1\r\n"
                           "HOST: localhost:9996\r\n"
                           "user-agent: test-agent\r\n"
@@ -371,7 +376,7 @@ TEST_F(RFC9112IntegrationTest, CaseInsensitiveHeaders) {
 // Test large request body — verifies the parser handles incomplete →
 // extended-buffer re-parses idempotently (the body arrives across
 // multiple async_read iterations on the server side).
-TEST_F(RFC9112IntegrationTest, LargeRequestBody) {
+TEST_P(RFC9112IntegrationTest, LargeRequestBody) {
     std::string body(10000, 'A');
     std::string request = "POST /test HTTP/1.1\r\n"
                           "Host: localhost:9996\r\n"
@@ -389,3 +394,84 @@ TEST_F(RFC9112IntegrationTest, LargeRequestBody) {
     close_socket(sock);
     EXPECT_NE(response.find("HTTP/1.1 200 OK"), std::string::npos);
 }
+
+// Pipelines three requests in a single write(2), all on one keep-alive
+// connection. HTTPHandler here answers synchronously, so the reactor
+// dispatcher's try_process() loop must notice all three are already
+// buffered and answer them in order, in place, without recursing once
+// per request (see Http1Connection::try_process()'s class comment) — and
+// the coroutine dispatcher's plain while(true) loop must do the
+// equivalent. Answers must come back in request order on both.
+TEST_P(RFC9112IntegrationTest, PipelinedRequestsAnsweredInOrderOnOneConnection) {
+    int sock = connect_to_server();
+    ASSERT_GE(sock, 0);
+    spaznet::detail::setsockopt_rcvtimeo_ms(sock, 2000);
+
+    std::string pipelined = "GET /one HTTP/1.1\r\nHost: localhost:9996\r\nConnection: keep-alive\r\n\r\n"
+                            "GET /two HTTP/1.1\r\nHost: localhost:9996\r\nConnection: keep-alive\r\n\r\n"
+                            "GET /three HTTP/1.1\r\nHost: localhost:9996\r\nConnection: close\r\n\r\n";
+    ASSERT_EQ(spaznet::detail::socket_send(sock, pipelined.c_str(), pipelined.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(pipelined.size()));
+
+    // Three responses, then the peer closes (Connection: close on the
+    // last one) — read until EOF and check all three status lines
+    // appear, in order.
+    std::string response;
+    char buffer[4096];
+    for (;;) {
+        int received = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        if (received <= 0) {
+            break;
+        }
+        response.append(buffer, static_cast<std::size_t>(received));
+    }
+    close_socket(sock);
+
+    std::size_t first = response.find("HTTP/1.1 200 OK");
+    ASSERT_NE(first, std::string::npos);
+    std::size_t second = response.find("HTTP/1.1 200 OK", first + 1);
+    ASSERT_NE(second, std::string::npos);
+    std::size_t third = response.find("HTTP/1.1 200 OK", second + 1);
+    ASSERT_NE(third, std::string::npos);
+    EXPECT_LT(first, second);
+    EXPECT_LT(second, third);
+    EXPECT_GE(handler->request_count.load(), 3);
+}
+
+// A malformed request line must get a full "400 Bad Request" response —
+// not a truncated one — before the connection closes. This specifically
+// exercises the reactor dispatcher's send_error_and_close() ->
+// BufferedConnection::close_after_flush() path (as opposed to close()),
+// which exists precisely so this response can't be cut short by a race
+// between the write and the close.
+TEST_P(RFC9112IntegrationTest, MalformedRequestLineGetsFullBadRequestResponseThenCloses) {
+    int sock = connect_to_server();
+    ASSERT_GE(sock, 0);
+    spaznet::detail::setsockopt_rcvtimeo_ms(sock, 2000);
+
+    std::string bad_request = "NOT A VALID REQUEST LINE AT ALL\r\n\r\n";
+    ASSERT_EQ(spaznet::detail::socket_send(sock, bad_request.c_str(), bad_request.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(bad_request.size()));
+
+    std::string response;
+    char buffer[4096];
+    for (;;) {
+        int received = recv(sock, buffer, sizeof(buffer) - 1, 0);
+        if (received <= 0) {
+            break; // Peer closed — expected once the 400 response has gone out.
+        }
+        response.append(buffer, static_cast<std::size_t>(received));
+    }
+    close_socket(sock);
+
+    ASSERT_NE(response.find("HTTP/1.1 400"), std::string::npos) << response;
+    // Full status line + "Connection: close" header must both have made
+    // it across before the peer saw EOF; a truncated write would drop one
+    // or both.
+    EXPECT_NE(response.find("Connection: close"), std::string::npos) << response;
+    EXPECT_NE(response.find("\r\n\r\n"), std::string::npos) << response;
+}
+
+INSTANTIATE_TEST_SUITE_P(Dispatchers, RFC9112IntegrationTest,
+                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        DispatcherKindName);

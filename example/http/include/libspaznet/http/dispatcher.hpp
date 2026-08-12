@@ -32,4 +32,15 @@ auto make_dispatcher(std::unique_ptr<HTTPHandler> handler) -> ::spaznet::Connect
 auto serve_keep_alive(::spaznet::Socket socket, HTTPHandler& handler,
                       std::vector<std::uint8_t> initial_buffer) -> ::spaznet::Task;
 
+// Reactor-side counterpart of make_dispatcher: no Task, no co_await,
+// anywhere. Hand the result to Server::set_connection_factory instead of
+// set_connection_handler. Speaks the exact same HTTP/1.1 keep-alive
+// protocol against the exact same HTTPHandler interface (handler.cpp,
+// HTTPParser, HTTPRequest/HTTPResponse are all shared, unmodified, with
+// the coroutine dispatcher above) — the two are meant to be
+// interchangeable from a client's point of view; see
+// tests/integration/test_dispatcher_differential.cpp for the harness that
+// checks exactly that.
+auto make_reactor_dispatcher(std::unique_ptr<HTTPHandler> handler) -> ::spaznet::ConnectionFactory;
+
 } // namespace spaznet::http

@@ -4,6 +4,7 @@
 add_library(spaznet_http STATIC
     src/handler.cpp
     src/dispatcher.cpp
+    src/dispatcher_reactor.cpp
 )
 add_library(spaznet::http ALIAS spaznet_http)
 
