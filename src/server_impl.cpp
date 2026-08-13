@@ -313,6 +313,55 @@ Task Socket::async_write(std::vector<uint8_t> data) {
                                               data.size() - total_sent};
             if (r.kind == detail::TlsIoResult::Kind::Ok && r.n > 0) {
                 total_sent += r.n;
+                // Memory-BIO path: SSL_write may return Ok while ciphertext
+                // still sits in pending_out_. Drain it before accepting more
+                // app data or returning from async_write.
+                while (stream->wants_write()) {
+                    struct TlsFlushAwaiter {
+                        Socket* socket;
+                        detail::TlsStream* stream;
+                        mutable detail::TlsIoResult result{};
+                        mutable uint32_t wait_events = PlatformIO::EVENT_WRITE;
+                        mutable bool ready_flag = false;
+
+                        bool await_ready() const noexcept {
+                            result = stream->flush();
+                            if (result.kind == detail::TlsIoResult::Kind::WantWrite) {
+                                wait_events = PlatformIO::EVENT_WRITE;
+                                ready_flag = false;
+                                return false;
+                            }
+                            if (result.kind == detail::TlsIoResult::Kind::WantRead) {
+                                wait_events = PlatformIO::EVENT_READ;
+                                ready_flag = false;
+                                return false;
+                            }
+                            ready_flag = true;
+                            return true;
+                        }
+
+                        void await_suspend(std::coroutine_handle<TaskPromise> h) {
+                            socket->context()->register_io(socket->fd(), wait_events,
+                                                           CoroutineHandle::from_handle(h));
+                        }
+
+                        detail::TlsIoResult await_resume() noexcept {
+                            if (!ready_flag) {
+                                result = stream->flush();
+                            }
+                            return result;
+                        }
+                    };
+
+                    auto fr = co_await TlsFlushAwaiter{this, stream};
+                    if (fr.kind == detail::TlsIoResult::Kind::WantRead ||
+                        fr.kind == detail::TlsIoResult::Kind::WantWrite) {
+                        continue;
+                    }
+                    if (fr.kind != detail::TlsIoResult::Kind::Ok) {
+                        co_return;
+                    }
+                }
                 continue;
             }
             if (r.kind == detail::TlsIoResult::Kind::WantRead ||

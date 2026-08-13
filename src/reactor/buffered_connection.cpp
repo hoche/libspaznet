@@ -111,6 +111,17 @@ auto OutputBuffer::try_flush(detail::TlsStream& tls) -> Result {
     }
     buf_.clear();
     read_pos_ = 0;
+    // App buffer empty, but memory-BIO ciphertext may still need a send.
+    if (tls.wants_write()) {
+        auto r = tls.flush();
+        if (r.kind == detail::TlsIoResult::Kind::Error ||
+            r.kind == detail::TlsIoResult::Kind::Closed) {
+            return Result::Error;
+        }
+        if (r.kind == detail::TlsIoResult::Kind::WantWrite || tls.wants_write()) {
+            return Result::WouldBlock;
+        }
+    }
     return Result::Flushed;
 }
 #endif
@@ -184,9 +195,15 @@ void BufferedConnection::on_readable() {
                 if (closed_) {
                     return;
                 }
+                if (tls_->wants_write()) {
+                    write_interest_armed_ = true;
+                }
                 continue;
             }
             if (r.kind == detail::TlsIoResult::Kind::WantRead) {
+                if (tls_->wants_write()) {
+                    write_interest_armed_ = true;
+                }
                 break;
             }
             if (r.kind == detail::TlsIoResult::Kind::WantWrite) {

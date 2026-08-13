@@ -3,6 +3,12 @@
 // Internal TLS-over-TCP helpers shared by Socket and BufferedConnection.
 // OpenSSL types stay out of public headers; only this detail header and
 // tls_stream.cpp include <openssl/...>.
+//
+// Uses memory BIOs (not SSL_set_fd socket BIOs). OpenSSL never touches the
+// socket; we pump ciphertext with recv/send. That keeps TLS compatible with
+// IOCP's overlapped zero-byte probes on Windows, where mixing OpenSSL's
+// socket BIO with WSARecv is undefined and stalls post-handshake reads
+// (e.g. WSS echo after the 101 response).
 
 #include <libspaznet/tls_config.hpp>
 
@@ -64,6 +70,13 @@ class TlsStream {
     auto read(void* buf, std::size_t len) -> TlsIoResult;
     auto write(const void* buf, std::size_t len) -> TlsIoResult;
 
+    // Push any ciphertext sitting in the write BIO / pending_out_ to the
+    // socket. Call from on_writable even when the app OutputBuffer is empty.
+    auto flush() -> TlsIoResult;
+
+    // True when ciphertext still needs a socket send (arm EVENT_WRITE).
+    [[nodiscard]] auto wants_write() const noexcept -> bool;
+
     // Best-effort SSL_shutdown; safe to call more than once.
     void shutdown() noexcept;
 
@@ -80,11 +93,25 @@ class TlsStream {
   private:
     TlsStream(void* ssl, int fd);
     auto map_ssl_error(int ssl_ret) const -> TlsIoResult;
+    auto feed_network() -> TlsIoResult;
+    auto flush_network() -> TlsIoResult;
+    auto drain_wbio_to_pending() -> void;
 
     void* ssl_{nullptr}; // SSL*
     int fd_{-1};
     bool handshake_done_{false};
     bool shutdown_done_{false};
+
+    // HTTP/2 (and any future protocol) may run a reader coroutine and a
+    // writer coroutine on the same Socket concurrently. OpenSSL SSL*
+    // objects are not thread-safe; memory-BIO pending_out_ isn't either.
+    // recursive: write()/flush() callers also check wants_write().
+    mutable std::recursive_mutex io_mu_;
+
+    // Ciphertext waiting for a non-blocking send (partial send residue +
+    // anything pulled from the write BIO that has not hit the wire yet).
+    std::vector<uint8_t> pending_out_;
+    std::size_t pending_out_off_{0};
 
     static std::mutex stash_mu_;
     static std::unordered_map<int, std::unique_ptr<TlsStream>> stash_;

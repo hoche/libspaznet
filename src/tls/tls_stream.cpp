@@ -158,16 +158,21 @@ auto TlsStream::create_server(const std::shared_ptr<TlsContext>& ctx, int fd)
     if (ssl == nullptr) {
         throw std::runtime_error("SSL_new failed");
     }
-    SSL_set_fd(ssl, fd);
-    // Socket is already non-blocking at accept; keep the BIOs in sync so
-    // SSL_read/SSL_write return WANT_* (or SYSCALL+EWOULDBLOCK) instead of
-    // blocking the IO thread.
-    if (BIO* rbio = SSL_get_rbio(ssl)) {
-        BIO_set_nbio(rbio, 1);
+
+    // Memory BIOs: OpenSSL never calls recv/send. We pump ciphertext so this
+    // works with epoll/kqueue and with IOCP overlapped probes alike.
+    BIO* rbio = BIO_new(BIO_s_mem());
+    BIO* wbio = BIO_new(BIO_s_mem());
+    if (rbio == nullptr || wbio == nullptr) {
+        BIO_free(rbio);
+        BIO_free(wbio);
+        SSL_free(ssl);
+        throw std::runtime_error("BIO_new(BIO_s_mem) failed");
     }
-    if (BIO* wbio = SSL_get_wbio(ssl)) {
-        BIO_set_nbio(wbio, 1);
-    }
+    // Empty mem BIO would otherwise look like EOF to SSL_read.
+    BIO_set_mem_eof_return(rbio, -1);
+    BIO_set_mem_eof_return(wbio, -1);
+    SSL_set_bio(ssl, rbio, wbio); // ssl owns both
     SSL_set_accept_state(ssl);
     return std::unique_ptr<TlsStream>(new TlsStream(ssl, fd));
 }
@@ -188,10 +193,9 @@ auto TlsStream::map_ssl_error(int ssl_ret) const -> TlsIoResult {
         if (ssl_ret == 0) {
             return {TlsIoResult::Kind::Closed, 0};
         }
-        // Windows (and some BIO setups) report EWOULDBLOCK/EAGAIN as
-        // SSL_ERROR_SYSCALL instead of WANT_READ/WANT_WRITE. WSAGetLastError
-        // can also be 0 while SSL_want still says READING/WRITING — treat
-        // both as retryable so the wait path re-arms interest.
+        // With memory BIOs this is unexpected; treat retryable socket errno
+        // as WantRead so a mis-mapped path still re-arms rather than killing
+        // the connection under Windows errno=0 quirks.
         const int sock_err = detail::last_socket_error();
         if (detail::is_retryable_socket_error(sock_err) || sock_err == 0) {
             const int want = SSL_want(ssl);
@@ -204,59 +208,247 @@ auto TlsStream::map_ssl_error(int ssl_ret) const -> TlsIoResult {
     return {TlsIoResult::Kind::Error, 0};
 }
 
-auto TlsStream::handshake() -> TlsIoResult {
-    if (handshake_done_) {
-        return {TlsIoResult::Kind::Ok, 0};
-    }
-    ERR_clear_error();
+void TlsStream::drain_wbio_to_pending() {
     auto* ssl = static_cast<SSL*>(ssl_);
-    int r = SSL_accept(ssl);
-    if (r == 1) {
-        handshake_done_ = true;
+    BIO* wbio = SSL_get_wbio(ssl);
+    if (wbio == nullptr) {
+        return;
+    }
+    uint8_t chunk[16 * 1024];
+    for (;;) {
+        int n = BIO_read(wbio, chunk, static_cast<int>(sizeof(chunk)));
+        if (n > 0) {
+            pending_out_.insert(pending_out_.end(), chunk, chunk + n);
+            continue;
+        }
+        break;
+    }
+}
+
+auto TlsStream::flush_network() -> TlsIoResult {
+    drain_wbio_to_pending();
+    while (pending_out_off_ < pending_out_.size()) {
+        ssize_t n = detail::socket_send(fd_, pending_out_.data() + pending_out_off_,
+                                        pending_out_.size() - pending_out_off_, MSG_NOSIGNAL);
+        if (n > 0) {
+            pending_out_off_ += static_cast<std::size_t>(n);
+            continue;
+        }
+        if (n == 0) {
+            return {TlsIoResult::Kind::WantWrite, 0};
+        }
+        const int err = detail::last_socket_error();
+        if (detail::is_retryable_socket_error(err)) {
+            return {TlsIoResult::Kind::WantWrite, 0};
+        }
+        return {TlsIoResult::Kind::Error, 0};
+    }
+    pending_out_.clear();
+    pending_out_off_ = 0;
+    return {TlsIoResult::Kind::Ok, 0};
+}
+
+auto TlsStream::feed_network() -> TlsIoResult {
+    auto* ssl = static_cast<SSL*>(ssl_);
+    BIO* rbio = SSL_get_rbio(ssl);
+    if (rbio == nullptr) {
+        return {TlsIoResult::Kind::Error, 0};
+    }
+    uint8_t chunk[16 * 1024];
+    ssize_t n = detail::socket_recv(fd_, chunk, sizeof(chunk), 0);
+    if (n > 0) {
+        int w = BIO_write(rbio, chunk, static_cast<int>(n));
+        if (w <= 0) {
+            return {TlsIoResult::Kind::Error, 0};
+        }
+        // Rare: mem BIO rejected part of the write. Put the rest back by
+        // failing hard rather than dropping ciphertext.
+        if (w != static_cast<int>(n)) {
+            return {TlsIoResult::Kind::Error, 0};
+        }
+        return {TlsIoResult::Kind::Ok, static_cast<std::size_t>(n)};
+    }
+    if (n == 0) {
+        return {TlsIoResult::Kind::Closed, 0};
+    }
+    const int err = detail::last_socket_error();
+    if (detail::is_retryable_socket_error(err)) {
+        return {TlsIoResult::Kind::WantRead, 0};
+    }
+    return {TlsIoResult::Kind::Error, 0};
+}
+
+auto TlsStream::wants_write() const noexcept -> bool {
+    std::lock_guard<std::recursive_mutex> lock(io_mu_);
+    if (pending_out_off_ < pending_out_.size()) {
+        return true;
+    }
+    auto* ssl = static_cast<SSL*>(ssl_);
+    if (ssl == nullptr) {
+        return false;
+    }
+    BIO* wbio = SSL_get_wbio(ssl);
+    return wbio != nullptr && BIO_ctrl_pending(wbio) > 0;
+}
+
+auto TlsStream::flush() -> TlsIoResult {
+    std::lock_guard<std::recursive_mutex> lock(io_mu_);
+    return flush_network();
+}
+
+auto TlsStream::handshake() -> TlsIoResult {
+    std::lock_guard<std::recursive_mutex> lock(io_mu_);
+    if (handshake_done_) {
+        // Final flight may still be in pending_out_ after SSL_accept
+        // returned 1 with WantWrite; keep flushing until the wire is clear.
+        auto flushed = flush_network();
+        if (flushed.kind != TlsIoResult::Kind::Ok) {
+            return flushed;
+        }
         return {TlsIoResult::Kind::Ok, 0};
     }
-    return map_ssl_error(r);
+    auto* ssl = static_cast<SSL*>(ssl_);
+    for (;;) {
+        ERR_clear_error();
+        int r = SSL_accept(ssl);
+        auto flushed = flush_network();
+        if (flushed.kind == TlsIoResult::Kind::Error ||
+            flushed.kind == TlsIoResult::Kind::Closed) {
+            return flushed;
+        }
+        if (r == 1) {
+            handshake_done_ = true;
+            // Handshake records may still need a socket write.
+            if (flushed.kind == TlsIoResult::Kind::WantWrite ||
+                pending_out_off_ < pending_out_.size() ||
+                (SSL_get_wbio(ssl) != nullptr && BIO_ctrl_pending(SSL_get_wbio(ssl)) > 0)) {
+                return {TlsIoResult::Kind::WantWrite, 0};
+            }
+            return {TlsIoResult::Kind::Ok, 0};
+        }
+        auto err = map_ssl_error(r);
+        if (err.kind == TlsIoResult::Kind::WantRead) {
+            auto fed = feed_network();
+            if (fed.kind == TlsIoResult::Kind::Ok) {
+                continue;
+            }
+            return fed;
+        }
+        if (err.kind == TlsIoResult::Kind::WantWrite) {
+            if (flushed.kind == TlsIoResult::Kind::WantWrite ||
+                pending_out_off_ < pending_out_.size()) {
+                return {TlsIoResult::Kind::WantWrite, 0};
+            }
+            continue;
+        }
+        return err;
+    }
 }
 
 auto TlsStream::read(void* buf, std::size_t len) -> TlsIoResult {
+    std::lock_guard<std::recursive_mutex> lock(io_mu_);
     if (!handshake_done_) {
         return {TlsIoResult::Kind::Error, 0};
     }
     if (len == 0) {
         return {TlsIoResult::Kind::Ok, 0};
     }
-    ERR_clear_error();
     auto* ssl = static_cast<SSL*>(ssl_);
-    int r = SSL_read(ssl, buf, static_cast<int>(len));
-    if (r > 0) {
-        return {TlsIoResult::Kind::Ok, static_cast<std::size_t>(r)};
+    for (;;) {
+        ERR_clear_error();
+        int r = SSL_read(ssl, buf, static_cast<int>(len));
+        auto flushed = flush_network();
+        if (flushed.kind == TlsIoResult::Kind::Error ||
+            flushed.kind == TlsIoResult::Kind::Closed) {
+            return flushed;
+        }
+        if (r > 0) {
+            // App data ready; if tickets/KeyUpdate left ciphertext, caller
+            // must arm WRITE via wants_write().
+            return {TlsIoResult::Kind::Ok, static_cast<std::size_t>(r)};
+        }
+        auto err = map_ssl_error(r);
+        if (err.kind == TlsIoResult::Kind::WantRead) {
+            auto fed = feed_network();
+            if (fed.kind == TlsIoResult::Kind::Ok) {
+                continue;
+            }
+            // Prefer reporting WantWrite if we also have outbound ciphertext
+            // (e.g. post-handshake message) so the reactor arms both.
+            if (fed.kind == TlsIoResult::Kind::WantRead &&
+                (flushed.kind == TlsIoResult::Kind::WantWrite ||
+                 pending_out_off_ < pending_out_.size() ||
+                 (SSL_get_wbio(ssl) != nullptr && BIO_ctrl_pending(SSL_get_wbio(ssl)) > 0))) {
+                return {TlsIoResult::Kind::WantWrite, 0};
+            }
+            return fed;
+        }
+        if (err.kind == TlsIoResult::Kind::WantWrite) {
+            if (flushed.kind == TlsIoResult::Kind::WantWrite ||
+                pending_out_off_ < pending_out_.size()) {
+                return {TlsIoResult::Kind::WantWrite, 0};
+            }
+            continue;
+        }
+        return err;
     }
-    return map_ssl_error(r);
 }
 
 auto TlsStream::write(const void* buf, std::size_t len) -> TlsIoResult {
+    std::lock_guard<std::recursive_mutex> lock(io_mu_);
     if (!handshake_done_) {
         return {TlsIoResult::Kind::Error, 0};
     }
     if (len == 0) {
-        return {TlsIoResult::Kind::Ok, 0};
+        return flush_network();
     }
-    ERR_clear_error();
+    // Finish any prior ciphertext before accepting more app data so a
+    // WantWrite here never implies "retry the same SSL_write".
+    if (pending_out_off_ < pending_out_.size() ||
+        (SSL_get_wbio(static_cast<SSL*>(ssl_)) != nullptr &&
+         BIO_ctrl_pending(SSL_get_wbio(static_cast<SSL*>(ssl_))) > 0)) {
+        auto flushed = flush_network();
+        if (flushed.kind != TlsIoResult::Kind::Ok) {
+            return flushed;
+        }
+    }
+
     auto* ssl = static_cast<SSL*>(ssl_);
+    ERR_clear_error();
     int r = SSL_write(ssl, buf, static_cast<int>(len));
+    auto flushed = flush_network();
+    if (flushed.kind == TlsIoResult::Kind::Error || flushed.kind == TlsIoResult::Kind::Closed) {
+        return flushed;
+    }
     if (r > 0) {
+        // App bytes accepted into SSL. Ciphertext residue is drained via
+        // wants_write()/flush() or the next write/read.
         return {TlsIoResult::Kind::Ok, static_cast<std::size_t>(r)};
     }
-    return map_ssl_error(r);
+    auto err = map_ssl_error(r);
+    if (err.kind == TlsIoResult::Kind::WantRead) {
+        auto fed = feed_network();
+        if (fed.kind == TlsIoResult::Kind::Ok) {
+            // Retry once with the same buffer; outer try_flush loops.
+            return {TlsIoResult::Kind::WantRead, 0};
+        }
+        return fed;
+    }
+    if (err.kind == TlsIoResult::Kind::WantWrite) {
+        return {TlsIoResult::Kind::WantWrite, 0};
+    }
+    return err;
 }
 
 void TlsStream::shutdown() noexcept {
+    std::lock_guard<std::recursive_mutex> lock(io_mu_);
     if (shutdown_done_ || ssl_ == nullptr) {
         return;
     }
     shutdown_done_ = true;
     // Best-effort; ignore WANT_*/errors on teardown.
     SSL_shutdown(static_cast<SSL*>(ssl_));
+    (void)flush_network();
 }
 
 void TlsStream::stash_for_fd(int fd, std::unique_ptr<TlsStream> stream) {

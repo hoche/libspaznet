@@ -6,6 +6,17 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
+## 2026-08-13 — TLS memory BIOs (fix Windows WSS / IOCP)
+
+`TlsStream` no longer uses `SSL_set_fd` socket BIOs. Ciphertext is
+pumped through memory BIOs with explicit `recv`/`send`, so OpenSSL does
+not race IOCP's overlapped zero-byte `WSARecv` probes. That race left
+Windows WSS hanging after the 101 response (HTTPS still worked because
+the request was drained in one wake). Also drains pending ciphertext
+when the app `OutputBuffer` is empty, and serializes `SSL_*` / BIO pump
+ops with a per-stream mutex (HTTP/2's concurrent reader+writer
+coroutines otherwise corrupt the TLS state).
+
 ## 2026-08-13 — TLS-over-TCP for HTTP/1.1, HTTP/2, and WebSocket
 
 Optional HTTPS/WSS via OpenSSL on accepted TCP connections. Dispatchers
