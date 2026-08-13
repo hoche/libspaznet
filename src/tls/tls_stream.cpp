@@ -1,5 +1,8 @@
 #include <libspaznet/detail/tls_stream.hpp>
 
+#include <libspaznet/detail/socket_compat.hpp>
+
+#include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
@@ -152,6 +155,15 @@ auto TlsStream::create_server(const std::shared_ptr<TlsContext>& ctx, int fd)
         throw std::runtime_error("SSL_new failed");
     }
     SSL_set_fd(ssl, fd);
+    // Socket is already non-blocking at accept; keep the BIOs in sync so
+    // SSL_read/SSL_write return WANT_* (or SYSCALL+EWOULDBLOCK) instead of
+    // blocking the IO thread.
+    if (BIO* rbio = SSL_get_rbio(ssl)) {
+        BIO_set_nbio(rbio, 1);
+    }
+    if (BIO* wbio = SSL_get_wbio(ssl)) {
+        BIO_set_nbio(wbio, 1);
+    }
     SSL_set_accept_state(ssl);
     return std::unique_ptr<TlsStream>(new TlsStream(ssl, fd));
 }
@@ -168,8 +180,21 @@ auto TlsStream::map_ssl_error(int ssl_ret) const -> TlsIoResult {
     if (err == SSL_ERROR_ZERO_RETURN) {
         return {TlsIoResult::Kind::Closed, 0};
     }
-    if (err == SSL_ERROR_SYSCALL && ssl_ret == 0) {
-        return {TlsIoResult::Kind::Closed, 0};
+    if (err == SSL_ERROR_SYSCALL) {
+        if (ssl_ret == 0) {
+            return {TlsIoResult::Kind::Closed, 0};
+        }
+        // Windows (and some BIO setups) report EWOULDBLOCK/EAGAIN as
+        // SSL_ERROR_SYSCALL instead of WANT_READ/WANT_WRITE. Treat those as
+        // retryable so the reactor/coroutine wait path re-arms interest.
+        const int sock_err = detail::last_socket_error();
+        if (detail::is_retryable_socket_error(sock_err)) {
+            const int want = SSL_want(ssl);
+            if (want == SSL_WRITING) {
+                return {TlsIoResult::Kind::WantWrite, 0};
+            }
+            return {TlsIoResult::Kind::WantRead, 0};
+        }
     }
     return {TlsIoResult::Kind::Error, 0};
 }
