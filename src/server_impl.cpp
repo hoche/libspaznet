@@ -1134,6 +1134,16 @@ void Server::stop() {
             std::lock_guard<std::mutex> lock(reactor_conns_mutex_);
             conns.swap(reactor_connections_);
         }
+        // finish_reactor_connection() only decrements when it erases a map
+        // entry. We've already pulled these out of the map, so balance the
+        // gauge here — otherwise shutdown()->on_closed() is a no-op on the
+        // count and active_connections sticks above zero after stop().
+        for (auto& [fd, entry] : conns) {
+            (void)fd;
+            if (entry.ctx != nullptr) {
+                entry.ctx->decrement_active_connections();
+            }
+        }
         std::unordered_map<IOContext*, std::vector<std::shared_ptr<IoHandler>>> by_ctx;
         by_ctx.reserve(io_contexts_.size());
         for (auto& [fd, entry] : conns) {
