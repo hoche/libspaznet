@@ -2,47 +2,124 @@
 
 - [x] Fix Windows builds (poll, then readiness IOCP as default)
 - [x] Fix Windows IOCP backend (readiness demux; `-DSPAZNET_FORCE_POLL=ON` fallback)
+- [x] Add non-coroutine reactor model
+
+- Fix reactor model's threading system: N independent event loops for reactor I/O scaling. `Server(N)` still means one loop plus N coroutine workers; reactor `on_readable` / `on_writable` never leave the `run()` thread, so extra workers do not raise reactor rps. Analysis and proposed accept-and-shard design: `docs/reactor-threading.md`.
 - TLS addition. Already in QUIC, of course, but needs to be added to the
-  other protocols. HTTP/1.x should support both separate socket listeners
-  and ALPN. Websockets should support both ws as wss.
+other protocols. HTTP/1.x should support both separate socket listeners
+and ALPN. Websockets should support both ws as wss.
+- Support wolfSSL as an alternate to OpenSSL.
 - QUIC Demo. There is none at this point.
 - QUIC Improvements
-	+ 0-RTT / session resumption (RFC 9001 §4.6) — not
-	 implemented. Needs session-ticket issuance, early-data keys,
-	 and anti-replay. Flagged in the perf profile as the single
-	 biggest realistic win.
-	+ Connection-level flow control (RFC 9000 §4.1) —
-	 only per-stream limits exist (ensure_stream sets recv/send
-	limits). There's no connection-aggregate MAX_DATA accounting,
-	 no MAX_DATA emission, and MAX_STREAMS is not enforced —
-	 ensure_stream creates unbounded streams (also the Medium DoS from
-	 the security review). connection.cpp has no conn_recv/conn_send
-	 window tracking.
-	+ Active Connection ID management (RFC 9000 §5.1) —
-	 NEW_CONNECTION_ID/RETIRE_CONNECTION_ID frames parse and encode
-	 but are not acted on: the server never issues spare CIDs, never
-	 processes the peer's, and does no CID rotation.
-	+ Connection migration / path validation (RFC 9000 §9) —
-	 currently "Limited": it echoes inbound PATH_CHALLENGE and
-	 freezes the peer address post-handshake, but does not initiate
-	 PATH_CHALLENGE, validate alternate paths, or migrate — so
-	 legitimate NAT rebinding strands the connection until idle
-	 timeout. Depends on #4.
-	+ Stateless reset (RFC 9000 §10.3) — only the
-	 stateless_reset_token transport parameter is advertised; there's
-	 no detection of inbound stateless resets and no emission of one
-	 for unknown-CID datagrams.
-	+ Path MTU discovery (DPLPMTUD, RFC 8899) — fixed
-	 max_udp_payload_size; no probing.
-	+ ECN validation (RFC 9000 §13.4) — ACK carries ECN counts
-	 on the wire but there's no marking/validation path.
-	+ Client mode — Connection::Role has only Server. No client
-	 handshake initiation, client-initiated streams, or client TP
-	 handling. (Large component.)
+  - 0-RTT / session resumption (RFC 9001 §4.6) — not
+   implemented. Needs session-ticket issuance, early-data keys,
+   and anti-replay. Flagged in the perf profile as the single
+   biggest realistic win.
+  - Connection-level flow control (RFC 9000 §4.1) —
+   only per-stream limits exist (ensure_stream sets recv/send
+  limits). There's no connection-aggregate MAX_DATA accounting,
+   no MAX_DATA emission, and MAX_STREAMS is not enforced —
+   ensure_stream creates unbounded streams (also the Medium DoS from
+   the security review). connection.cpp has no conn_recv/conn_send
+   window tracking.
+  - Active Connection ID management (RFC 9000 §5.1) —
+   NEW_CONNECTION_ID/RETIRE_CONNECTION_ID frames parse and encode
+   but are not acted on: the server never issues spare CIDs, never
+   processes the peer's, and does no CID rotation.
+  - Connection migration / path validation (RFC 9000 §9) —
+   currently "Limited": it echoes inbound PATH_CHALLENGE and
+   freezes the peer address post-handshake, but does not initiate
+   PATH_CHALLENGE, validate alternate paths, or migrate — so
+   legitimate NAT rebinding strands the connection until idle
+   timeout. Depends on #4.
+  - Stateless reset (RFC 9000 §10.3) — only the
+   stateless_reset_token transport parameter is advertised; there's
+   no detection of inbound stateless resets and no emission of one
+   for unknown-CID datagrams.
+  - Path MTU discovery (DPLPMTUD, RFC 8899) — fixed
+   max_udp_payload_size; no probing.
+  - ECN validation (RFC 9000 §13.4) — ACK carries ECN counts
+   on the wire but there's no marking/validation path.
+  - Client mode — Connection::Role has only Server. No client
+   handshake initiation, client-initiated streams, or client TP
+   handling. (Large component.)
 - Other client modes (provide examples)
-	+ HTTP Client
-	+ HTTP/2 Client
-	+ WEbsocket Client
+  - HTTP Client
+  - HTTP/2 Client
+  - Websocket Client
+
+## Progress Summary - 2026-08-12
+
+The reactor-port plan landed in full: a callback/state-machine reactor
+is now the foundation, C++20 coroutines are an optional adapter, and
+`-DSPAZNET_ENABLE_COROUTINES=OFF` builds the core, all five protocol
+libraries, every demo, and the full test suite. SHAs below are on
+`main`.
+
+### Reactor core
+
+- [x] **Extract reactor primitives from `IOContext`** (65ef325) —
+  `IoHandler`, fd table of `shared_ptr<IoHandler>` with generation
+  tokens, always-queueing `post()`, `add_timer_callback`, reap list
+  (`defer_destruction`). Coroutine resume is one `IoHandler`
+  (`CoroutineResumeHandler`); `register_io` is a thin wrapper.
+  CMake option `SPAZNET_ENABLE_COROUTINES` (default ON) plus
+  `SPAZNET_HAS_COROUTINES`.
+- [x] **Buffered I/O + `ResponseWriter`** (same commit) —
+  `BufferedConnection` / `InputBuffer` / `OutputBuffer` with
+  automatic write-interest toggling; synchronous handler API with a
+  movable completion token. HTTP/1.1 `handle_request` is now
+  `void(const HTTPRequest&, ResponseWriter)`.
+- [x] `**Server` reactor entry points** (same commit) —
+  `set_connection_factory` / `set_sync_datagram_handler`, destroy-based
+  shutdown, `Statistics::active_connections` / `bytes_buffered`.
+
+### Per-protocol reactor dispatchers
+
+Same codec and (where the handler shape allowed) the same handler
+object as the coroutine dispatcher; differential tests parameterized
+over `DispatcherKind {Coroutine, Reactor}`.
+
+- [x] **HTTP/1.1** (80fc41a) — `Http1Connection` phase machine;
+  `make_reactor_dispatcher`; harness reused by later protocols.
+- [x] **UDP + QUIC/HTTP3** (f241499) — sync `handle_packet`; QUIC
+  `make_reactor_dispatcher` is a thin datagram callback over the
+  existing pump.
+- [x] **WebSocket** (f86d4f4) — `reactor::Handler` / `Connection`;
+  handshake logic shared; HTTP fallback composes with HTTP/1.1's
+  reactor dispatcher. `WriteGate` has no reactor analogue
+  (`OutputBuffer` serializes writes).
+- [x] **HTTP/2** (180a8ec) — `Http2Connection` frame state machine;
+  `writer_loop` / `out_queue` collapse into `OutputBuffer`. Interim
+  `recursive_mutex` for concurrent deferred completions (removed in
+  the threading milestone below). Also fixed a latent coroutine
+  dispatcher lifetime bug in `AwaitResponseReady`.
+
+### Threading and coroutine-free build
+
+- [x] **Per-loop IO-thread affinity** (1857700) —
+  `IOContext::post_to_io_thread` / `is_io_thread()`. Every reactor
+  `ResponseWriter` completion and `websocket::reactor::Connection::send`
+  routes through it. HTTP/2's `recursive_mutex` is gone. `bench_thread_modes`
+  reports coroutine and reactor side by side. TSan-clean.
+- [x] **Coroutine-free build** (5b87325) — `Server`/`Socket` compile
+  without coroutines (`ListenHandler` / `DatagramReadHandler` replace
+  the accept/UDP coroutines). Header leakage closed; WS `Opcode` /
+  `Frame` / `Message` split out of the `Task`-returning types; CMake
+  gates coroutine-only sources; demos and `AllDispatcherKinds()` work
+  with `OFF`. CI matrix job for `SPAZNET_ENABLE_COROUTINES=OFF`.
+  Docs: `docs/coro-free-build.md`.
+
+### Benchmarks and docs
+
+- [x] `**thread_mode_report.md` regenerated** (f90e91f) — coroutine vs
+  reactor rows per thread count. Reactor large-body rps is flat
+  across `N` (one I/O thread); coroutine scales ~6–13× on 64 KiB+
+  bodies. iperf section is kernel-ceiling only (no dispatcher split).
+- [x] `**docs/reactor-threading.md**` — why `Server(N)` cannot scale
+  reactor I/O, and the N-loop accept-and-shard design that would.
+  Linked from `threading.md`, `concurrency-and-coroutines.md`,
+  `coro-free-build.md`, `performance.md`, and the README table.
 
 ## Progress Summary - 2026-07-18
 
@@ -87,138 +164,133 @@
 
 ## Progress Summary - 2026-05-31
 
-- [x] **Pull protocol handlers out of core into `example/<protocol>/`** — landed 2026-05-31 across commits a7fab2d..2253437. All ten phases done; src/ and include/libspaznet/ now carry only the low-level server. Same 284 tests pass on Mac and meep.
+- [x] **Pull protocol handlers out of core into** `example/<protocol>/` — landed 2026-05-31 across commits a7fab2d..2253437. All ten phases done; src/ and include/libspaznet/ now carry only the low-level server. Same 284 tests pass on Mac and meep.
   - Goal: `src/` and `include/` contain only the low-level server
-    (`Server`, `Socket`, `IOContext`, `Task`, `PlatformIO`). Protocol
-    code (HTTP/1.1, WebSocket, HTTP/2, UDP, QUIC + HTTP/3) lives under
-    `example/<protocol>/` with its own headers, sources, tests, and
-    `CMakeLists.txt`.
+  (`Server`, `Socket`, `IOContext`, `Task`, `PlatformIO`). Protocol
+  code (HTTP/1.1, WebSocket, HTTP/2, UDP, QUIC + HTTP/3) lives under
+  `example/<protocol>/` with its own headers, sources, tests, and
+  `CMakeLists.txt`.
   - **Phase 1 — ✅ shipped (a7fab2d)**: low-level
-    `Server::set_connection_handler(std::function<Task(Socket)>)` and
-    `Server::set_datagram_handler(std::function<Task(Datagram)>)`.
-    `Datagram` struct added. Legacy `set_http_handler` /
-    `set_websocket_handler` / etc. still work as compatibility
-    wrappers while the move happens.
-  - **Phase 2a — HTTP/1.1 → `example/http/`** (plain HTTP, no
-    WebSocket). Types in `spaznet::http::` namespace, names
-    verbatim (`HTTPHandler`, `HTTPRequest`, `HTTPResponse`,
-    `HTTPParser`). Factory:
-    `spaznet::http::make_dispatcher(unique_ptr<HTTPHandler>)
-    -> ConnectionHandler`. Dispatcher reads requests, runs
-    keep-alive loop, calls the user's handler — no WS upgrade
-    detection. Demos: `http_hello`, plus later `http_showcase`
-    (1.0 vs 1.1 feature routes).
-  - **Phase 2b — HTTP/1.1 + WebSocket → `example/http-websocket/`**
-    (combined stack, depends on `example/http/` for the HTTP/1.1
-    parser used during upgrade). WS types live in
-    `spaznet::websocket::` namespace, prefix dropped from names
-    (`Handler`, `Frame`, `Message`, `Opcode`).
-    `spaznet::websocket::send_message(Socket&, Opcode, span,
-    bool fin=true)` is the free-function replacement for
-    `Socket::send_websocket_message`. Factory:
-    `spaznet::websocket::make_dispatcher(
-        unique_ptr<spaznet::http::HTTPHandler>,
-        unique_ptr<spaznet::websocket::Handler>)
-        -> ConnectionHandler`. Dispatcher reads first request,
-    detects WS upgrade, either runs the WS frame loop or hands
-    to the HTTP dispatcher (composing example/http's
-    machinery). Demos: `ws_echo`, plus later `ws_chat` (broadcast
-    room + browser page) and the `Connection` write gate. This phase
-    is where the ~400-line WS frame loop previously inline in
-    `src/server_impl.cpp::handle_connection` ends up — it moved to
-    `example/http-websocket/src/dispatcher.cpp`.
-  - **Phase 3 — HTTP/2 → `example/http2/`**. Status quo: dispatch
-    isn't wired into `Server::handle_connection` today; move keeps
-    the parser/HPACK code visible without changing behavior.
-    Demos added later: `http2_hello`, `http2_showcase` (multiplexing).
-  - **Phase 4 — UDP → `example/udp/`**. Becomes a thin wrapper
-    around `set_datagram_handler` for code that prefers the
-    handler-interface idiom. Demos added later: `udp_echo`,
-    `udp_relay`, `udp_statsd`.
-  - **Phase 5 — QUIC + HTTP/3 → `example/quic-http3/`**. The
-    `quic::` and `http3::` namespaces stay; just relocate the
-    files and update `add_subdirectory` wiring.
-  - **Phase 6 — Strip dispatch from `src/server_impl.cpp`** and
-    remove legacy setters. `handle_connection` collapses to "call
-    `connection_handler_` if set, else close". `receive_udp`
-    similarly.
+  `Server::set_connection_handler(std::function<Task(Socket)>)` and
+  `Server::set_datagram_handler(std::function<Task(Datagram)>)`.
+  `Datagram` struct added. Legacy `set_http_handler` /
+  `set_websocket_handler` / etc. still work as compatibility
+  wrappers while the move happens.
+  - **Phase 2a — HTTP/1.1 →** `example/http/` (plain HTTP, no
+  WebSocket). Types in `spaznet::http::` namespace, names
+  verbatim (`HTTPHandler`, `HTTPRequest`, `HTTPResponse`,
+  `HTTPParser`). Factory:
+  `spaznet::http::make_dispatcher(unique_ptr<HTTPHandler>) -> ConnectionHandler`. Dispatcher reads requests, runs
+  keep-alive loop, calls the user's handler — no WS upgrade
+  detection. Demos: `http_hello`, plus later `http_showcase`
+  (1.0 vs 1.1 feature routes).
+  - **Phase 2b — HTTP/1.1 + WebSocket →** `example/http-websocket/`
+  (combined stack, depends on `example/http/` for the HTTP/1.1
+  parser used during upgrade). WS types live in
+  `spaznet::websocket::` namespace, prefix dropped from names
+  (`Handler`, `Frame`, `Message`, `Opcode`).
+  `spaznet::websocket::send_message(Socket&, Opcode, span, bool fin=true)` is the free-function replacement for
+  `Socket::send_websocket_message`. Factory:
+  `spaznet::websocket::make_dispatcher( unique_ptr<spaznet::http::HTTPHandler>, unique_ptr<spaznet::websocket::Handler>) -> ConnectionHandler`. Dispatcher reads first request,
+  detects WS upgrade, either runs the WS frame loop or hands
+  to the HTTP dispatcher (composing example/http's
+  machinery). Demos: `ws_echo`, plus later `ws_chat` (broadcast
+  room + browser page) and the `Connection` write gate. This phase
+  is where the ~400-line WS frame loop previously inline in
+  `src/server_impl.cpp::handle_connection` ends up — it moved to
+  `example/http-websocket/src/dispatcher.cpp`.
+  - **Phase 3 — HTTP/2 →** `example/http2/`. Status quo: dispatch
+  isn't wired into `Server::handle_connection` today; move keeps
+  the parser/HPACK code visible without changing behavior.
+  Demos added later: `http2_hello`, `http2_showcase` (multiplexing).
+  - **Phase 4 — UDP →** `example/udp/`. Becomes a thin wrapper
+  around `set_datagram_handler` for code that prefers the
+  handler-interface idiom. Demos added later: `udp_echo`,
+  `udp_relay`, `udp_statsd`.
+  - **Phase 5 — QUIC + HTTP/3 →** `example/quic-http3/`. The
+  `quic::` and `http3::` namespaces stay; just relocate the
+  files and update `add_subdirectory` wiring.
+  - **Phase 6 — Strip dispatch from** `src/server_impl.cpp` and
+  remove legacy setters. `handle_connection` collapses to "call
+  `connection_handler_` if set, else close". `receive_udp`
+  similarly.
   - **Phase 7 — CMake**: new top-level option
-    `SPAZNET_BUILD_EXAMPLES` (default ON). Each example/ has its
-    own CMakeLists adding its target + tests. SPAZNET_BUILD_QUIC
-    moves to example/quic-http3 scope.
+  `SPAZNET_BUILD_EXAMPLES` (default ON). Each example/ has its
+  own CMakeLists adding its target + tests. SPAZNET_BUILD_QUIC
+  moves to example/quic-http3 scope.
   - **Phase 8 — Docs**: update `api-status.md`, `http.md`,
-    `websocket.md`, `quic-http3.md`, `integration.md`,
-    `migration.md`, README. All `set_http_handler` references
-    become `set_connection_handler + spaznet::http::make_dispatcher`.
+  `websocket.md`, `quic-http3.md`, `integration.md`,
+  `migration.md`, README. All `set_http_handler` references
+  become `set_connection_handler + spaznet::http::make_dispatcher`.
   - **Phase 9 — netbench**: depend on `add_subdirectory(libspaznet/example/http)`
-    and link against the example target.
+  and link against the example target.
   - **Phase 10 — Verify** on Mac + meep: all unit / integration /
-    perf tests pass, netbench builds and runs, CI workflow doesn't
-    reference the old layout.
+  perf tests pass, netbench builds and runs, CI workflow doesn't
+  reference the old layout.
 
 ## From the 2026-05-27 audit
 
 - [x] Replace QUIC + HPACK with a real implementation
   - Shipped across commits 111fcd1 (Phase 1+2 — RFC 9000 §16 varints,
-    RFC 9001 §A.2 Initial-packet KAT, AES-128/256-GCM + ChaCha20-Poly1305
-    AEAD, header protection, full frame codec under std::variant),
-    3da5cbb (Phase 3 — TLS 1.3 via SSL_set_quic_tls_cbs, RFC 9000 §18
-    transport-parameter codec), aa756d6 + 982be0a (Phase 4 — PN-space
-    ACK bookkeeping, stream state machine with out-of-order reassembly,
-    RFC 9002 RTT/PTO, NewReno congestion, Connection orchestrator),
-    1adf39b (Phase 5 — Listener with CID demux, RFC 9001 §A.4 Retry
-    integrity tag KAT, Version Negotiation), 5e3a4ba + 7c90120 +
-    eb91300 (Phase 6 — RFC 7541 §B Huffman with §C.4 vectors,
-    RFC 9204 QPACK static-only, RFC 9114 HTTP/3 frames, Http3Server
-    request dispatcher), 230681b (Phase 7 — peer-addr routing,
-    Server::set_quic_http3_service, end-to-end protected-datagram GET
-    test).
+  RFC 9001 §A.2 Initial-packet KAT, AES-128/256-GCM + ChaCha20-Poly1305
+  AEAD, header protection, full frame codec under std::variant),
+  3da5cbb (Phase 3 — TLS 1.3 via SSL_set_quic_tls_cbs, RFC 9000 §18
+  transport-parameter codec), aa756d6 + 982be0a (Phase 4 — PN-space
+  ACK bookkeeping, stream state machine with out-of-order reassembly,
+  RFC 9002 RTT/PTO, NewReno congestion, Connection orchestrator),
+  1adf39b (Phase 5 — Listener with CID demux, RFC 9001 §A.4 Retry
+  integrity tag KAT, Version Negotiation), 5e3a4ba + 7c90120 +
+  eb91300 (Phase 6 — RFC 7541 §B Huffman with §C.4 vectors,
+  RFC 9204 QPACK static-only, RFC 9114 HTTP/3 frames, Http3Server
+  request dispatcher), 230681b (Phase 7 — peer-addr routing,
+  Server::set_quic_http3_service, end-to-end protected-datagram GET
+  test).
   - Server-side QUIC v1 + HTTP/3 only. TLS handshake driven by
-    OpenSSL 3.5+ via the upstream QUIC TLS callback dispatch; all
-    transport / recovery / congestion / HTTP/3 / QPACK code is
-    in-tree, no other third-party deps.
+  OpenSSL 3.5+ via the upstream QUIC TLS callback dispatch; all
+  transport / recovery / congestion / HTTP/3 / QPACK code is
+  in-tree, no other third-party deps.
   - End-to-end verification: an OpenSSL client SSL* and our
-    quic::Connection complete a TLS 1.3 handshake through three rounds
-    of real protected datagrams, exchange transport parameters,
-    install Application-level secrets, and the client's QPACK-encoded
-    GET on stream 0 round-trips through Http3Server to a HEADERS+DATA
-    response (`:status 200`, body "Hello, h3!").
+  quic::Connection complete a TLS 1.3 handshake through three rounds
+  of real protected datagrams, exchange transport parameters,
+  install Application-level secrets, and the client's QPACK-encoded
+  GET on stream 0 round-trips through Http3Server to a HEADERS+DATA
+  response (`:status 200`, body "Hello, h3!").
 
 - [x] Make the WebSocket layer RFC 6455 compliant
   - Shipped in e1db51e and f87cdb8 (pre-rewrite SHAs e860986, 3fa7788)
-    on the merged main; integration + unit tests cover each rejection
-    path. Sec-WebSocket-Accept handshake already existed and was
-    confirmed correct.
+  on the merged main; integration + unit tests cover each rejection
+  path. Sec-WebSocket-Accept handshake already existed and was
+  confirmed correct.
 
 - [x] Re-architect Socket::async_read / async_write
   - Shipped in dbd9ded and 607a2c9, merged via aca9198. async_read /
-    async_write loop on EAGAIN via re-await instead of sleep_for;
-    read_exact has no sleep_for; Server::stop drains in-flight
-    handle_connection coroutines before tearing down the IOContext.
+  async_write loop on EAGAIN via re-await instead of sleep_for;
+  read_exact has no sleep_for; Server::stop drains in-flight
+  handle_connection coroutines before tearing down the IOContext.
   - Still open as a follow-up: change async_read's return type to
-    Task<ssize_t> so callers can distinguish bytes-read from
-    EOF/error. Not done because Task<T> doesn't exist yet and the
-    callsites all infer success from buffer.size().
+  Task so callers can distinguish bytes-read from
+  EOF/error. Not done because Task doesn't exist yet and the
+  callsites all infer success from buffer.size().
 
 - [x] Fix platform I/O hazards
   - Shipped in 4b3f3e6, 77a8fc5, d64bce1, 5d53adb (EINTR + HUP/EOF,
-    TaskQueue UAF, user_data + generation token, IOCP gate). Docs
-    refreshed in e179a02.
+  TaskQueue UAF, user_data + generation token, IOCP gate). Docs
+  refreshed in e179a02.
 
 - [x] Sanitize CR/LF in outgoing header values
   - Shipped in 0fbe399. HTTP/1.1 and HTTP/2 response builders now
-    drop entries whose name isn't a valid token or whose value
-    contains CR/LF/NUL. 7 unit tests cover the rejection paths.
+  drop entries whose name isn't a valid token or whose value
+  contains CR/LF/NUL. 7 unit tests cover the rejection paths.
 
 - [x] Build hygiene
   - Shipped on branch fix/build-hygiene, merged via 5b5a1b9.
-    -Wall/-Wextra/-Wpedantic on the library (tests run a slightly
-    looser set); googletest treated as SYSTEM; find_package(Threads)
-    + Threads::Threads; install(EXPORT) + spaznetConfig.cmake so
+  -Wall/-Wextra/-Wpedantic on the library (tests run a slightly
+  looser set); googletest treated as SYSTEM; find_package(Threads)
+    - Threads::Threads; install(EXPORT) + spaznetConfig.cmake so
     downstream find_package(spaznet) works; WSAStartup via call_once
     on Windows; verified ASan + UBSan suites are still clean.
   - -Wconversion / -Wshadow intentionally deferred — both fire across
-    existing code; cleaning them up is a separate, bounded project.
+  existing code; cleaning them up is a separate, bounded project.
 
 ## From the post-cleanup re-audit (2026-05-27)
 
@@ -246,28 +318,28 @@ items from the same re-audit, none critical:
 
 - [x] Don't hold the pending_io_ spinlock across add_fd / modify_fd
   - map_lock_ is now a std::mutex instead of an atomic_flag spinlock
-    (register_io / remove_io / process_io_events). The platform-IO
-    syscall stays inside the critical section on purpose — it must
-    remain mutually exclusive with remove_io's remove_fd to keep the
-    side-table fd-reuse fix (d64bce1) intact — but waiters now park on
-    the mutex instead of burning CPU spinning behind a blocked syscall.
+  (register_io / remove_io / process_io_events). The platform-IO
+  syscall stays inside the critical section on purpose — it must
+  remain mutually exclusive with remove_io's remove_fd to keep the
+  side-table fd-reuse fix (d64bce1) intact — but waiters now park on
+  the mutex instead of burning CPU spinning behind a blocked syscall.
 
 - [x] Skip generation 0 on register_io counter wrap
   - register_io re-rolls when fetch_add returns 0 (the wakeup-pipe
-    sentinel), so a real fd never inherits generation 0 and has its
-    events dropped as wakeup-pipe traffic after the counter wraps.
+  sentinel), so a real fd never inherits generation 0 and has its
+  events dropped as wakeup-pipe traffic after the counter wraps.
 
-- [x] async_read return type → Task<ssize_t>
-  - Landed as ValueTask<ssize_t>: async_read co_returns the byte count
-    (>0), 0 on orderly EOF, or -1 on hard error, so callers can tell
-    EOF from error instead of inferring from buffer.size(). Named
-    ValueTask<T> rather than Task<T> to avoid renaming the 100+ void
-    Task callsites. The coroutine runtime was refactored so Task and
-    ValueTask<T> share a TaskPromiseBase; the control block carries a
-    base-promise pointer so the I/O layer never reinterpret-casts
-    between promise types. Existing `co_await socket.async_read(...)`
-    callsites are unchanged (the ssize_t is simply discarded). ASan +
-    TSan suites stay clean.
+- [x] async_read return type → Task
+  - Landed as ValueTask: async_read co_returns the byte count
+  (>0), 0 on orderly EOF, or -1 on hard error, so callers can tell
+  EOF from error instead of inferring from buffer.size(). Named
+  ValueTask rather than Task to avoid renaming the 100+ void
+  Task callsites. The coroutine runtime was refactored so Task and
+  ValueTask share a TaskPromiseBase; the control block carries a
+  base-promise pointer so the I/O layer never reinterpret-casts
+  between promise types. Existing `co_await socket.async_read(...)`
+  callsites are unchanged (the ssize_t is simply discarded). ASan +
+  TSan suites stay clean.
 
 ## QUIC + HTTP/3 follow-ups (2026-05-29)
 
@@ -279,39 +351,38 @@ Ordered by priority.
 
 - [x] Delete the toy QUIC/HTTP/3 code
   - Deleted `src/handlers/quic_handler.cpp`,
-    `src/handlers/quic_server.cpp`, `src/handlers/http3_handler.cpp`,
-    their public headers, and the obsolete tests
-    (`tests/unit/test_quic_handler.cpp`,
-    `tests/integration/test_quic_server.cpp`,
-    `tests/integration/test_http3_server.cpp`,
-    `tests/performance/test_quic_performance.cpp`).  Removed
-    `set_quic_handler` / `set_http3_handler` from `Server` and the
-    `QUICServerEngine` branch in `Server::receive_udp`.
-    `Server::set_quic_http3_service` is the only QUIC/HTTP/3 entry
-    point now.
+  `src/handlers/quic_server.cpp`, `src/handlers/http3_handler.cpp`,
+  their public headers, and the obsolete tests
+  (`tests/unit/test_quic_handler.cpp`,
+  `tests/integration/test_quic_server.cpp`,
+  `tests/integration/test_http3_server.cpp`,
+  `tests/performance/test_quic_performance.cpp`).  Removed
+  `set_quic_handler` / `set_http3_handler` from `Server` and the
+  `QUICServerEngine` branch in `Server::receive_udp`.
+  `Server::set_quic_http3_service` is the only QUIC/HTTP/3 entry
+  point now.
 
 - [x] Wire `Listener::Config::require_retry` into the dispatch path
   - When `require_retry` is on, the listener now full-parses each
-    Initial; without a token it emits a Retry (containing a fresh
-    SCID and a peer-address-bound token) and creates no state.
-    Initials carrying a valid token are accepted, the OD-CID is
-    decoded out of the token, the connection is constructed with
-    `original_destination_connection_id` and
-    `retry_source_connection_id` pre-filled, and
-    `Connection::mark_peer_address_validated()` skips the anti-amp
-    cap.  Tokens are bound to the peer's IP+port via HMAC-SHA256
-    truncated to 128 bits over `nonce||addr_len||addr||odcid_len||
-    odcid`, so a replay from a different source fails validation.
+  Initial; without a token it emits a Retry (containing a fresh
+  SCID and a peer-address-bound token) and creates no state.
+  Initials carrying a valid token are accepted, the OD-CID is
+  decoded out of the token, the connection is constructed with
+  `original_destination_connection_id` and
+  `retry_source_connection_id` pre-filled, and
+  `Connection::mark_peer_address_validated()` skips the anti-amp
+  cap.  Tokens are bound to the peer's IP+port via HMAC-SHA256
+  truncated to 128 bits over `nonce||addr_len||addr||odcid_len|| odcid`, so a replay from a different source fails validation.
 
 - [x] Implement the 3× anti-amplification budget in `Connection`
   - RFC 9000 §8.1.2.  `Connection` now tracks `recv_bytes_total_`
-    (bumped on every received datagram regardless of decrypt
-    success) and `sent_bytes_unvalidated_`.  `build_and_send` bails
-    early when `sent + 1500 > 3 × recv` while still unvalidated.
-    The cap is released either by `mark_peer_address_validated()`
-    (called by Listener after Retry token verification) or
-    automatically when a Handshake-protected packet decrypts (proof
-    the peer received our Initial response).
+  (bumped on every received datagram regardless of decrypt
+  success) and `sent_bytes_unvalidated_`.  `build_and_send` bails
+  early when `sent + 1500 > 3 × recv` while still unvalidated.
+  The cap is released either by `mark_peer_address_validated()`
+  (called by Listener after Retry token verification) or
+  automatically when a Handshake-protected packet decrypts (proof
+  the peer received our Initial response).
 
 ### Spec MUSTs deferred
 
@@ -371,16 +442,15 @@ Ordered by priority.
   fuzzer binaries link cleanly.  5-second pass per harness on meep
   (clang 18, Linux x86_64) found zero crashers and accumulates
   coverage continuously — good baseline for longer-running CI runs.
-  Run with e.g. `./build-fuzz/example/quic-http3/fuzz_quic_frame
-  -max_total_time=10 -print_final_stats=1`.
+  Run with e.g. `./build-fuzz/example/quic-http3/fuzz_quic_frame -max_total_time=10 -print_final_stats=1`.
 - [ ] UDP-socket integration test for `Server::set_quic_http3_service`
   - We have the wiring (`server_impl.cpp` calls
-    `quic_http3_service_->handle_datagram`) but no test actually opens
-    a UDP socket. The end-to-end loopback test (`test_http3_end_to_end`)
-    goes through the `Connection` API directly. A real-socket test
-    that binds, uses our hand-rolled client over `sendto`/`recvfrom`,
-    and validates the GET round-trips would catch any plumbing bugs
-    in the receive_udp coroutine.
+  `quic_http3_service_->handle_datagram`) but no test actually opens
+  a UDP socket. The end-to-end loopback test (`test_http3_end_to_end`)
+  goes through the `Connection` API directly. A real-socket test
+  that binds, uses our hand-rolled client over `sendto`/`recvfrom`,
+  and validates the GET round-trips would catch any plumbing bugs
+  in the receive_udp coroutine.
 
 - [x] Real curl `--http3` interop test scaffolding — landed 2026-05-31.
   `QuicHttp3CurlInterop` (example/quic-http3/tests/integration/test_curl_http3_interop.cpp)
@@ -391,7 +461,6 @@ Ordered by priority.
   Service grows a self-routing constructor so callers don't have
   to know the UDP fd before `listen_udp` picks one.  Honors
   `SSLKEYLOGFILE` for Wireshark debugging.
-
   Still open follow-up: actually running it against a real
   HTTP/3-capable curl in CI. Both meep and the macOS dev box ship
   curl without HTTP/3 today.  Easiest path: install
@@ -405,122 +474,121 @@ Ordered by priority.
 
 - [ ] Client mode for `Connection`
   - The `Role role_{Role::Server}` field is a placeholder. Client mode
-    needs: SCID/DCID generation in reverse, Initial-secret derivation
-    with `Direction::Client`, transport-parameter encode-without-OD-CID,
-    handling of Retry on the client side, and the dispatch through TLS
-    `SSL_set_connect_state` instead of `SSL_set_accept_state`.
+  needs: SCID/DCID generation in reverse, Initial-secret derivation
+  with `Direction::Client`, transport-parameter encode-without-OD-CID,
+  handling of Retry on the client side, and the dispatch through TLS
+  `SSL_set_connect_state` instead of `SSL_set_accept_state`.
 
 - [ ] 0-RTT / session resumption
   - TLS layer can already do it (OpenSSL exposes the early-data API).
-    QUIC plumbing for the EarlyData PN space, the early-data CRYPTO
-    buffer, and the 0-RTT key install path is missing.
+  QUIC plumbing for the EarlyData PN space, the early-data CRYPTO
+  buffer, and the 0-RTT key install path is missing.
 
 - [ ] Dynamic QPACK table
   - Today the server advertises `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0`
-    and rejects any non-zero Required-Insert-Count in incoming field
-    sections. A dynamic-table encoder + decoder (RFC 9204 §3.2) lifts
-    compression ratios significantly for repeated headers.
+  and rejects any non-zero Required-Insert-Count in incoming field
+  sections. A dynamic-table encoder + decoder (RFC 9204 §3.2) lifts
+  compression ratios significantly for repeated headers.
 
 ### Operational polish
 
 - [ ] qlog tracing
   - RFC 9001 §A.1 / IETF draft-ietf-quic-qlog. Emit one JSON line per
-    packet/frame to a file pointed to by the `QLOGDIR` env var. Cheap
-    to add (the encoder/decoder for each frame already exists) and
-    indispensable when something breaks in the field.
+  packet/frame to a file pointed to by the `QLOGDIR` env var. Cheap
+  to add (the encoder/decoder for each frame already exists) and
+  indispensable when something breaks in the field.
 
 - [x] Performance benchmark for the QUIC path
   - Shipped as `tests/performance/bench_quic_steady_state.cpp`
-    (commit 27320da). Baseline numbers: ~117 K full-MTU
-    packets/sec, ~675 Mbps, ~8.5 µs/packet end-to-end on a single
-    thread (meep, Intel x86_64). See
-    `docs/quic-profile-2026-05-29.md`.
+  (commit 27320da). Baseline numbers: ~117 K full-MTU
+  packets/sec, ~675 Mbps, ~8.5 µs/packet end-to-end on a single
+  thread (meep, Intel x86_64). See
+  `docs/quic-profile-2026-05-29.md`.
   - The first profile under that bench is also captured in the same
-    doc. The in-place-AEAD optimization that the profile recommended
-    (commit fc8a185) turned out to be within benchmark noise here
-    (callgrind saw −7% on the changed sub-tree, but the bench
-    exercises both server send + client receive plus the per-call
-    EVP context churn, which dwarfs vector allocations).
+  doc. The in-place-AEAD optimization that the profile recommended
+  (commit fc8a185) turned out to be within benchmark noise here
+  (callgrind saw −7% on the changed sub-tree, but the bench
+  exercises both server send + client receive plus the per-call
+  EVP context churn, which dwarfs vector allocations).
 
 - [x] QUIC perf: cache EVP_CIPHER_CTX per Space
   - Shipped as `quic::CipherCtx` (commit pending). One Encrypt + one
-    Decrypt context per encryption level, allocated when keys are
-    installed via `install_new_keys` and reused for every packet —
-    only the IV gets reset per call via
-    `EVP_EncryptInit_ex(ctx, NULL, NULL, NULL, nonce)`. Eliminates
-    per-packet EVP_CIPHER_CTX_new + Init(cipher,key) + free. Bench
-    confirms +8–23% throughput on the steady-state QUIC bench
-    (smaller-N runs see the bigger win because at higher N
-    `Stream::on_acked`'s O(N) erase eats the wallclock).
+  Decrypt context per encryption level, allocated when keys are
+  installed via `install_new_keys` and reused for every packet —
+  only the IV gets reset per call via
+  `EVP_EncryptInit_ex(ctx, NULL, NULL, NULL, nonce)`. Eliminates
+  per-packet EVP_CIPHER_CTX_new + Init(cipher,key) + free. Bench
+  confirms +8–23% throughput on the steady-state QUIC bench
+  (smaller-N runs see the bigger win because at higher N
+  `Stream::on_acked`'s O(N) erase eats the wallclock).
 
 - [x] QUIC perf: fix O(N) erase in Stream::on_acked + O(N²) ACK loop
   - Shipped in bcac7b4. Two fixes, both required:
     1. `Connection::on_ack_frame` now walks `sent_` via `lower_bound`
-       instead of iterating every PN in each acked range. The bench
+      instead of iterating every PN in each acked range. The bench
        client doesn't trim its PnSpace.ranges_, so each ACK frame
        covers PNs 0..largest — most of which are already acked. The
        old code did O(largest_pn) by_pn.find calls per ACK; the new
        one visits only the actually-still-in-flight entries.
     2. `Stream::on_acked` now advances a logical head offset
-       (`send_buf_head_`) on ack rather than `vector::erase(begin,
-       ...)`, compacting only when the head exceeds 8 KiB or half
+      (`send_buf_head_`) on ack rather than `vector::erase(begin,  ...)`, compacting only when the head exceeds 8 KiB or half
        the buffer.
   - Result: bench ns/pkt is flat across N (was growing ~linearly
-    with N, i.e. total time was O(N²)). Headline: ~388 K pps /
-    2.23 Gbps / 2,575 ns/pkt on meep, holds steady up to 500 K
-    packets. End-to-end +231% throughput vs the pre-optimization
-    baseline (461645b).
+  with N, i.e. total time was O(N²)). Headline: ~388 K pps /
+  2.23 Gbps / 2,575 ns/pkt on meep, holds steady up to 500 K
+  packets. End-to-end +231% throughput vs the pre-optimization
+  baseline (461645b).
 
 - [ ] QUIC perf: PnSpace should trim received-PN ranges over time
   - The companion problem to the fix above. RFC 9000 §13.2
-    "Limiting Ranges by Tracking ACK Frames" describes the actual
-    fix: once the peer has acknowledged a frame that itself
-    acknowledged some PNs, the receiver no longer needs to keep
-    those PNs in its received-PN set. We currently never call
-    PnSpace::trim_below, so the ranges_ vector includes every PN
-    ever seen — bloating every emitted ACK frame.
+  "Limiting Ranges by Tracking ACK Frames" describes the actual
+  fix: once the peer has acknowledged a frame that itself
+  acknowledged some PNs, the receiver no longer needs to keep
+  those PNs in its received-PN set. We currently never call
+  PnSpace::trim_below, so the ranges_ vector includes every PN
+  ever seen — bloating every emitted ACK frame.
   - Today the workaround is on the server side (on_ack_frame
-    handles the bloated ACK efficiently). But the bloated ACKs
-    themselves are wire-inefficient (more varint bytes than
-    needed) and the test harness/client would benefit from
-    proper trimming too.
+  handles the bloated ACK efficiently). But the bloated ACKs
+  themselves are wire-inefficient (more varint bytes than
+  needed) and the test harness/client would benefit from
+  proper trimming too.
 
 - [ ] QUIC perf: hand back a span from Stream::pull_send
   - Today pull_send does data_out.assign(...), copying bytes from
-    the stream's send buffer into a vector that lives in a
-    StreamFrame's `data` field until the packet is acked. That's
-    one allocation + one memcpy per packet emitted. The stream's
-    send buffer is the source of truth and doesn't shrink until
-    on_acked, so handing back a span<const uint8_t> into it would
-    let build_and_send reference the bytes without copying.
+  the stream's send buffer into a vector that lives in a
+  StreamFrame's `data` field until the packet is acked. That's
+  one allocation + one memcpy per packet emitted. The stream's
+  send buffer is the source of truth and doesn't shrink until
+  on_acked, so handing back a span into it would
+  let build_and_send reference the bytes without copying.
 
 - [ ] API documentation
   - The five new public types (`TlsContext`, `Connection`, `Listener`,
-    `QuicHttp3Service`, `Http3Server`) have header comments but no
-    consolidated docs. A `docs/quic.md` walking through how the layers
-    compose, with the loopback test as a worked example, would help
-    anyone trying to use this.
+  `QuicHttp3Service`, `Http3Server`) have header comments but no
+  consolidated docs. A `docs/quic.md` walking through how the layers
+  compose, with the loopback test as a worked example, would help
+  anyone trying to use this.
 
 ## Other
 
 - [x] Add support for TLS (QUIC path)
   - Shipped as part of the QUIC rewrite (commit 3da5cbb). The
-    `TlsContext` / `TlsConnection` wrappers around OpenSSL 3.5+ live
-    in `include/libspaznet/quic/tls.hpp`. They're QUIC-specific
-    today — using them for vanilla TLS-over-TCP would need a thin
-    `SSL_read`/`SSL_write`-driven path that isn't there yet, but the
-    SSL_CTX construction (cert/key loading, ALPN) is reusable.
+  `TlsContext` / `TlsConnection` wrappers around OpenSSL 3.5+ live
+  in `include/libspaznet/quic/tls.hpp`. They're QUIC-specific
+  today — using them for vanilla TLS-over-TCP would need a thin
+  `SSL_read`/`SSL_write`-driven path that isn't there yet, but the
+  SSL_CTX construction (cert/key loading, ALPN) is reusable.
 
 - [ ] **TLS-over-TCP for HTTP / HTTP/2 / WebSocket (https / wss)** — LATER
   - Design sketched 2026-07-18: optional OpenSSL path inside
-    `Socket::async_read` / `async_write` (opaque pimpl, `SSL_set_fd`,
-    `WANT_READ`/`WANT_WRITE` → existing `register_io` awaits), gated by
-    `SPAZNET_ENABLE_TLS` / `SPAZNET_HAS_TLS` (OpenSSL 1.1.1+/3.0+,
-    independent of QUIC's 3.5+ requirement). Would give all three
-    example servers https/wss with no dispatcher changes.
+  `Socket::async_read` / `async_write` (opaque pimpl, `SSL_set_fd`,
+  `WANT_READ`/`WANT_WRITE` → existing `register_io` awaits), gated by
+  `SPAZNET_ENABLE_TLS` / `SPAZNET_HAS_TLS` (OpenSSL 1.1.1+/3.0+,
+  independent of QUIC's 3.5+ requirement). Would give all three
+  example servers https/wss with no dispatcher changes.
   - **Blocked on ALPN protocol-selection decision:** one TLS port with
-    ALPN auto-routing (`h2` vs `http/1.1`/wss) vs per-server single
-    protocol. Scope (core only vs wire all examples + demos) also open.
+  ALPN auto-routing (`h2` vs `http/1.1`/wss) vs per-server single
+  protocol. Scope (core only vs wire all examples + demos) also open.
   - Plan file: `.cursor/plans/tls_https_support_later_00b0f3d4.plan.md`
-    (or the workspace copy under the user's Cursor plans dir).
+  (or the workspace copy under the user's Cursor plans dir).
 

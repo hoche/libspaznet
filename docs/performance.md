@@ -204,6 +204,9 @@ In order of how much they move the dial:
 ## Related
 
 - [`threading.md`](threading.md) — picking `N` for your workload
+- [`reactor-threading.md`](reactor-threading.md) — why reactor
+  throughput is flat across `N`, and the multi-loop design that
+  would change that
 - [`mutex-vs-atomics.md`](mutex-vs-atomics.md) — why the hot path is
   almost lock-free
 - [`quic-profile-2026-05-29.md`](quic-profile-2026-05-29.md) —

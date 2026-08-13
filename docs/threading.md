@@ -142,7 +142,9 @@ specifically, rather than `post()`'s round-robin across every worker. See
 `concurrency-and-coroutines.md`'s "Reactor Threading Model" section for
 the full picture, including why this is not the same as "pinning a
 connection to a thread" in the multi-loop sense above — there is still
-only one loop (and one `run()` thread) per `IOContext`.
+only one loop (and one `run()` thread) per `IOContext`. For why that
+single loop is the reactor throughput ceiling, and the N-loop design
+that would raise it, see [`reactor-threading.md`](reactor-threading.md).
 
 ## Stop / drain semantics
 
@@ -182,3 +184,6 @@ calling `stop`.
 - [mutex-vs-atomics.md](mutex-vs-atomics.md) — what's locked vs
   atomic in the library itself
 - [performance.md](performance.md) — broader benchmark numbers
+- [reactor-threading.md](reactor-threading.md) — why reactor
+  dispatchers ignore `N`, and the multi-loop design that would
+  actually scale them

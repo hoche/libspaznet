@@ -225,7 +225,10 @@ every `websocket::reactor::Connection::send()` call, routes through it.
 A new reactor dispatcher's completion path should too — see
 `docs/concurrency-and-coroutines.md`'s "Reactor Threading Model" for
 the full rationale, including why this replaced a per-connection
-`recursive_mutex` in HTTP/2 rather than living alongside one.
+`recursive_mutex` in HTTP/2 rather than living alongside one. That
+model is one loop per `IOContext`; `Server(N)`'s worker threads do not
+scale reactor I/O. The design that would is N independent loops —
+see [`reactor-threading.md`](reactor-threading.md).
 
 ## Verifying a change under both configurations
 

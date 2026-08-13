@@ -1,6 +1,6 @@
 # libspaznet
 
-A high-performance, cross-platform network server library written in C++20 using coroutines.
+A high-performance, cross-platform network server library written in C++20 that supports two interchangeable execution models on the same event loop: C++20 coroutines and a plain callback/state-machine reactor. Every protocol dispatcher (HTTP/1.1, HTTP/2, WebSocket, UDP, QUIC + HTTP/3) ships in both flavors, and the reactor model needs no coroutine support at all — `-DSPAZNET_ENABLE_COROUTINES=OFF` builds the entire library, every demo, and the full test suite with zero `<coroutine>` in the compiled output.
 
 ## Features
 
@@ -9,8 +9,10 @@ A high-performance, cross-platform network server library written in C++20 using
   - epoll on Linux
   - poll on other Unix systems
   - readiness-style IOCP on Windows (force poll with `-DSPAZNET_FORCE_POLL=ON`)
-
-- **Coroutine-based async I/O:** Uses C++20 coroutines as the primary execution model
+- **Two execution models, your choice per connection:**
+  - **Coroutines** (`make_dispatcher(...)`) — `Task`/`co_await`, the original model. Connection state lives implicitly in the coroutine frame, which can migrate freely between worker threads.
+  - **Reactor** (`make_reactor_dispatcher(...)`) — plain callbacks over an explicit state machine (`BufferedConnection` + phase enum), no `<coroutine>` dependency, no coroutine-frame allocation. Works with `-DSPAZNET_ENABLE_COROUTINES=OFF`.
+  - Both hit the identical protocol codec and the identical handler object where the handler shape allows it (HTTP/1.1, HTTP/2, UDP, QUIC/HTTP3); only the execution model differs. See *Execution Models* below.
 - **Thread-safe:** Single-threaded by default, or multi-threaded with a small fixed set of mutexes (see *Concurrency Primitives* below and `docs/mutex-vs-atomics.md`)
 - **Protocol support:**
   - UDP
@@ -19,7 +21,46 @@ A high-performance, cross-platform network server library written in C++20 using
   - QUIC & HTTP/3 (partial)
   - WebSockets
 
+
+
+## Execution Models: Coroutines vs. Reactor
+
+Every protocol under `example/<protocol>/` exposes two dispatcher factories that speak the exact same wire protocol:
+
+```cpp
+// Coroutine dispatcher: Task/co_await under the hood.
+server.set_connection_handler(
+    spaznet::http::make_dispatcher(std::make_unique<MyHTTPHandler>()));
+
+// Reactor dispatcher: plain callbacks, no coroutine dependency.
+server.set_connection_factory(
+    spaznet::http::make_reactor_dispatcher(std::make_unique<MyHTTPHandler>()));
+```
+
+| | Coroutine (`make_dispatcher`) | Reactor (`make_reactor_dispatcher`) |
+|---|---|---|
+| Connection state lives in | the coroutine frame (implicit, across `co_await`) | ordinary member variables of a phase state machine (explicit) |
+| Requires C++20 `<coroutine>` | Yes | No |
+| Builds with `-DSPAZNET_ENABLE_COROUTINES=OFF` | No | Yes |
+| Can migrate between `Server(N)` worker threads | Yes, at every `co_await` | No — see below |
+| Registered via | `Server::set_connection_handler` | `Server::set_connection_factory` |
+
+Pick coroutines when you want `co_await`-style linear code and don't mind the C++20 coroutine dependency. Pick the reactor model when you need a coroutine-free build (older toolchains, embedded targets, or code that just prefers explicit state machines), or when you're calling into `libspaznet` from a context where `<coroutine>` isn't available at all.
+
+One threading caveat: reactor connection state is only safe to touch from the thread that runs the event loop, so `Server(N)`'s worker threads add parallelism for coroutine `Task`s but **not** for reactor I/O — a reactor server's throughput is currently flat across `N`. See [`docs/reactor-threading.md`](docs/reactor-threading.md) for why, and the multi-loop design that would change that.
+
+For the full picture — how coroutines schedule, why reactor state can't migrate, the CMake option and header guards, and a state-machine authoring guide for a new reactor dispatcher — see:
+
+- [`docs/concurrency-and-coroutines.md`](docs/concurrency-and-coroutines.md) — coroutine scheduling model and the "Reactor Threading Model" section
+- [`docs/coro-free-build.md`](docs/coro-free-build.md) — the coroutine-free build matrix and reactor authoring rules
+- [`docs/threading.md`](docs/threading.md) — `Server(N)` tuning for both models
+- [`docs/reactor-threading.md`](docs/reactor-threading.md) — reactor scaling analysis
+
+
+
 ## Quick Start
+
+
 
 ### Building
 
@@ -33,6 +74,8 @@ cmake ..
 make
 ```
 
+
+
 ### Running Tests
 
 ```bash
@@ -44,6 +87,8 @@ make test-unit
 make test-integration
 make test-performance
 ```
+
+
 
 ### Code Quality
 
@@ -62,16 +107,20 @@ make check-cppcheck  # cppcheck
 make lint
 ```
 
+
+
 ## Threading Modes
 
 The `Server` constructor accepts a thread count parameter:
 
-- **`Server(0)`** - Single-threaded mode: All work runs on the main event loop thread
-- **`Server(N)`** - Multi-threaded mode: N worker threads process coroutines in parallel
+- `Server(0)` - Single-threaded mode: All work runs on the main event loop thread
+- `Server(N)` - Multi-threaded mode: N worker threads process coroutines in parallel
 
-Coroutines can migrate between threads as they await I/O operations. The scheduler uses a small, fixed set of `std::mutex`es (see *Concurrency Primitives* below); everything else on the hot path is `std::atomic<…>`.
+This applies fully to the **coroutine** dispatchers: coroutines can migrate between threads as they await I/O operations. The scheduler uses a small, fixed set of `std::mutex`es (see *Concurrency Primitives* below); everything else on the hot path is `std::atomic<…>`.
 
-For performance characteristics across different thread counts, see `thread_mode_report.md` (generated by `./bench_thread_modes`).
+For **reactor** dispatchers, `N` currently has no effect on I/O throughput: exactly one thread per `Server` ever calls into `on_readable()`/`on_writable()` (the thread that calls `Server::run()`), so worker threads only help offloaded, non-I/O work posted via `IOContext::post()`. See [`docs/reactor-threading.md`](docs/reactor-threading.md) for the full explanation and a proposed multi-loop design that would let reactor I/O scale with `N` too.
+
+For performance characteristics across different thread counts and both execution models, see `thread_mode_report.md` (generated by `./bench_thread_modes`).
 
 ## Testing
 
@@ -92,9 +141,12 @@ Or run tests individually:
 ./test_performance    # Run performance benchmarks
 ```
 
+
+
 ### Test Coverage
 
 **Unit Tests:**
+
 - Task and TaskQueue (coroutine scheduling, thread safety)
 - PlatformIO implementations (epoll/kqueue/poll/IOCP)
 - IOContext (event loop, task scheduling)
@@ -105,6 +157,7 @@ Or run tests individually:
 - HTTP/3 handler (partial)
 
 **Integration Tests:**
+
 - TCP server (connection handling, multiple ports)
 - HTTP server (request/response cycle, multiple requests)
 - WebSocket server (frame handling, ping/pong)
@@ -112,10 +165,13 @@ Or run tests individually:
 - Concurrent connections (load testing, burst connections)
 
 **Performance Tests:**
+
 - Throughput benchmarks (requests per second)
 - Latency measurements (min, max, mean, median, P95, P99)
 - Concurrent connection performance
 - iperf/iperf3 integration for bandwidth testing
+
+
 
 ### Performance Benchmarking
 
@@ -151,6 +207,8 @@ make format        # Format all files
 make check-format  # Check formatting without modifying files
 ```
 
+
+
 ### clang-tidy
 
 Run static analysis:
@@ -158,6 +216,8 @@ Run static analysis:
 ```bash
 make check-tidy
 ```
+
+
 
 ### cppcheck
 
@@ -167,6 +227,8 @@ Run additional static analysis:
 make check-cppcheck
 ```
 
+
+
 ### Combined Checks
 
 Run all code quality checks:
@@ -174,6 +236,8 @@ Run all code quality checks:
 ```bash
 make lint
 ```
+
+
 
 ## Example Usage
 
@@ -211,23 +275,40 @@ int main() {
 }
 ```
 
+`MyHTTPHandler` above works unchanged with the reactor dispatcher too — only how the connection replays it differs:
+
+```cpp
+int main() {
+    spaznet::Server server(0);  // N has no effect on reactor I/O; see Threading Modes
+    server.set_connection_factory(
+        spaznet::http::make_reactor_dispatcher(std::make_unique<MyHTTPHandler>()));
+    server.listen_tcp(8080);
+    server.run();
+    return 0;
+}
+```
+
+This variant has no coroutine dependency and compiles under `-DSPAZNET_ENABLE_COROUTINES=OFF`.
+
 Core ships only the low-level server.  Each protocol — HTTP/1.1,
 WebSocket, HTTP/2, UDP, QUIC + HTTP/3 — is an `example/<protocol>/`
 library you link in addition to `spaznet::spaznet`.  Working demos
 under `example/*/demo/` (see each directory's `README.md` for details):
 
-| Protocol | Binary | Description |
-|---|---|---|
-| **HTTP/1.x** | `http_hello` | Minimal `HTTPHandler` that always returns a fixed body |
-| | `http_showcase` | HTTP/1.0 vs 1.1 differences (keep-alive, chunked framing, request bodies) |
-| **WebSocket** | `ws_echo` | Minimal echo; also serves plain HTTP on the same port |
-| | `ws_chat` | Multi-client broadcast chat with a browser HTML+JS page |
-| **HTTP/2** | `http2_hello` | Minimal h2c (prior-knowledge) hello world |
-| | `http2_showcase` | Stream multiplexing via `/slow?ms=N`, plus HPACK/DATA routes |
-| **QUIC-HTTP/3** | --- | None yet |
-| **UDP** | `udp_echo` | Minimal datagram echo |
-| | `udp_relay` | Connectionless peer table + fan-out ("chat" over UDP) |
-| | `udp_statsd` | Fire-and-forget metrics aggregator (statsd-style line protocol) |
+
+| Protocol        | Binary           | Description                                                               |
+| --------------- | ---------------- | ------------------------------------------------------------------------- |
+| **HTTP/1.x**    | `http_hello`     | Minimal `HTTPHandler` that always returns a fixed body                    |
+|                 | `http_showcase`  | HTTP/1.0 vs 1.1 differences (keep-alive, chunked framing, request bodies) |
+| **WebSocket**   | `ws_echo`        | Minimal echo; also serves plain HTTP on the same port                     |
+|                 | `ws_chat`        | Multi-client broadcast chat with a browser HTML+JS page                   |
+| **HTTP/2**      | `http2_hello`    | Minimal h2c (prior-knowledge) hello world                                 |
+|                 | `http2_showcase` | Stream multiplexing via `/slow?ms=N`, plus HPACK/DATA routes              |
+| **QUIC-HTTP/3** | ---              | None yet                                                                  |
+| **UDP**         | `udp_echo`       | Minimal datagram echo                                                     |
+|                 | `udp_relay`      | Connectionless peer table + fan-out ("chat" over UDP)                     |
+|                 | `udp_statsd`     | Fire-and-forget metrics aggregator (statsd-style line protocol)           |
+
 
 ```bash
 ./build/example/http/http_hello
@@ -250,12 +331,13 @@ porting code from before the restructure.
 
 ## Architecture
 
-- **IOContext:** Manages the event loop and coroutine scheduling
-- **PlatformIO:** Platform-specific I/O multiplexing abstraction
-- **Server:** High-level server interface
-- **Handlers:** Protocol-specific request handlers (UDP, HTTP, HTTP/2, WebSocket, QUIC, HTTP/3)
+- **IOContext:** Manages the event loop, the fd readiness table, timers, and — for the coroutine model — coroutine scheduling across worker threads
+- **PlatformIO:** Platform-specific I/O multiplexing abstraction (epoll/kqueue/poll/IOCP), shared by both execution models
+- **IoHandler:** The reactor primitive underneath both models — a plain `on_readable`/`on_writable`/`on_error` interface. Coroutine resumption is implemented as one `IoHandler` (`CoroutineResumeHandler`); a reactor connection's `BufferedConnection` is another. Neither is a privileged special case.
+- **Server:** High-level server interface; `set_connection_handler` wires up a coroutine dispatcher, `set_connection_factory` wires up a reactor one
+- **Handlers:** Protocol-specific request handlers (UDP, HTTP, HTTP/2, WebSocket, QUIC, HTTP/3), each with a coroutine dispatcher and a reactor dispatcher sharing the same codec
 
-The library uses C++20 coroutines for async operations; worker threads are optional and exist only to run multiple coroutines in parallel. Most state on the hot path is held in `std::atomic<…>`; structural mutations are guarded by a small set of mutexes (see *Concurrency Primitives* below).
+Coroutines are the optional layer, not the foundation: the reactor core (`IoHandler`, `BufferedConnection`, `post()`/timers) builds and runs with zero coroutine dependency, and coroutine support is an adapter on top of it, gated by the `SPAZNET_ENABLE_COROUTINES` CMake option (default `ON`). See *Execution Models* above. Most state on the hot path is held in `std::atomic<…>`; structural mutations are guarded by a small set of mutexes (see *Concurrency Primitives* below).
 
 ### Concurrency Primitives
 
@@ -263,18 +345,20 @@ The library uses C++20 coroutines for async operations; worker threads are optio
 
 #### Core library (`src/`, `include/libspaznet/`)
 
-| Location | File | Backend | Guards |
-|---|---|---|---|
-| `TaskQueue::mutex_` | `include/libspaznet/platform/io_context.hpp` | all | both ends of each worker's task queue |
-| `IOContext::timer_mutex_` | `include/libspaznet/platform/io_context.hpp` | all | timer min-heap + cancelled-set + suspended-tasks map |
-| `IOContext::map_lock_` | `include/libspaznet/platform/io_context.hpp` | all | `pending_io_` map and platform `add_fd` / `modify_fd` / `remove_fd` side-table updates |
-| `IOContext::worker_wake_mutex_` | `include/libspaznet/platform/io_context.hpp` | all | pairs with `worker_wake_cv_`; idle workers park here instead of busy-yielding |
-| `IOContext::worker_join_mutex_` | `include/libspaznet/platform/io_context.hpp` | all | serializes `join_workers()` between `run()`'s exit path and `~IOContext` |
-| `Server::listen_fds_mutex_` | `include/libspaznet/server.hpp` | all | listening-socket vector |
-| `Server::client_fds_mutex_` | `include/libspaznet/server.hpp` | all | active-client-fd set used by `Server::stop()` to drain in-flight connections |
-| `PlatformIOPoll::mutex_` | `src/platform/platform_io_poll.cpp` | poll / WSAPoll | interest-set tables (`pollfds_` / `fd_info_`); compiled when `USE_POLL` is selected (non-Windows default fallback, or `-DSPAZNET_FORCE_POLL=ON` on Windows) |
-| `PlatformIOIOCP::mutex_` | `src/platform/platform_io_iocp.cpp` | IOCP (Winsock) | IOCP fd/probe tables; compiled when `USE_IOCP` is selected (default on Windows) |
-| `detail::ensure_winsock()` `once_flag` | `include/libspaznet/detail/socket_compat.hpp` | Winsock | process-wide `WSAStartup` / `WSACleanup`; fires at most once (not a `std::mutex`) |
+
+| Location                               | File                                          | Backend        | Guards                                                                                                                                                      |
+| -------------------------------------- | --------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TaskQueue::mutex_`                    | `include/libspaznet/platform/io_context.hpp`  | all            | both ends of each worker's task queue                                                                                                                       |
+| `IOContext::timer_mutex_`              | `include/libspaznet/platform/io_context.hpp`  | all            | timer min-heap + cancelled-set + suspended-tasks map                                                                                                        |
+| `IOContext::map_lock_`                 | `include/libspaznet/platform/io_context.hpp`  | all            | `pending_io_` map and platform `add_fd` / `modify_fd` / `remove_fd` side-table updates                                                                      |
+| `IOContext::worker_wake_mutex_`        | `include/libspaznet/platform/io_context.hpp`  | all            | pairs with `worker_wake_cv_`; idle workers park here instead of busy-yielding                                                                               |
+| `IOContext::worker_join_mutex_`        | `include/libspaznet/platform/io_context.hpp`  | all            | serializes `join_workers()` between `run()`'s exit path and `~IOContext`                                                                                    |
+| `Server::listen_fds_mutex_`            | `include/libspaznet/server.hpp`               | all            | listening-socket vector                                                                                                                                     |
+| `Server::client_fds_mutex_`            | `include/libspaznet/server.hpp`               | all            | active-client-fd set used by `Server::stop()` to drain in-flight connections                                                                                |
+| `PlatformIOPoll::mutex_`               | `src/platform/platform_io_poll.cpp`           | poll / WSAPoll | interest-set tables (`pollfds_` / `fd_info_`); compiled when `USE_POLL` is selected (non-Windows default fallback, or `-DSPAZNET_FORCE_POLL=ON` on Windows) |
+| `PlatformIOIOCP::mutex_`               | `src/platform/platform_io_iocp.cpp`           | IOCP (Winsock) | IOCP fd/probe tables; compiled when `USE_IOCP` is selected (default on Windows)                                                                             |
+| `detail::ensure_winsock()` `once_flag` | `include/libspaznet/detail/socket_compat.hpp` | Winsock        | process-wide `WSAStartup` / `WSACleanup`; fires at most once (not a `std::mutex`)                                                                           |
+
 
 Everything else in core — coroutine ref-counts, the per-fd generation counter that defeats fd-reuse, statistics, timer ids, `running_` / `active_connections_` flags, etc. — lives in `std::atomic<…>` and never reaches for a mutex.
 
@@ -284,21 +368,27 @@ See `docs/mutex-vs-atomics.md` for why the core locks are mutexes rather than at
 
 These ship with the optional protocol stacks under `example/`; they are not part of the core `spaznet` target and are not demos. Backend is `—` because they sit above the demux.
 
-| Location | File | Backend | Guards |
-|---|---|---|---|
-| `WriteGate::m` | `example/http-websocket/src/dispatcher.cpp` | — | fair async write gate so dispatcher control frames and application `send()` cannot interleave on one connection |
-| `ConnState::mu` | `example/http2/src/dispatcher.cpp` | — | per-connection HTTP/2 state and the serialized outbound frame queue |
+
+| Location        | File                                        | Backend | Guards                                                                                                          |
+| --------------- | ------------------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------- |
+| `WriteGate::m`  | `example/http-websocket/src/dispatcher.cpp` | —       | fair async write gate so dispatcher control frames and application `send()` cannot interleave on one connection |
+| `ConnState::mu` | `example/http2/src/dispatcher.cpp`          | —       | per-connection HTTP/2 state and the serialized outbound frame queue                                             |
+
+
+
 
 #### Demos only (`example/*/demo`)
 
 Demo binaries may take locks for application-level shared state. None of these are linked into the core library or the protocol example libraries.
 
-| Demo | Location | File | Backend | Guards |
-|---|---|---|---|---|
-| `ws_chat` | `ChatRoom::mu_` | `example/http-websocket/demo/chat.cpp` | — | room session map (`sessions_`) across `on_open` / `on_close` / `broadcast` |
-| `ws_chat` | `Session::mu` | `example/http-websocket/demo/chat.cpp` | — | that session's outbound message outbox |
-| `udp_relay` | `Relay::peers_mutex_` | `example/udp/demo/relay.cpp` | — | peer table shared across datagram worker threads |
-| `udp_statsd` | `StatsdAggregator::mutex_` | `example/udp/demo/statsd.cpp` | — | counter/gauge maps between the handler and the reporter thread |
+
+| Demo         | Location                   | File                                   | Backend | Guards                                                                     |
+| ------------ | -------------------------- | -------------------------------------- | ------- | -------------------------------------------------------------------------- |
+| `ws_chat`    | `ChatRoom::mu_`            | `example/http-websocket/demo/chat.cpp` | —       | room session map (`sessions_`) across `on_open` / `on_close` / `broadcast` |
+| `ws_chat`    | `Session::mu`              | `example/http-websocket/demo/chat.cpp` | —       | that session's outbound message outbox                                     |
+| `udp_relay`  | `Relay::peers_mutex_`      | `example/udp/demo/relay.cpp`           | —       | peer table shared across datagram worker threads                           |
+| `udp_statsd` | `StatsdAggregator::mutex_` | `example/udp/demo/statsd.cpp`          | —       | counter/gauge maps between the handler and the reporter thread             |
+
 
 Other demos (`http_hello`, `http_showcase`, `http2_*`, `ws_echo`, `udp_echo`, etc.) do not introduce their own mutexes.
 
@@ -320,37 +410,48 @@ For detailed information about the coroutine execution model, thread scheduling,
 
 ## Documentation
 
-| Topic | File |
-|---|---|
-| **What's stable, what's not** | [`docs/api-status.md`](docs/api-status.md) |
-| HTTP/1.1 handler API | [`docs/http.md`](docs/http.md) |
-| WebSocket handler API | [`docs/websocket.md`](docs/websocket.md) |
-| QUIC + HTTP/3 walkthrough | [`docs/quic-http3.md`](docs/quic-http3.md) |
-| QUIC security model | [`docs/quic-security.md`](docs/quic-security.md) |
-| Threading & tuning | [`docs/threading.md`](docs/threading.md) |
-| Coroutine model | [`docs/concurrency-and-coroutines.md`](docs/concurrency-and-coroutines.md) |
-| Building without coroutines (reactor runtime) | [`docs/coro-free-build.md`](docs/coro-free-build.md) |
-| Coroutine pitfalls (don't do these) | [`docs/coroutine-pitfalls.md`](docs/coroutine-pitfalls.md) |
-| Mutex vs. atomic posture | [`docs/mutex-vs-atomics.md`](docs/mutex-vs-atomics.md) |
-| Performance numbers | [`docs/performance.md`](docs/performance.md) |
-| Integrating libspaznet into your project | [`docs/integration.md`](docs/integration.md) |
-| Migration / breaking changes | [`docs/migration.md`](docs/migration.md) |
-| API reference (Doxygen) | [`docs/doxygen.md`](docs/doxygen.md) |
-| Contributing | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
-| Changelog | [`CHANGELOG.md`](CHANGELOG.md) |
+
+| Topic                                         | File                                                                       |
+| --------------------------------------------- | -------------------------------------------------------------------------- |
+| **What's stable, what's not**                 | `[docs/api-status.md](docs/api-status.md)`                                 |
+| HTTP/1.1 handler API                          | `[docs/http.md](docs/http.md)`                                             |
+| WebSocket handler API                         | `[docs/websocket.md](docs/websocket.md)`                                   |
+| QUIC + HTTP/3 walkthrough                     | `[docs/quic-http3.md](docs/quic-http3.md)`                                 |
+| QUIC security model                           | `[docs/quic-security.md](docs/quic-security.md)`                           |
+| Threading & tuning                            | `[docs/threading.md](docs/threading.md)`                                   |
+| Reactor multi-loop (not yet implemented)      | `[docs/reactor-threading.md](docs/reactor-threading.md)`                   |
+| Coroutine model                               | `[docs/concurrency-and-coroutines.md](docs/concurrency-and-coroutines.md)` |
+| Building without coroutines (reactor runtime) | `[docs/coro-free-build.md](docs/coro-free-build.md)`                       |
+| Coroutine pitfalls (don't do these)           | `[docs/coroutine-pitfalls.md](docs/coroutine-pitfalls.md)`                 |
+| Mutex vs. atomic posture                      | `[docs/mutex-vs-atomics.md](docs/mutex-vs-atomics.md)`                     |
+| Performance numbers                           | `[docs/performance.md](docs/performance.md)`                               |
+| Integrating libspaznet into your project      | `[docs/integration.md](docs/integration.md)`                               |
+| Migration / breaking changes                  | `[docs/migration.md](docs/migration.md)`                                   |
+| API reference (Doxygen)                       | `[docs/doxygen.md](docs/doxygen.md)`                                       |
+| Contributing                                  | `[CONTRIBUTING.md](CONTRIBUTING.md)`                                       |
+| Changelog                                     | `[CHANGELOG.md](CHANGELOG.md)`                                             |
+
+
+
 
 ## Requirements
 
-- C++20 compiler with `<format>` support: **GCC 13.1+** or **Clang 17+**
-  (with libstdc++ from gcc 13+, or libc++).
+- C++20 compiler with++ `<format>` ++support: **GCC 13.1+** or **Clang 17+**
+(with libstdc++ from gcc 13+, or libc++).
 - CMake 3.20+
 - Make (optional, for convenience targets)
+- The `SPAZNET_ENABLE_COROUTINES` CMake option (default `ON`) gates the
+coroutine execution model and its `<coroutine>` dependency; the reactor
+model has no such dependency. Set `-DSPAZNET_ENABLE_COROUTINES=OFF` to
+build the core library, every protocol, every demo, and the full test
+suite with zero coroutine code compiled in — see
+[docs/coro-free-build.md](docs/coro-free-build.md).
 - **OpenSSL 3.5+** — only required when building the QUIC v1 + HTTP/3
-  stack. The CMake option `SPAZNET_BUILD_QUIC` (default `ON`) gates this:
-  if OpenSSL 3.5+ isn't available, CMake prints a warning and disables
-  the QUIC build automatically; the rest of the library (UDP, HTTP/1.1,
-  HTTP/2, WebSocket) still builds with no OpenSSL dependency. To turn
-  it off explicitly:
+stack. The CMake option `SPAZNET_BUILD_QUIC` (default `ON`) gates this:
+if OpenSSL 3.5+ isn't available, CMake prints a warning and disables
+the QUIC build automatically; the rest of the library (UDP, HTTP/1.1,
+HTTP/2, WebSocket) still builds with no OpenSSL dependency. To turn
+it off explicitly:
   ```
   cmake -B build -DSPAZNET_BUILD_QUIC=OFF
   ```
@@ -366,6 +467,8 @@ deep in compilation.
 - clang-tidy (for static analysis)
 - cppcheck (for additional static analysis)
 - iperf2 or iperf3 (for performance benchmarking)
+
+
 
 ## Development Workflow
 

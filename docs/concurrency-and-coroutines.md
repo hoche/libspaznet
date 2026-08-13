@@ -138,8 +138,8 @@ CPU-bound coroutine `Task`s and `post()`ed callbacks that don't touch
 `BufferedConnection` state directly, not for the I/O readiness loop.
 Sharding across N independent loops, each with its own connections
 pinned to it, would need a different (bigger) change than this one; see
-the reactor-port plan's `threading` milestone note for why it wasn't
-needed here.
+[`reactor-threading.md`](reactor-threading.md) for the analysis and the
+design that would actually scale reactor I/O across cores.
 
 ## TaskQueue Internal Structure
 
