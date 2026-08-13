@@ -11,21 +11,27 @@
 #include <libspaznet/quic/transport_params.hpp>
 
 // Opaque TLS handles — OpenSSL uses ssl_st / ssl_ctx_st; wolfSSL uses
-// WOLFSSL / WOLFSSL_CTX. Keep both out of this public header.
+// WOLFSSL / WOLFSSL_CTX. Forward-declare at global scope (matching the
+// backends' own declarations); aliases live in spaznet::quic below so
+// callers can write quic::TlsSslCtx.
 #if defined(SPAZNET_TLS_WOLFSSL)
 struct WOLFSSL;
 struct WOLFSSL_CTX;
-using TlsSsl = WOLFSSL;
-using TlsSslCtx = WOLFSSL_CTX;
 #else
 struct ssl_st;
 struct ssl_ctx_st;
-using TlsSsl = ssl_st;
-using TlsSslCtx = ssl_ctx_st;
 #endif
 
 namespace spaznet {
 namespace quic {
+
+#if defined(SPAZNET_TLS_WOLFSSL)
+using TlsSsl = WOLFSSL;
+using TlsSslCtx = WOLFSSL_CTX;
+#else
+using TlsSsl = ssl_st;
+using TlsSslCtx = ssl_ctx_st;
+#endif
 
 // QUIC encryption levels, matching OpenSSL's protection-level numbering.
 enum class EncryptionLevel : uint8_t {
