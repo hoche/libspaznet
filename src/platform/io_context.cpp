@@ -99,8 +99,8 @@ IOContext::IOContext(std::size_t num_threads)
 #ifdef SPAZNET_HAS_COROUTINES
       thread_queues_((std::max)(std::size_t{1}, num_threads == 0 ? 1 : num_threads)),
 #endif
-      callback_queues_((std::max)(std::size_t{1}, num_threads == 0 ? 1 : num_threads)), running_(false),
-      next_queue_(0), num_threads_(num_threads),
+      callback_queues_((std::max)(std::size_t{1}, num_threads == 0 ? 1 : num_threads)),
+      io_thread_id_(std::thread::id{}), running_(false), next_queue_(0), num_threads_(num_threads),
       queue_count_((std::max)(std::size_t{1}, num_threads == 0 ? 1 : num_threads)) {
 #ifdef _WIN32
     // Must run before platform_io_->init() — IOCP itself, and every
@@ -196,6 +196,10 @@ auto IOContext::drain_wakeup_pipe() const -> void {
 
 void IOContext::run() {
     running_.store(true, std::memory_order_release);
+    // Publish this thread's identity before spawning workers or entering
+    // the loop, so post_to_io_thread()'s "already on the IO thread" fast
+    // path is correct from the very first call any thread makes.
+    io_thread_id_.store(std::this_thread::get_id(), std::memory_order_release);
 
     // Join workers even if the event loop throws — otherwise ~IOContext would
     // destroy worker_wake_mutex_ under a parked condition_variable::wait().
@@ -209,6 +213,12 @@ void IOContext::run() {
             }
             self->wakeup_event_loop();
             self->join_workers();
+            // No thread is running the loop anymore: post_to_io_thread()
+            // must queue rather than run inline from here on (there's
+            // nothing left to drain io_thread_queue_, so those callbacks
+            // would simply never run — same accepted "leak over deadlock"
+            // posture as post()'s callback_queues_ after stop()).
+            self->io_thread_id_.store(std::thread::id{}, std::memory_order_release);
         }
     } join_guard{this};
 
@@ -266,6 +276,20 @@ void IOContext::run() {
         for (auto& queue : callback_queues_) {
             std::function<void()> fn;
             while (queue.dequeue(fn)) {
+                if (fn) {
+                    fn();
+                }
+            }
+        }
+
+        // Drain IO-thread-affine callbacks (post_to_io_thread()). Unlike
+        // callback_queues_ above, worker_thread() never touches this queue
+        // — draining it only here, on the same thread that just called
+        // on_readable()/on_writable() via process_io_events() above, is
+        // what gives post_to_io_thread() its single-thread guarantee.
+        {
+            std::function<void()> fn;
+            while (io_thread_queue_.dequeue(fn)) {
                 if (fn) {
                     fn();
                 }
@@ -365,6 +389,34 @@ void IOContext::post(std::function<void()> fn) {
         std::lock_guard<std::mutex> lock(worker_wake_mutex_);
         worker_wake_cv_.notify_one();
     }
+    wakeup_event_loop();
+}
+
+auto IOContext::is_io_thread() const -> bool {
+    return std::this_thread::get_id() == io_thread_id_.load(std::memory_order_acquire);
+}
+
+void IOContext::post_to_io_thread(std::function<void()> fn) {
+    if (!fn) {
+        return;
+    }
+    if (is_io_thread()) {
+        // Already there: run inline, synchronously, right now. This is
+        // what keeps a ResponseWriter that completes before
+        // handle_request() returns (the overwhelmingly common case, and
+        // always true when the calling code is itself already running on
+        // the IO thread — e.g. nested inside on_data()) exactly as cheap
+        // as a direct call, with no queue hop and no behavior change from
+        // before this primitive existed.
+        fn();
+        return;
+    }
+    // Not on the IO thread: queue for the next loop iteration. No
+    // round-robining across callback_queues_ here — io_thread_queue_ is a
+    // single queue, deliberately, so every caller lands on the one thread
+    // that also drives on_readable()/on_writable(), regardless of how
+    // many worker threads this IOContext has.
+    io_thread_queue_.enqueue(std::move(fn));
     wakeup_event_loop();
 }
 

@@ -34,11 +34,14 @@ This document explains how `libspaznet` schedules work, how coroutines move betw
 > (`ResponseWriter`-based, like HTTP/1.1) under *both* of its
 > dispatchers — its coroutine dispatcher just calls it as a plain
 > function and `co_await`s the writer's completion internally; see
-> `docs/http.md`'s "Two dispatchers" section for HTTP/2. Only the
-> `threading` and `coro-free-build` milestones remain before every
-> protocol's reactor path gets per-loop affinity and the whole library
-> builds coroutine-free end to end. A full rewrite of this document for
-> the dual-runtime model is tracked alongside that work.
+> `docs/http.md`'s "Two dispatchers" section for HTTP/2. The `threading`
+> milestone landed `IOContext::post_to_io_thread`/`is_io_thread()` (see
+> the new "Reactor Threading Model" section below) — every reactor
+> dispatcher's `ResponseWriter` completion and cross-connection send now
+> goes through it, and HTTP/2's former per-connection `recursive_mutex`
+> is gone as a result. Only `coro-free-build` remains before the whole
+> library builds coroutine-free end to end. A full rewrite of this
+> document for the dual-runtime model is tracked alongside that work.
 
 ## Architecture Overview
 
@@ -73,6 +76,66 @@ This document explains how `libspaznet` schedules work, how coroutines move betw
 - Timers are placed in a min-heap and, when due, their coroutine handles are also rescheduled.
 - Workers and the main loop both drain queues: every resume that yields again must be resubmitted via `schedule`.
 - `wait()` retries internally on `EINTR`, and a peer half-close (`EPOLLHUP` / `EV_EOF` / `POLLHUP`) wakes the read-waiter so `recv()` returns 0 instead of hanging.
+
+## Reactor Threading Model
+
+The section above describes the coroutine runtime's threading model —
+frames migrate freely between the main loop and worker threads because
+each `Task` is self-contained. A reactor state machine (`BufferedConnection`
+and everything built on it: `Http1Connection`, `Http2Connection`,
+`WsConnection`, ...) is the opposite: its state lives in ordinary member
+variables, and those are only ever safe to touch from one thread.
+
+**Only one thread per `IOContext` ever calls `PlatformIO::wait()` and
+invokes `on_readable()`/`on_writable()`** — the thread that called `run()`
+(see `IOContext::run()`'s main loop and `process_io_events()`). Worker
+threads spawned for `num_threads_ > 0` never call into `PlatformIO`
+directly; they only drain `thread_queues_` (coroutine `Task`s) and
+`callback_queues_` (plain `post()`ed callbacks). So a reactor connection's
+own `on_data()`/`on_closed()` are single-threaded by construction, with no
+lock needed, for exactly the same reason the diagram above shows
+coroutines migrating between threads freely: there's only one "loop" per
+`IOContext` in this codebase, and I/O readiness dispatch never leaves it.
+
+The risk is anything that touches that same connection state from
+*outside* that call chain — chiefly a `ResponseWriter` completion arriving
+from a background thread, or one connection's handler reaching into a
+different connection (WebSocket broadcast). `IOContext::post(fn)` doesn't
+fix this: it round-robins across `callback_queues_`, which *any* worker
+thread (or the main loop, interleaved between iterations) may drain —
+exactly the mechanism that produced a real double-free in HTTP/2's
+reactor dispatcher under concurrent deferred completions (see
+`CHANGELOG.md`'s "HTTP/2 reactor dispatcher" entry), fixed at the time
+with a per-connection `recursive_mutex`.
+
+**`IOContext::post_to_io_thread(fn)`** replaces that mutex with affinity
+instead of locking: it's backed by a queue drained *only* inside `run()`'s
+own loop, never by `worker_thread()`. If the caller is already on the IO
+thread, `fn` runs inline, synchronously — no queue hop, so a handler that
+completes its `ResponseWriter` before returning (the common case) costs
+exactly what it always did. Otherwise `fn` is queued and runs on the IO
+thread's next iteration. `IOContext::is_io_thread()` exposes the same
+check for assertions. Every reactor dispatcher's `ResponseWriter`
+completion (`example/http`'s and `example/http2`'s `on_response_ready`)
+and `websocket::reactor::Connection::send()` route through it, which is
+why `Http2Connection` no longer needs a lock at all — every entry point
+that mutates its state is now provably reached from one thread only,
+enforced with `assert(ctx_.is_io_thread())` rather than a runtime lock.
+
+`Server::stop()`'s reactor-connection teardown uses the same primitive for
+the same reason: tearing down connections from `stop()`'s caller thread
+(or a worker, under the old `post()`) while the IO thread might still be
+mid-`on_readable()` for one of them is the identical hazard.
+
+This does **not** mean the reactor runtime scales I/O demultiplexing
+itself across cores — there is still exactly one `PlatformIO::wait()`
+caller per `IOContext`. `num_threads_` workers add parallelism for
+CPU-bound coroutine `Task`s and `post()`ed callbacks that don't touch
+`BufferedConnection` state directly, not for the I/O readiness loop.
+Sharding across N independent loops, each with its own connections
+pinned to it, would need a different (bigger) change than this one; see
+the reactor-port plan's `threading` milestone note for why it wasn't
+needed here.
 
 ## TaskQueue Internal Structure
 

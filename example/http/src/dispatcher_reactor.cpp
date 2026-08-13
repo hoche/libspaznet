@@ -19,6 +19,19 @@
 // is just a BufferedConnection::write() call (it manages its own
 // backpressure via OutputBuffer), and closing is a terminal action
 // (close() / close_after_flush()) rather than a state we wait in.
+//
+// Threading: on_data() only ever runs on the IOContext's IO thread (only
+// that thread calls PlatformIO::wait()/process_io_events() — see
+// IOContext::run()), so buffer_/phase_/closing_ are safe there without a
+// lock. But a deferred ResponseWriter can complete from ANY thread (a
+// background thread, a timer, another connection's callback), and
+// on_response_ready() mutates the exact same fields. The ResponseWriter's
+// deliver callback below routes the actual work through
+// ctx_.post_to_io_thread(), which is a no-op queue hop when already on
+// the IO thread (the synchronous-completion case) and marshals onto it
+// otherwise — so on_response_ready() itself never needs to worry about
+// which thread it's running on; it's always the IO thread. See
+// docs/concurrency-and-coroutines.md's threading section.
 
 #include <libspaznet/http/dispatcher.hpp>
 #include <libspaznet/http/handler.hpp>
@@ -178,7 +191,14 @@ class Http1Connection : public std::enable_shared_from_this<Http1Connection> {
 
             auto self = shared_from_this();
             ResponseWriter writer([self, keep_alive](HTTPResponse response) {
-                self->on_response_ready(std::move(response), keep_alive);
+                // deliver() itself may run on any thread (see the class
+                // comment); post_to_io_thread() guarantees
+                // on_response_ready() always runs on this connection's
+                // IO thread, inline immediately if we're already there.
+                self->ctx_.post_to_io_thread(
+                    [self, keep_alive, response = std::move(response)]() mutable {
+                        self->on_response_ready(std::move(response), keep_alive);
+                    });
             });
 
             dispatch_call_active_ = true;
@@ -208,12 +228,12 @@ class Http1Connection : public std::enable_shared_from_this<Http1Connection> {
         }
     }
 
-    // The ResponseWriter completion callback: may run synchronously
-    // (nested inside handle_request(), itself nested inside
+    // Always runs on the IO thread (see try_process()'s ResponseWriter
+    // construction and the class comment above) — but still either
+    // synchronously (nested inside handle_request(), itself nested inside
     // try_process()'s while loop above) or asynchronously, arbitrarily
-    // later, from any thread. dispatch_call_active_ is how it tells
-    // those two cases apart, since phase_ alone can't (both start from
-    // Dispatching).
+    // later. dispatch_call_active_ is how it tells those two cases apart,
+    // since phase_ alone can't (both start from Dispatching).
     void on_response_ready(HTTPResponse response, bool keep_alive) {
         ctx_.decrement_active_requests();
         // Flip back to ReadingRequest before touching conn_ below: if

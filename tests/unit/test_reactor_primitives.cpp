@@ -92,6 +92,80 @@ TEST_F(ReactorPrimitivesTest, PostFromMultipleThreadsAllRun) {
     EXPECT_TRUE(wait_until([&] { return counter.load() == kPosters * kPerThread; }, 2000ms));
 }
 
+TEST_F(ReactorPrimitivesTest, PostToIoThreadRunsOnEventLoop) {
+    std::atomic<bool> ran{false};
+    context->post_to_io_thread([&ran]() { ran.store(true); });
+    EXPECT_TRUE(wait_until([&] { return ran.load(); }));
+}
+
+TEST_F(ReactorPrimitivesTest, PostToIoThreadFromOtherThreadRunsOnIoThread) {
+    // Called from this test thread (not the IO thread): must queue and run
+    // on io_thread, exactly like post() does.
+    std::atomic<std::thread::id> ran_on{};
+    context->post_to_io_thread([&ran_on]() { ran_on.store(std::this_thread::get_id()); });
+    EXPECT_TRUE(wait_until([&] { return ran_on.load() != std::thread::id{}; }));
+    EXPECT_EQ(ran_on.load(), io_thread.get_id());
+    EXPECT_NE(ran_on.load(), std::this_thread::get_id());
+}
+
+TEST_F(ReactorPrimitivesTest, PostToIoThreadFromIoThreadRunsInline) {
+    // A callback already running on the IO thread (e.g. one post_to_io_thread
+    // call nested inside another) must see the inner call execute
+    // synchronously, before post_to_io_thread() returns — no queue hop.
+    std::atomic<bool> outer_saw_inner_run_before_return{false};
+    std::atomic<bool> inner_ran{false};
+    context->post_to_io_thread([this, &outer_saw_inner_run_before_return, &inner_ran]() {
+        context->post_to_io_thread([&inner_ran]() { inner_ran.store(true); });
+        // If post_to_io_thread's inline fast path fired, inner_ran is
+        // already true here, before the outer callback even returns.
+        outer_saw_inner_run_before_return.store(inner_ran.load());
+    });
+    EXPECT_TRUE(wait_until([&] { return inner_ran.load(); }));
+    EXPECT_TRUE(outer_saw_inner_run_before_return.load())
+        << "post_to_io_thread() did not run inline when already on the IO thread";
+}
+
+TEST_F(ReactorPrimitivesTest, PostToIoThreadFromMultipleThreadsAllLandOnIoThread) {
+    // The affinity guarantee under real contention: many threads posting
+    // concurrently must still all execute on the one IO thread, never on
+    // each other or on a worker (this fixture has none, but a multi-worker
+    // Server's post_to_io_thread must hold the same guarantee — see
+    // ServerReactorTests for an end-to-end version with worker threads).
+    constexpr int kPosters = 8;
+    constexpr int kPerThread = 50;
+    std::atomic<int> counter{0};
+    std::atomic<int> wrong_thread_hits{0};
+    const std::thread::id expected = io_thread.get_id();
+
+    std::vector<std::thread> posters;
+    posters.reserve(kPosters);
+    for (int t = 0; t < kPosters; ++t) {
+        posters.emplace_back([this, &counter, &wrong_thread_hits, expected]() {
+            for (int i = 0; i < kPerThread; ++i) {
+                context->post_to_io_thread([&counter, &wrong_thread_hits, expected]() {
+                    if (std::this_thread::get_id() != expected) {
+                        wrong_thread_hits.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    counter.fetch_add(1, std::memory_order_relaxed);
+                });
+            }
+        });
+    }
+    for (auto& t : posters) {
+        t.join();
+    }
+
+    EXPECT_TRUE(wait_until([&] { return counter.load() == kPosters * kPerThread; }, 2000ms));
+    EXPECT_EQ(wrong_thread_hits.load(), 0);
+}
+
+TEST_F(ReactorPrimitivesTest, IsIoThreadReflectsCallingThread) {
+    EXPECT_FALSE(context->is_io_thread()) << "test thread is not the IO thread";
+    std::atomic<bool> was_true{false};
+    context->post_to_io_thread([this, &was_true]() { was_true.store(context->is_io_thread()); });
+    EXPECT_TRUE(wait_until([&] { return was_true.load(); }));
+}
+
 TEST_F(ReactorPrimitivesTest, TimerCallbackFiresOnce) {
     std::atomic<int> hits{0};
     context->add_timer_callback(std::chrono::steady_clock::now() + 20ms, {}, /*repeat=*/false,

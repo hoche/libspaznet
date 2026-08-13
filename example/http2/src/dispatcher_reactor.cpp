@@ -34,19 +34,29 @@
 // that straddles several recv()s is handled the same way as one that
 // arrives in a single read.
 //
-// Locking: unlike example/http's Http1Connection (at most one dispatch in
-// flight per connection, so its handler call and its ResponseWriter's
-// completion can never truly race each other), HTTP/2 multiplexing means
-// several ResponseWriters can be outstanding at once, and — exactly like
-// the coroutine dispatcher's own ConnState::mu, which for the same
-// reason guards not just out_queue but peer_settings/windows/goaway_sent
-// too — their completions can arrive concurrently, on arbitrary threads,
-// while the frame-reading loop is itself mid-frame on another thread.
-// mu_ (a recursive_mutex, since the overwhelmingly common case — a
-// handler that completes its writer before handle_request() returns —
-// re-enters on_response_ready() synchronously from inside try_process(),
-// already holding it) covers every access to shared connection state,
-// including every write() onto the connection.
+// Threading: unlike example/http's Http1Connection (at most one dispatch
+// in flight per connection), HTTP/2 multiplexing means several
+// ResponseWriters can be outstanding at once, and their completions can
+// arrive concurrently, on arbitrary threads (a background thread, a
+// timer, ...), while the frame-reading loop is itself mid-frame — the
+// exact scenario that produced a real double-free crash under
+// http2_showcase --reactor's concurrent /slow requests during this
+// dispatcher's initial development (see CHANGELOG.md's "HTTP/2 reactor
+// dispatcher" entry). The fix ended up NOT being a per-connection lock:
+// only the IOContext's IO thread ever calls PlatformIO::wait() and
+// invokes on_readable()/on_writable() (see IOContext::run()), so on_data()
+// and on_closed() below are already single-threaded by construction.
+// dispatch_request()'s ResponseWriter deliver callback is the one path
+// that could otherwise land on a different thread; it routes the actual
+// mutation through ctx_.post_to_io_thread(), which is a no-op queue hop
+// when already on the IO thread (the overwhelmingly common
+// completes-before-handle_request()-returns case) and marshals onto it
+// otherwise. With every mutating entry point guaranteed single-threaded
+// this way, there is no second thread left to race against and no lock
+// is needed — see docs/concurrency-and-coroutines.md's threading
+// section for the general primitive. assert(ctx_.is_io_thread()) below
+// documents (and, in debug builds, enforces) that invariant rather than
+// silently relying on it.
 //
 // One deliberate divergence from the coroutine dispatcher: several
 // malformed-frame paths there (the WINDOW_UPDATE-length and
@@ -67,11 +77,11 @@
 #include <libspaznet/reactor/buffered_connection.hpp>
 #include <libspaznet/server.hpp>
 
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -140,7 +150,7 @@ class Http2Connection : public std::enable_shared_from_this<Http2Connection> {
     // Just accumulate; try_process() below reparses buffer_ from
     // wherever the state machine currently is.
     void on_data() {
-        std::lock_guard<std::recursive_mutex> lock(mu_);
+        assert(ctx_.is_io_thread());
         auto conn = conn_.lock();
         if (!conn) {
             return;
@@ -160,7 +170,7 @@ class Http2Connection : public std::enable_shared_from_this<Http2Connection> {
     // completing). Unlike a fatal protocol error we detect ourselves,
     // there's no point sending a GOAWAY here — the peer is already gone.
     void on_closed() {
-        std::lock_guard<std::recursive_mutex> lock(mu_);
+        assert(ctx_.is_io_thread());
         closing_ = true;
         if (notify_closed_) {
             auto cb = std::move(notify_closed_);
@@ -535,8 +545,15 @@ class Http2Connection : public std::enable_shared_from_this<Http2Connection> {
         ctx_.increment_active_requests();
         const std::uint32_t stream_id = req.stream_id;
         auto self = shared_from_this();
-        ResponseWriter writer(
-            [self, stream_id](Response response) { self->on_response_ready(stream_id, std::move(response)); });
+        // deliver() may run on any thread — see the file header comment.
+        // post_to_io_thread() guarantees on_response_ready() always runs
+        // on this connection's IO thread, inline immediately if we're
+        // already there (the common synchronous-completion case).
+        ResponseWriter writer([self, stream_id](Response response) {
+            self->ctx_.post_to_io_thread([self, stream_id, response = std::move(response)]() mutable {
+                self->on_response_ready(stream_id, std::move(response));
+            });
+        });
 
         try {
             handler_->handle_request(req, writer);
@@ -553,15 +570,14 @@ class Http2Connection : public std::enable_shared_from_this<Http2Connection> {
         }
     }
 
-    // The ResponseWriter completion callback: may run synchronously
+    // Always runs on the IO thread (see dispatch_request()'s
+    // ResponseWriter construction) — but still either synchronously
     // (nested inside handle_request(), itself nested inside
     // handle_frame()'s HEADERS/CONTINUATION/DATA case, itself nested
     // inside try_process()'s while loop) or asynchronously, arbitrarily
-    // later, from any thread — same interim risk profile as
-    // example/http's on_response_ready, accepted pending the dedicated
-    // threading milestone's per-loop affinity.
+    // later.
     void on_response_ready(std::uint32_t stream_id, Response response) {
-        std::lock_guard<std::recursive_mutex> lock(mu_);
+        assert(ctx_.is_io_thread());
         ctx_.decrement_active_requests();
         auto conn = conn_.lock();
         if (!conn || closing_) {
@@ -618,11 +634,6 @@ class Http2Connection : public std::enable_shared_from_this<Http2Connection> {
         // it unboundedly).
         streams_.erase(sid);
     }
-
-    // Guards every field below and every write() onto conn_ — see the
-    // file header comment for why HTTP/2 multiplexing needs this where
-    // example/http's Http1Connection doesn't.
-    std::recursive_mutex mu_;
 
     ::spaznet::IOContext& ctx_;
     std::weak_ptr<::spaznet::BufferedConnection> conn_;

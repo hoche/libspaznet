@@ -612,20 +612,24 @@ void Server::stop() {
     // just hand each one's shared_ptr to IoHandler::shutdown() (which, for
     // BufferedConnection, closes the fd and fires its on_closed hook,
     // which in turn calls finish_reactor_connection() below). Routed
-    // through IOContext::post() so this always runs on an IO thread
-    // instead of racing this thread (stop() may be called from any
-    // thread) against in-flight on_readable()/on_writable() calls for the
-    // same connections — see set_io_handler()'s per-fd dispatch.
+    // through IOContext::post_to_io_thread() (not the round-robining
+    // post()) so this is GUARANTEED to run on the IO thread instead of
+    // racing this thread (stop() may be called from any thread) — or a
+    // worker thread, which plain post() could otherwise hand it to — against
+    // in-flight on_readable()/on_writable() calls for the same connections.
+    // This is the same affinity guarantee every reactor dispatcher's own
+    // ResponseWriter completion now relies on; see
+    // docs/concurrency-and-coroutines.md's threading section.
     //
     // `done` is heap-allocated (not captured by reference) because if
-    // run() was never called, or the loop has already exited, this post()
-    // never executes and the bounded wait below simply times out; the
-    // lambda — and the connections it would have shut down — leak, on the
-    // same "don't deadlock stop()" basis the coroutine drain below
-    // accepts.
+    // run() was never called, or the loop has already exited,
+    // post_to_io_thread() never executes this and the bounded wait below
+    // simply times out; the lambda — and the connections it would have
+    // shut down — leak, on the same "don't deadlock stop()" basis the
+    // coroutine drain below accepts.
     {
         auto done = std::make_shared<std::atomic<bool>>(false);
-        io_context_->post([this, done]() {
+        io_context_->post_to_io_thread([this, done]() {
             std::unordered_map<int, std::shared_ptr<IoHandler>> conns;
             {
                 std::lock_guard<std::mutex> lock(reactor_conns_mutex_);

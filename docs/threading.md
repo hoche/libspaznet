@@ -121,6 +121,29 @@ strict CPU-affinity (e.g. for a connection-per-NUMA-node setup), run
 multiple `Server` instances on different ports and pin each via the
 OS (`taskset`, `pthread_setaffinity_np`, `numactl`).
 
+## The reactor dispatchers are the exception
+
+Everything above describes the coroutine dispatchers
+(`make_dispatcher(...)`). The coroutine-free reactor counterparts
+(`make_reactor_dispatcher(...)`, see `docs/http.md` / `docs/websocket.md`)
+run inside the exact same `Server(N)`/`IOContext`, but their connection
+state (`Http1Connection`, `Http2Connection`, `WsConnection`, ...) is
+ordinary member data, not a coroutine frame, so it can't tolerate the "no
+thread affinity" model above. In practice it doesn't need to: only the
+thread that calls `Server::run()` (i.e. `IOContext::run()`) ever calls
+`PlatformIO::wait()` or dispatches `on_readable()`/`on_writable()` —
+worker threads only drain `post()`ed callbacks and coroutine resumes, so a
+reactor connection's own I/O handling was already implicitly
+single-threaded. The one gap was code that reaches into a reactor
+connection from *outside* that dispatch (a `ResponseWriter` completed on a
+background thread, or one connection sending to another); those call
+`IOContext::post_to_io_thread(...)` to land back on the `run()` thread
+specifically, rather than `post()`'s round-robin across every worker. See
+`concurrency-and-coroutines.md`'s "Reactor Threading Model" section for
+the full picture, including why this is not the same as "pinning a
+connection to a thread" in the multi-loop sense above — there is still
+only one loop (and one `run()` thread) per `IOContext`.
+
 ## Stop / drain semantics
 
 `Server::stop()` is safe to call from any thread (including from

@@ -15,6 +15,7 @@
 #include <libspaznet/reactor/buffered_connection.hpp>
 #include <memory>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -87,6 +88,41 @@ template <typename Pred> auto wait_until(Pred pred, std::chrono::milliseconds ti
         std::this_thread::sleep_for(2ms);
     }
     return pred();
+}
+
+// BufferedConnection has no internal locking: write()/close()/
+// close_after_flush()/pending_write_bytes()/closed() all assume the
+// caller is on the same thread that drives this connection's
+// on_readable()/on_writable() (see buffered_connection.hpp's class
+// comment and IOContext::post_to_io_thread()'s rationale). These tests
+// run IOContext::run() on a dedicated background thread (see SetUp()
+// below) and need to touch the connection from the *test* thread, so
+// every such touch is marshaled onto the IO thread through
+// post_to_io_thread() — exactly what a real reactor dispatcher's
+// ResponseWriter completion does — rather than calling BufferedConnection
+// directly from here and racing the IO thread.
+template <typename Fn> auto on_io_thread(IOContext& ctx, Fn fn) -> decltype(fn()) {
+    using R = decltype(fn());
+    std::atomic<bool> done{false};
+    if constexpr (std::is_void_v<R>) {
+        ctx.post_to_io_thread([&fn, &done]() {
+            fn();
+            done.store(true, std::memory_order_release);
+        });
+        while (!done.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(1ms);
+        }
+    } else {
+        R result{};
+        ctx.post_to_io_thread([&fn, &done, &result]() {
+            result = fn();
+            done.store(true, std::memory_order_release);
+        });
+        while (!done.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(1ms);
+        }
+        return result;
+    }
 }
 
 class BufferedConnectionTest : public ::testing::Test {
@@ -285,11 +321,11 @@ TEST_F(BufferedConnectionTest, LargeWriteTogglesWriteInterestThenDrains) {
     conn->start();
 
     std::vector<uint8_t> payload(1 << 20, 'y'); // 1 MiB
-    conn->write(payload);
+    on_io_thread(*context, [&]() { conn->write(payload); });
 
     // Immediately after the call, if the whole payload didn't fit in one
     // optimistic write, write interest must be armed (pending > 0).
-    bool needed_interest = conn->pending_write_bytes() > 0;
+    bool needed_interest = on_io_thread(*context, [&]() { return conn->pending_write_bytes(); }) > 0;
 
     std::size_t total_received = 0;
     std::array<char, 65536> recv_buf{};
@@ -309,7 +345,7 @@ TEST_F(BufferedConnectionTest, LargeWriteTogglesWriteInterestThenDrains) {
     EXPECT_EQ(total_received, payload.size());
     // Once fully drained, the connection must have dropped write interest
     // (checked indirectly: no more bytes pending).
-    EXPECT_EQ(conn->pending_write_bytes(), 0u);
+    EXPECT_EQ(on_io_thread(*context, [&]() { return conn->pending_write_bytes(); }), 0u);
     (void)needed_interest; // documents intent even if the OS accepted it all at once
 }
 
@@ -325,8 +361,9 @@ TEST_F(BufferedConnectionTest, BytesBufferedStatDrainsToZeroOnceFlushed) {
     conn->start();
 
     std::vector<uint8_t> payload(1 << 20, 'z'); // 1 MiB
-    conn->write(payload);
-    EXPECT_EQ(context->get_statistics().bytes_buffered, conn->pending_write_bytes());
+    on_io_thread(*context, [&]() { conn->write(payload); });
+    EXPECT_EQ(context->get_statistics().bytes_buffered,
+              on_io_thread(*context, [&]() { return conn->pending_write_bytes(); }));
 
     std::array<char, 65536> recv_buf{};
     ASSERT_TRUE(wait_until(
@@ -334,7 +371,7 @@ TEST_F(BufferedConnectionTest, BytesBufferedStatDrainsToZeroOnceFlushed) {
             while (detail::socket_recv(pair.b, recv_buf.data(), recv_buf.size(), 0) > 0) {
                 // draining
             }
-            return conn->pending_write_bytes() == 0;
+            return on_io_thread(*context, [&]() { return conn->pending_write_bytes(); }) == 0;
         },
         5000ms));
 
@@ -353,10 +390,10 @@ TEST_F(BufferedConnectionTest, BytesBufferedStatDroppedOnCloseWithPendingData) {
     conn->start();
 
     std::vector<uint8_t> payload(1 << 20, 'z'); // 1 MiB; peer never reads, so this stays queued
-    conn->write(payload);
+    on_io_thread(*context, [&]() { conn->write(payload); });
     ASSERT_GT(context->get_statistics().bytes_buffered, 0u);
 
-    conn->close();
+    on_io_thread(*context, [&]() { conn->close(); });
     EXPECT_EQ(context->get_statistics().bytes_buffered, 0u);
 }
 
@@ -369,8 +406,8 @@ TEST_F(BufferedConnectionTest, CloseAfterFlushClosesImmediatelyWhenNothingQueued
     pair.a = -1;
     conn->start();
 
-    conn->close_after_flush();
-    EXPECT_TRUE(conn->closed());
+    on_io_thread(*context, [&]() { conn->close_after_flush(); });
+    EXPECT_TRUE(on_io_thread(*context, [&]() { return conn->closed(); }));
 }
 
 TEST_F(BufferedConnectionTest, CloseAfterFlushWaitsForPendingWriteToDrainFirst) {
@@ -385,16 +422,28 @@ TEST_F(BufferedConnectionTest, CloseAfterFlushWaitsForPendingWriteToDrainFirst) 
     conn->start();
 
     std::vector<uint8_t> payload(1 << 20, 'q'); // 1 MiB; peer will drain it below
-    conn->write(payload);
-    conn->close_after_flush();
+    on_io_thread(*context, [&]() {
+        conn->write(payload);
+        conn->close_after_flush();
+    });
     // Must not have closed yet — bytes are still queued and the peer
     // hasn't read anything.
-    EXPECT_FALSE(conn->closed());
+    EXPECT_FALSE(on_io_thread(*context, [&]() { return conn->closed(); }));
 
     std::size_t total_received = 0;
     std::array<char, 65536> recv_buf{};
     ASSERT_TRUE(wait_until(
         [&]() {
+            // Check closed() FIRST, then always drain whatever's arrived
+            // afterward: by the time close_after_flush() actually closes,
+            // every byte it flushed has already been handed to the
+            // kernel via send() (and is therefore already available to
+            // recv()), so draining after the check — rather than before
+            // it — can't miss a tail that a slower closed() round trip
+            // (now a post_to_io_thread() call, not a plain field read)
+            // would otherwise let slip past an EAGAIN-terminated drain
+            // loop that ran just before the connection finished closing.
+            bool was_closed = on_io_thread(*context, [&]() { return conn->closed(); });
             for (;;) {
                 ssize_t n = detail::socket_recv(pair.b, recv_buf.data(), recv_buf.size(), 0);
                 if (n <= 0) {
@@ -402,13 +451,13 @@ TEST_F(BufferedConnectionTest, CloseAfterFlushWaitsForPendingWriteToDrainFirst) 
                 }
                 total_received += static_cast<std::size_t>(n);
             }
-            return conn->closed();
+            return was_closed;
         },
         5000ms));
 
     EXPECT_EQ(total_received, payload.size())
         << "close_after_flush() must not truncate data queued before it was called";
-    EXPECT_TRUE(conn->closed());
+    EXPECT_TRUE(on_io_thread(*context, [&]() { return conn->closed(); }));
 }
 
 TEST_F(BufferedConnectionTest, PeerCloseFiresOnClosedExactlyOnce) {
@@ -425,7 +474,7 @@ TEST_F(BufferedConnectionTest, PeerCloseFiresOnClosedExactlyOnce) {
     detail::close_socket_fd(pair.b);
     pair.b = -1;
 
-    ASSERT_TRUE(wait_until([&] { return conn->closed(); }));
+    ASSERT_TRUE(wait_until([&] { return on_io_thread(*context, [&]() { return conn->closed(); }); }));
     std::this_thread::sleep_for(30ms); // let any spurious extra events settle
     EXPECT_EQ(closed_count.load(), 1);
 }

@@ -839,6 +839,21 @@ class IOContext {
     // resumes coroutines.
     std::vector<CallbackQueue> callback_queues_;
     std::atomic<std::size_t> next_callback_queue_{0};
+    // Backs post_to_io_thread(): a single queue drained ONLY inside run()'s
+    // own loop (see the "Drain IO-thread-affine callbacks" step there) —
+    // never by worker_thread(), unlike callback_queues_ above, which any
+    // worker may steal from. That exclusivity is the entire reason this
+    // queue exists: it is what lets a reactor connection's mutable state
+    // be touched by exactly one thread, ever, without a per-connection
+    // lock. See post_to_io_thread()'s declaration below for the full
+    // rationale.
+    CallbackQueue io_thread_queue_;
+    // Identity of the thread currently executing run()'s loop (default
+    // std::thread::id{}, "no thread", before run() starts or after it
+    // returns). Written only by that thread itself, at the top and
+    // bottom of run(); read by post_to_io_thread()/is_io_thread() from
+    // arbitrary threads, hence atomic.
+    std::atomic<std::thread::id> io_thread_id_;
     // Idle worker threads park on this CV instead of busy-yielding when their
     // queues are empty. schedule() notifies after enqueuing; stop() wakes all
     // so they can observe running_ == false and exit. See worker_thread().
@@ -996,6 +1011,42 @@ class IOContext {
     // fine; std::function only requires copyability of the underlying
     // target if you copy the std::function itself.
     auto post(std::function<void()> fn) -> void;
+
+    // Reactor primitive: post a callback that is GUARANTEED to run only on
+    // the thread currently (or, if called before/after run(), about to be
+    // or having been) executing run()'s loop — never a worker thread,
+    // never any other caller's thread. If the calling thread already IS
+    // the IO thread, `fn` runs inline, synchronously, before this call
+    // returns; otherwise it is queued and runs on the IO thread's next
+    // loop iteration.
+    //
+    // This is the "per-loop connection affinity" primitive the
+    // reactor-port plan's `threading` milestone calls for: only the run()
+    // thread ever calls PlatformIO::wait() and invokes
+    // on_readable()/on_writable() (see run()'s implementation), so a
+    // reactor connection's mutable state (buffer_, phase_, streams_,
+    // flow-control windows, ...) is already touched by exactly one thread
+    // as long as every OTHER path that can touch it — chiefly a
+    // ResponseWriter completion or a cross-connection send, either of
+    // which may otherwise arrive from an arbitrary background thread —
+    // is routed through here instead of running inline or through the
+    // round-robining post() above. Once every such path is, per-connection
+    // locks (e.g. the mutex a naively-written multiplexed dispatcher would
+    // otherwise need) become unnecessary: there is no second thread left
+    // to race against. See docs/concurrency-and-coroutines.md's threading
+    // section.
+    //
+    // The inline fast path when already on the IO thread is what keeps
+    // the common case — a handler that completes its ResponseWriter
+    // before returning — exactly as cheap as a plain function call, with
+    // no queue hop, matching today's synchronous-completion behavior.
+    auto post_to_io_thread(std::function<void()> fn) -> void;
+
+    // True if the calling thread is the one currently executing run()'s
+    // loop (false before run() starts, after it returns, or on any other
+    // thread). Exposed for assertions in reactor dispatchers that rely on
+    // post_to_io_thread's affinity guarantee instead of a lock.
+    [[nodiscard]] auto is_io_thread() const -> bool;
 
     // Reactor primitive: register (or update) readiness interest for
     // `file_descriptor`, backed by an arbitrary IoHandler. register_io

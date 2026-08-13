@@ -305,16 +305,14 @@ class ChatRoom : public spaznet::websocket::Handler {
 // need for chat.cpp's own outbox/writer_loop/interval-poll machinery --
 // that whole apparatus existed only to give the coroutine side an async
 // context to co_await conn.send() from when broadcasting into a
-// *different* connection's coroutine frame. Here, broadcasting is just
-// "call send() from wherever" -- except "wherever" here is one
-// connection's handle_message() touching another connection's
-// BufferedConnection, which on_readable()/on_writable() run inline on a
-// single dedicated thread (see IOContext::run()), and which a posted
-// closure can end up racing today if the Server has extra worker
-// threads. ctx->post() (queued via the same reactor primitive that
-// carries every other posted callback) is the least-risky thing to
-// route the actual send through pending real per-connection loop
-// affinity -- see the threading milestone in the reactor-port plan.
+// *different* connection's coroutine frame. Here, broadcasting really is
+// just "call send() from wherever": send() itself now routes through
+// IOContext::post_to_io_thread() internally (see reactor_handler.hpp),
+// so a call from one connection's handle_message() into a *different*
+// connection's Connection is safe even when the Server has extra worker
+// threads, with no explicit post() needed at this call site anymore --
+// see the threading milestone note in the reactor-port plan for the
+// affinity primitive this relies on.
 class ChatRoomReactor : public spaznet::websocket::reactor::Handler {
   public:
     void on_open(spaznet::websocket::reactor::Connection& conn) override {
@@ -355,9 +353,9 @@ class ChatRoomReactor : public spaznet::websocket::reactor::Handler {
     }
 
   private:
-    // Posts `bytes` (as a Text frame) onto every connection except
-    // `exclude_id`'s own IOContext, to be sent from there. See the class
-    // comment above for why post() rather than a direct call.
+    // Sends `bytes` (as a Text frame) to every connection except
+    // `exclude_id`. See the class comment above: target.send() itself
+    // handles landing on the right thread, so this is a plain loop.
     void broadcast(int exclude_id, std::vector<uint8_t> bytes) {
         std::vector<spaznet::websocket::reactor::Connection> targets;
         {
@@ -369,15 +367,8 @@ class ChatRoomReactor : public spaznet::websocket::reactor::Handler {
                 }
             }
         }
-        auto shared_bytes = std::make_shared<std::vector<uint8_t>>(std::move(bytes));
         for (auto& target : targets) {
-            auto* ctx = target.context();
-            if (ctx == nullptr) {
-                continue;
-            }
-            ctx->post([target, shared_bytes] {
-                target.send(spaznet::websocket::Opcode::Text, *shared_bytes);
-            });
+            target.send(spaznet::websocket::Opcode::Text, bytes);
         }
     }
 

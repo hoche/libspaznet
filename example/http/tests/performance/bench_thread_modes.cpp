@@ -248,7 +248,21 @@ struct HttpCase {
     std::size_t resp_body;
 };
 
+// Which of the two HTTP dispatchers (see docs/http.md's "Two dispatchers,
+// one handler" note) drove a given HttpResult. Both speak the exact same
+// wire protocol and hit the exact same BenchHandler logic; the only
+// difference is coroutines + Socket::async_read/write vs. plain
+// callbacks + BufferedConnection — this benchmark exists to show whether
+// that execution-model choice costs (or saves) anything end to end,
+// across the same thread-count sweep.
+enum class DispatcherKind : std::uint8_t { Coroutine, Reactor };
+
+static auto to_string(DispatcherKind k) -> const char* {
+    return k == DispatcherKind::Coroutine ? "coroutine" : "reactor";
+}
+
 struct HttpResult {
+    DispatcherKind dispatcher = DispatcherKind::Coroutine;
     std::size_t threads = 0;
     HttpCase c{};
     std::size_t requests = 0;
@@ -309,9 +323,11 @@ static auto listen_on_random_port(Server& server) -> uint16_t {
     return 0;
 }
 
-static auto run_http_case(std::size_t server_threads, uint16_t port, const HttpCase& c,
-                          double duration_s, std::size_t client_threads) -> HttpResult {
+static auto run_http_case(DispatcherKind dispatcher, std::size_t server_threads, uint16_t port,
+                          const HttpCase& c, double duration_s,
+                          std::size_t client_threads) -> HttpResult {
     HttpResult out;
+    out.dispatcher = dispatcher;
     out.threads = server_threads;
     out.c = c;
 
@@ -674,23 +690,35 @@ static void print_markdown_report(const std::vector<HttpResult>& http,
     std::cout << "- **iperf duration per case**: " << iperf_seconds << "s\n\n";
 
     std::cout << "### HTTP (libspaznet) — throughput + latency\n\n";
-    // Group results by (req,resp) for easier per-thread comparisons.
+    std::cout << "Both dispatcher columns hit the exact same BenchHandler over the exact same "
+                 "wire protocol (see docs/http.md's \"Two dispatchers, one handler\" note); "
+                 "`coroutine` uses Task/co_await + Socket::async_read/write, `reactor` uses "
+                 "plain callbacks + BufferedConnection (see the threading milestone note in "
+                 "the reactor-port plan and docs/concurrency-and-coroutines.md).\n\n";
+    // Group results by (req,resp) for easier per-thread comparisons; each
+    // such table interleaves both dispatchers, sorted by (dispatcher,
+    // threads), so a row-by-row scan at a fixed thread count compares them
+    // directly.
     std::map<std::pair<std::size_t, std::size_t>, std::vector<HttpResult>> by_case;
     for (const auto& r : http) {
         by_case[{r.c.req_body, r.c.resp_body}].push_back(r);
     }
     for (auto& [k, rows] : by_case) {
-        std::sort(rows.begin(), rows.end(),
-                  [](const HttpResult& a, const HttpResult& b) { return a.threads < b.threads; });
+        std::sort(rows.begin(), rows.end(), [](const HttpResult& a, const HttpResult& b) {
+            if (a.dispatcher != b.dispatcher) {
+                return a.dispatcher < b.dispatcher;
+            }
+            return a.threads < b.threads;
+        });
         std::cout << "**Case**: req_body=" << k.first << "B, resp_body=" << k.second << "B\n\n";
-        std::cout << "| threads | rps | resp MiB/s | p50 ms | p95 ms | p99 ms | errors |\n";
-        std::cout << "|---:|---:|---:|---:|---:|---:|---:|\n";
+        std::cout << "| dispatcher | threads | rps | resp MiB/s | p50 ms | p95 ms | p99 ms | errors |\n";
+        std::cout << "|---|---:|---:|---:|---:|---:|---:|---:|\n";
         for (const auto& r : rows) {
-            std::cout << "| " << r.threads << " | " << std::fixed << std::setprecision(1) << r.rps
-                      << " | " << std::setprecision(2) << r.resp_mib_s << " | "
-                      << std::setprecision(2) << r.p50_ms << " | " << std::setprecision(2)
-                      << r.p95_ms << " | " << std::setprecision(2) << r.p99_ms << " | " << r.errors
-                      << " |\n";
+            std::cout << "| " << to_string(r.dispatcher) << " | " << r.threads << " | "
+                      << std::fixed << std::setprecision(1) << r.rps << " | "
+                      << std::setprecision(2) << r.resp_mib_s << " | " << std::setprecision(2)
+                      << r.p50_ms << " | " << std::setprecision(2) << r.p95_ms << " | "
+                      << std::setprecision(2) << r.p99_ms << " | " << r.errors << " |\n";
         }
         std::cout << "\n";
     }
@@ -784,27 +812,38 @@ int main(int argc, char** argv) {
     };
 
     std::vector<HttpResult> http_results;
-    http_results.reserve(thread_counts.size() * http_cases.size());
+    http_results.reserve(thread_counts.size() * http_cases.size() * 2); // x2: coroutine + reactor
 
-    // HTTP benchmarks per thread count.
+    // HTTP benchmarks per thread count, once per dispatcher kind — same
+    // BenchHandler, same protocol, only the execution model differs (see
+    // the DispatcherKind comment above).
     for (std::size_t threads : thread_counts) {
-        Server server(threads);
-        server.set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<BenchHandler>()));
-        uint16_t port = listen_on_random_port(server);
-        if (port == 0) {
-            std::cerr << "Failed to bind server for threads=" << threads << "\n";
-            continue;
-        }
-        std::thread server_thread([&]() { server.run(); });
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        for (DispatcherKind kind : {DispatcherKind::Coroutine, DispatcherKind::Reactor}) {
+            Server server(threads);
+            if (kind == DispatcherKind::Coroutine) {
+                server.set_connection_handler(
+                    spaznet::http::make_dispatcher(std::make_unique<BenchHandler>()));
+            } else {
+                server.set_connection_factory(
+                    spaznet::http::make_reactor_dispatcher(std::make_unique<BenchHandler>()));
+            }
+            uint16_t port = listen_on_random_port(server);
+            if (port == 0) {
+                std::cerr << "Failed to bind server for threads=" << threads
+                          << " dispatcher=" << to_string(kind) << "\n";
+                continue;
+            }
+            std::thread server_thread([&]() { server.run(); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-        for (const auto& c : http_cases) {
-            auto r = run_http_case(threads, port, c, http_duration_s, client_threads);
-            http_results.push_back(r);
-        }
+            for (const auto& c : http_cases) {
+                auto r = run_http_case(kind, threads, port, c, http_duration_s, client_threads);
+                http_results.push_back(r);
+            }
 
-        server.stop();
-        server_thread.join();
+            server.stop();
+            server_thread.join();
+        }
     }
 
     // iperf benchmarks (raw TCP + UDP) with stream counts aligned to thread counts (excluding 0).

@@ -6,6 +6,83 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
+## 2026-08-12 — Reactor threading: per-loop affinity replaces per-connection locks
+
+Tenth milestone of the reactor port (see the "Milestone threading
+progress note" in the reactor-port plan). Resolves the threading gap the
+`http2-reactor` milestone shipped an interim mutex for.
+
+### Added
+- `IOContext::post_to_io_thread(std::function<void()>)` and
+  `IOContext::is_io_thread()` (`include/libspaznet/platform/io_context.hpp`
+  / `src/platform/io_context.cpp`) — a reactor primitive, no coroutine
+  dependency. Backed by a dedicated single-consumer queue drained only
+  inside `run()`'s own loop (never by a worker thread), so a callback
+  posted through it is guaranteed to run on the one thread that also
+  calls `on_readable()`/`on_writable()` for every connection on that
+  `IOContext` — inline, synchronously, if the caller is already there
+  (zero extra cost for the common synchronous-completion case), queued
+  otherwise. This is "per-loop connection affinity" for this codebase's
+  actual architecture: exactly one thread per `IOContext` ever calls
+  `PlatformIO::wait()`, so affinity reduces to "the `run()` thread," not
+  sharding across independent loops.
+- `example/http/tests/performance/bench_thread_modes.cpp` now runs its
+  HTTP matrix against both `make_dispatcher` (coroutine) and
+  `make_reactor_dispatcher` (reactor) at every thread count, reporting
+  both as interleaved rows in the same table for direct comparison.
+- New unit tests in `tests/unit/test_reactor_primitives.cpp` covering
+  `post_to_io_thread`'s inline fast path, cross-thread delivery, and an
+  8-thread contention test asserting every callback lands on the `run()`
+  thread specifically.
+
+### Changed
+- `example/http`'s `Http1Connection::on_response_ready` and
+  `example/http2`'s `Http2Connection::on_response_ready` (both
+  `ResponseWriter` completion callbacks) now route their actual mutation
+  through `post_to_io_thread()` instead of running directly on whatever
+  thread happens to call `writer.complete()`.
+- `websocket::reactor::Connection::send()`
+  (`example/http-websocket/include/libspaznet/websocket/reactor_handler.hpp`)
+  now routes internally through `post_to_io_thread()`, making it genuinely
+  safe to call from any thread rather than requiring the caller to already
+  arrange that. `demo/chat.cpp`'s `ChatRoomReactor::broadcast()` dropped
+  its explicit `ctx->post(...)` wrapper (added in the `websocket-reactor`
+  milestone as an interim stand-in for this one) — it's now a plain loop
+  calling `target.send(...)` directly.
+- `Server::stop()`'s reactor-connection teardown
+  (`src/server_impl.cpp`) now uses `post_to_io_thread()` instead of the
+  round-robining `post()`. The old code comment already claimed an
+  IO-thread guarantee that `post()` didn't actually provide (any worker
+  thread could drain that callback) — a real, if narrow, latent gap.
+
+### Removed
+- `Http2Connection`'s `std::recursive_mutex mu_`
+  (`example/http2/src/dispatcher_reactor.cpp`), added in the
+  `http2-reactor` milestone to fix a real double-free. With every mutating
+  entry point now provably reached from the IO thread only (via
+  `post_to_io_thread`), there's no second thread left to race against, so
+  no lock is needed — replaced with `assert(ctx_.is_io_thread())` at the
+  top of `on_data()`, `on_closed()`, and `on_response_ready()`.
+
+### Fixed
+- A genuinely pre-existing, unrelated race caught by ThreadSanitizer while
+  validating this milestone: `tests/unit/test_buffered_connection.cpp`'s
+  fixture runs `IOContext::run()` on a background thread, but several
+  tests called `BufferedConnection::write()`/`close()`/
+  `close_after_flush()`/`pending_write_bytes()`/`closed()` directly from
+  the test thread — the exact off-IO-thread touch this milestone's
+  primitive exists to prevent, just in test code. Fixed with a small
+  `on_io_thread(ctx, fn)` test helper that marshals every such call
+  through `post_to_io_thread()`.
+
+Verified with the full suite (13 ctest targets), a manual re-run of the
+exact `http2_showcase --reactor` concurrent-`/slow`-requests crash repro
+from the `http2-reactor` milestone (30 rounds × 8 concurrent streams, zero
+crashes), and a one-off ThreadSanitizer build (`-fsanitize=thread`) run
+across the full unit suite, the HTTP/1.1 and HTTP/2 integration suites,
+and the live demo repro — clean across 3 repeated runs, including after
+removing HTTP/2's mutex.
+
 ## 2026-08-12 — HTTP/2 reactor dispatcher
 
 Ninth (and hardest, per the plan's own ordering) milestone of the reactor

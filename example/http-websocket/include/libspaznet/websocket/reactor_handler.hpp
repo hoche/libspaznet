@@ -40,23 +40,38 @@ class Connection {
     }
 
     // Build a server-origin (unmasked) frame and write it directly to the
-    // connection's OutputBuffer. Safe to call from any thread the caller
-    // has arranged to have exclusive access to this connection from (see
-    // docs/websocket.md's threading note) — a no-op if the underlying
-    // connection has already gone away. `fin = false` sends a non-final
-    // fragment (rarely needed).
+    // connection's OutputBuffer. Genuinely safe to call from ANY thread —
+    // not just the one driving this connection's own on_readable() — via
+    // IOContext::post_to_io_thread(): the actual write happens inline,
+    // synchronously, if the calling thread already is this connection's
+    // IO thread (so a handler calling send() on its own Connection from
+    // inside handle_message() costs nothing extra), and is marshaled
+    // onto that thread otherwise (e.g. a broadcast into a *different*
+    // connection from inside another connection's callback — see
+    // demo/chat.cpp's ChatRoomReactor). A no-op if the underlying
+    // connection has already gone away by the time it runs. `fin = false`
+    // sends a non-final fragment (rarely needed).
     void send(Opcode opcode, std::span<const std::uint8_t> payload, bool fin = true) const {
-        auto conn = conn_.lock();
-        if (!conn) {
-            return;
+        std::vector<std::uint8_t> payload_copy(payload.begin(), payload.end());
+        auto conn_weak = conn_;
+        auto do_send = [conn_weak, opcode, fin, payload_copy = std::move(payload_copy)]() mutable {
+            auto conn = conn_weak.lock();
+            if (!conn) {
+                return;
+            }
+            Frame frame;
+            frame.fin = fin;
+            frame.opcode = opcode;
+            frame.masked = false;
+            frame.payload = std::move(payload_copy);
+            frame.payload_length = frame.payload.size();
+            conn->write(frame.serialize());
+        };
+        if (ctx_) {
+            ctx_->post_to_io_thread(std::move(do_send));
+        } else {
+            do_send();
         }
-        Frame frame;
-        frame.fin = fin;
-        frame.opcode = opcode;
-        frame.masked = false;
-        frame.payload.assign(payload.begin(), payload.end());
-        frame.payload_length = frame.payload.size();
-        conn->write(frame.serialize());
     }
 
   private:
