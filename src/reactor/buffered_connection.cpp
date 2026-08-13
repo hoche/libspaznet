@@ -2,6 +2,9 @@
 #include <cstring>
 #include <libspaznet/detail/socket_compat.hpp>
 #include <libspaznet/reactor/buffered_connection.hpp>
+#ifdef SPAZNET_HAS_TLS
+#include <libspaznet/detail/tls_stream.hpp>
+#endif
 
 namespace spaznet {
 
@@ -89,8 +92,34 @@ auto OutputBuffer::try_flush(int fd) -> Result {
     return Result::Flushed;
 }
 
+#ifdef SPAZNET_HAS_TLS
+auto OutputBuffer::try_flush(detail::TlsStream& tls) -> Result {
+    while (read_pos_ < buf_.size()) {
+        auto r = tls.write(buf_.data() + read_pos_, buf_.size() - read_pos_);
+        if (r.kind == detail::TlsIoResult::Kind::Ok && r.n > 0) {
+            read_pos_ += r.n;
+            continue;
+        }
+        if (r.kind == detail::TlsIoResult::Kind::WantRead ||
+            r.kind == detail::TlsIoResult::Kind::WantWrite) {
+            // WANT_READ during a write is rare (renegotiation); treat both
+            // as "bytes remain — re-arm interest" and let on_readable also
+            // retry the flush if needed.
+            return Result::WouldBlock;
+        }
+        return Result::Error;
+    }
+    buf_.clear();
+    read_pos_ = 0;
+    return Result::Flushed;
+}
+#endif
+
 BufferedConnection::BufferedConnection(IOContext& ctx, int fd) : ctx_(ctx), fd_(fd) {
     detail::set_nonblocking(fd_);
+#ifdef SPAZNET_HAS_TLS
+    tls_ = detail::TlsStream::claim_for_fd(fd_);
+#endif
 }
 
 BufferedConnection::~BufferedConnection() {
@@ -102,10 +131,24 @@ BufferedConnection::~BufferedConnection() {
     // followed by dropping their reference) before the last reference
     // goes away.
     if (!closed_) {
+#ifdef SPAZNET_HAS_TLS
+        if (tls_) {
+            tls_->shutdown();
+        }
+#endif
         ctx_.remove_io(fd_);
         detail::close_socket_fd(fd_);
     }
 }
+
+#ifdef SPAZNET_HAS_TLS
+auto BufferedConnection::flush_output() -> OutputBuffer::Result {
+    if (tls_) {
+        return output_.try_flush(*tls_);
+    }
+    return output_.try_flush(fd_);
+}
+#endif
 
 void BufferedConnection::start() {
     if (closed_) {
@@ -121,6 +164,35 @@ void BufferedConnection::on_readable() {
     constexpr std::size_t kReadChunk = 4096;
     for (;;) {
         auto span = input_.prepare(kReadChunk);
+#ifdef SPAZNET_HAS_TLS
+        if (tls_) {
+            auto r = tls_->read(span.data(), span.size());
+            if (r.kind == detail::TlsIoResult::Kind::Ok && r.n > 0) {
+                input_.commit(r.n);
+                if (on_data_) {
+                    on_data_();
+                }
+                if (closed_) {
+                    return;
+                }
+                continue;
+            }
+            if (r.kind == detail::TlsIoResult::Kind::WantRead) {
+                break;
+            }
+            if (r.kind == detail::TlsIoResult::Kind::WantWrite) {
+                // Need to write to progress a read (unusual); arm write.
+                write_interest_armed_ = true;
+                break;
+            }
+            if (r.kind == detail::TlsIoResult::Kind::Closed) {
+                fail();
+                return;
+            }
+            fail();
+            return;
+        }
+#endif
         ssize_t n = detail::socket_recv(fd_, span.data(), span.size(), 0);
         if (n > 0) {
             input_.commit(static_cast<std::size_t>(n));
@@ -161,7 +233,11 @@ void BufferedConnection::on_writable() {
         return;
     }
     std::size_t before = output_.pending();
+#ifdef SPAZNET_HAS_TLS
+    auto result = flush_output();
+#else
     auto result = output_.try_flush(fd_);
+#endif
     report_buffered_delta(before);
     if (result == OutputBuffer::Result::Error) {
         fail();
@@ -197,7 +273,11 @@ void BufferedConnection::write(std::vector<uint8_t> data) {
         // Optimistic write: try to drain immediately rather than waiting
         // for a writable event that may not even be necessary (the common
         // case for a socket with room in its send buffer).
+#ifdef SPAZNET_HAS_TLS
+        auto result = flush_output();
+#else
         auto result = output_.try_flush(fd_);
+#endif
         if (result == OutputBuffer::Result::Error) {
             report_buffered_delta(before);
             fail();
@@ -228,6 +308,11 @@ void BufferedConnection::close() {
         // than leaking that count for the rest of the process lifetime.
         ctx_.adjust_bytes_buffered(-static_cast<std::int64_t>(output_.pending()));
     }
+#ifdef SPAZNET_HAS_TLS
+    if (tls_) {
+        tls_->shutdown();
+    }
+#endif
     ctx_.remove_io(fd_);
     detail::close_socket_fd(fd_);
     if (on_closed_) {

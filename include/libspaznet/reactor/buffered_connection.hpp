@@ -17,6 +17,10 @@
 #include <span>
 #include <vector>
 
+#ifdef SPAZNET_HAS_TLS
+#include <libspaznet/detail/tls_stream.hpp>
+#endif
+
 namespace spaznet {
 
 // Growable byte buffer for incoming data, written to directly by a raw
@@ -83,6 +87,11 @@ class OutputBuffer {
     // is armed); Error means a hard failure (caller should close the
     // connection).
     auto try_flush(int fd) -> Result;
+
+#ifdef SPAZNET_HAS_TLS
+    // Same contract as try_flush(fd), but drains through SSL_write.
+    auto try_flush(detail::TlsStream& tls) -> Result;
+#endif
 
   private:
     std::vector<uint8_t> buf_;
@@ -182,6 +191,11 @@ class BufferedConnection : public IoHandler, public std::enable_shared_from_this
     // its value at the start of whichever operation just ran) to
     // IOContext's global bytes_buffered gauge. A no-op if unchanged.
     void report_buffered_delta(std::size_t before);
+#ifdef SPAZNET_HAS_TLS
+    // Drain output_ via SSL_write when tls_ is attached; otherwise
+    // OutputBuffer::try_flush(fd_).
+    auto flush_output() -> OutputBuffer::Result;
+#endif
 
     IOContext& ctx_;
     int fd_;
@@ -192,6 +206,11 @@ class BufferedConnection : public IoHandler, public std::enable_shared_from_this
     bool closed_{false};
     bool write_interest_armed_{false};
     bool close_after_flush_{false};
+#ifdef SPAZNET_HAS_TLS
+    // Claimed from TlsStream::stash_for_fd in the constructor when this
+    // connection was accepted on a listen_tls() socket.
+    std::unique_ptr<detail::TlsStream> tls_;
+#endif
 };
 
 } // namespace spaznet

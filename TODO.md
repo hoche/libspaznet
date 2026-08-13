@@ -5,9 +5,8 @@
 - [x] Add non-coroutine reactor model
 
 - [x] Fix reactor model's threading system: N independent event loops via `ServerConfig{.loops = N}` and accept-and-shard. `Server(N)` keeps its coroutine meaning (1 loop + N workers); reactor TCP connections round-robin onto the loops. UDP stays on loop 0. See `docs/reactor-threading.md`.
-- TLS addition. Already in QUIC, of course, but needs to be added to the
-other protocols. HTTP/1.x should support both separate socket listeners
-and ALPN. Websockets should support both ws as wss.
+- [x] TLS-over-TCP for HTTP/1.1 and HTTP/2 (`listen_tls`, per-protocol
+  ALPN). WebSocket/`wss` still open (see below).
 - [x] Support wolfSSL as an alternate to OpenSSL (`-DSPAZNET_USE_WOLFSSL=ON`).
 - QUIC Demo. There is none at this point.
 - QUIC Improvements
@@ -592,16 +591,15 @@ Ordered by priority.
   `SSL_read`/`SSL_write`-driven path that isn't there yet, but the
   SSL_CTX construction (cert/key loading, ALPN) is reusable.
 
-- [ ] **TLS-over-TCP for HTTP / HTTP/2 / WebSocket (https / wss)** — LATER
-  - Design sketched 2026-07-18: optional OpenSSL path inside
-  `Socket::async_read` / `async_write` (opaque pimpl, `SSL_set_fd`,
-  `WANT_READ`/`WANT_WRITE` → existing `register_io` awaits), gated by
-  `SPAZNET_ENABLE_TLS` / `SPAZNET_HAS_TLS` (OpenSSL 1.1.1+/3.0+,
-  independent of QUIC's 3.5+ requirement). Would give all three
-  example servers https/wss with no dispatcher changes.
-  - **Blocked on ALPN protocol-selection decision:** one TLS port with
-  ALPN auto-routing (`h2` vs `http/1.1`/wss) vs per-server single
-  protocol. Scope (core only vs wire all examples + demos) also open.
-  - Plan file: `.cursor/plans/tls_https_support_later_00b0f3d4.plan.md`
-  (or the workspace copy under the user's Cursor plans dir).
+- [x] **TLS-over-TCP for HTTP / HTTP/2 (https)** — shipped
+  - `SPAZNET_ENABLE_TLS` / `SPAZNET_HAS_TLS` (OpenSSL 1.1.1+),
+  `TlsConfig` + `Server::listen_tls`, TLS under `Socket` /
+  `BufferedConnection` (`SSL_read`/`SSL_write`). Per-protocol ALPN
+  (`http/1.1` vs `h2`); no cross-protocol mux. Demos: `--tls` on
+  `http_hello` / `http2_hello`. Independent of QUIC TLS.
+- [ ] **WebSocket over TLS (wss)** — LATER
+  - Same TCP-TLS machinery; wire `example/http-websocket` once the
+  upgrade sniff runs after the TLS handshake (already true if the
+  listen socket is `listen_tls` with a suitable ALPN — decide
+  `http/1.1` vs a dedicated wss ALPN policy).
 

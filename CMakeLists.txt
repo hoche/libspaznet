@@ -126,6 +126,22 @@ if(SPAZNET_BUILD_QUIC)
     endif()
 endif()
 
+# ---- TCP TLS (HTTPS for HTTP/1.1 and HTTP/2) ------------------------------
+# Independent of QUIC's OpenSSL 3.5+ / wolfSSL requirement. Uses plain
+# SSL_read/SSL_write on accepted TCP fds via Server::listen_tls.
+option(SPAZNET_ENABLE_TLS
+    "TLS-over-TCP for HTTP/HTTP2 (requires OpenSSL 1.1.1+)" ON)
+if(SPAZNET_ENABLE_TLS)
+    find_package(OpenSSL 1.1.1 QUIET)
+    if(NOT OpenSSL_FOUND)
+        message(WARNING
+            "OpenSSL 1.1.1+ not found; disabling SPAZNET_ENABLE_TLS. "
+            "Pass -DSPAZNET_ENABLE_TLS=OFF to silence this warning, "
+            "or install OpenSSL and set OPENSSL_ROOT_DIR.")
+        set(SPAZNET_ENABLE_TLS OFF CACHE BOOL "" FORCE)
+    endif()
+endif()
+
 # ---- Coroutine runtime toggle --------------------------------------------
 # The reactor (IoHandler, the fd table, post(), timers) is always built and
 # has no coroutine dependency. Task/ValueTask, CoroutineHandle, and
@@ -189,7 +205,7 @@ else()
 endif()
 
 # ---- Source / header lists ----------------------------------------------
-# Core sources — always built; no OpenSSL dependency.
+# Core sources — always built. OpenSSL is linked only when SPAZNET_ENABLE_TLS.
 set(SOURCES
     src/platform/io_context.cpp
     src/platform/platform_io.cpp
@@ -215,6 +231,14 @@ set(HEADERS
     include/libspaznet/utils/binary_utils.hpp
     include/libspaznet/utils/header_utils.hpp
 )
+
+if(SPAZNET_ENABLE_TLS)
+    list(APPEND SOURCES src/tls/tls_stream.cpp)
+    list(APPEND HEADERS
+        include/libspaznet/tls_config.hpp
+        include/libspaznet/detail/tls_stream.hpp
+    )
+endif()
 
 # Server (and its Socket wrapper) is always built: Socket and the
 # coroutine-only accept/datagram-dispatch paths are #ifdef
@@ -249,6 +273,10 @@ if(SPAZNET_ENABLE_COROUTINES)
     # consumers linking spaznet::spaznet must see the same definition the
     # library itself was built with.
     target_compile_definitions(spaznet PUBLIC SPAZNET_HAS_COROUTINES)
+endif()
+if(SPAZNET_ENABLE_TLS)
+    target_link_libraries(spaznet PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(spaznet PUBLIC SPAZNET_HAS_TLS)
 endif()
 # QUIC TLS deps live on spaznet_quic_http3 only (see example/quic-http3).
 
@@ -335,13 +363,19 @@ install(EXPORT spaznetTargets
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/spaznet
 )
 
-# Core package only needs Threads.  QUIC TLS (OpenSSL / wolfSSL) is
-# pulled in by consumers that link spaznet::quic_http3, not by core.
+# Core package needs Threads, plus OpenSSL when TCP TLS was enabled.
+# QUIC TLS (OpenSSL 3.5 / wolfSSL) is pulled in by spaznet::quic_http3.
+if(SPAZNET_ENABLE_TLS)
+    set(SPAZNET_FIND_DEPENDENCY_OPENSSL "find_dependency(OpenSSL 1.1.1)")
+else()
+    set(SPAZNET_FIND_DEPENDENCY_OPENSSL "")
+endif()
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/spaznetConfig.cmake.in"
 "@PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
+@SPAZNET_FIND_DEPENDENCY_OPENSSL@
 
 include(\"\${CMAKE_CURRENT_LIST_DIR}/spaznetTargets.cmake\")
 

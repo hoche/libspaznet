@@ -2,12 +2,19 @@
 //
 //   $ ./http_hello           # coroutine dispatcher (default)
 //   $ ./http_hello --reactor # coroutine-free reactor dispatcher
+//   $ ./http_hello --tls     # also listen_tls on 8443 (ALPN http/1.1)
 //   $ curl http://localhost:8080/
+//   $ curl -k https://localhost:8443/
 //   Hello, libspaznet!
 
 #include <libspaznet/http/dispatcher.hpp>
 #include <libspaznet/http/handler.hpp>
 #include <libspaznet/server.hpp>
+#ifdef SPAZNET_HAS_TLS
+#include <libspaznet/detail/tls_self_signed.hpp>
+#include <libspaznet/tls_config.hpp>
+#include <iostream>
+#endif
 
 #include <cstring>
 #include <memory>
@@ -31,9 +38,13 @@ int main(int argc, char** argv) {
 #else
     bool use_reactor = true; // Coroutine dispatcher isn't built in this configuration.
 #endif
+    bool use_tls = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--reactor") == 0) {
             use_reactor = true;
+        }
+        if (std::strcmp(argv[i], "--tls") == 0) {
+            use_tls = true;
         }
     }
 
@@ -51,5 +62,20 @@ int main(int argc, char** argv) {
     }
 #endif
     server.listen_tcp(8080);
+#ifdef SPAZNET_HAS_TLS
+    if (use_tls) {
+        auto [cert, key] = spaznet::detail::make_self_signed_pem("localhost");
+        spaznet::TlsConfig cfg;
+        cfg.cert_pem = std::move(cert);
+        cfg.key_pem = std::move(key);
+        cfg.alpn = {"http/1.1"};
+        server.listen_tls(8443, std::move(cfg));
+        std::cerr << "TLS listening on https://127.0.0.1:8443/ (self-signed; curl -k)\n";
+    }
+#else
+    if (use_tls) {
+        // Built without SPAZNET_ENABLE_TLS — ignore.
+    }
+#endif
     server.run();
 }

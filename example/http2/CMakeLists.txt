@@ -36,6 +36,7 @@ if(BUILD_TESTING OR TARGET test_unit)
     set(SPAZNET_HTTP2_INTEGRATION_SOURCES
         ${PROJECT_SOURCE_DIR}/tests/test_main.cpp
         tests/integration/test_rfc9113_compliance.cpp
+        tests/integration/test_tls_https.cpp
     )
     add_executable(test_http2_integration ${SPAZNET_HTTP2_INTEGRATION_SOURCES})
     target_link_libraries(test_http2_integration PRIVATE spaznet_http2 GTest::gtest GTest::gmock)

@@ -7,6 +7,10 @@
 #include <libspaznet/detail/socket_compat.hpp>
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/platform_io.hpp>
+#ifdef SPAZNET_HAS_TLS
+#include <libspaznet/detail/tls_stream.hpp>
+#include <libspaznet/tls_config.hpp>
+#endif
 #include <memory>
 #include <mutex>
 #include <span>
@@ -28,6 +32,12 @@ class Socket {
     int fd_;
     IOContext* io_context_;
     bool owns_fd_;
+#ifdef SPAZNET_HAS_TLS
+    // Opaque TLS state (SSL*). Present when the connection was accepted
+    // from a listen_tls() socket. Handshake runs once via async_handshake()
+    // before the connection handler sees plaintext I/O.
+    std::unique_ptr<detail::TlsStream> tls_;
+#endif
 
   public:
     Socket(int fd, IOContext* ctx, bool owns_fd = true)
@@ -35,7 +45,12 @@ class Socket {
 
     // Move constructor
     Socket(Socket&& other) noexcept
-        : fd_(other.fd_), io_context_(other.io_context_), owns_fd_(other.owns_fd_) {
+        : fd_(other.fd_), io_context_(other.io_context_), owns_fd_(other.owns_fd_)
+#ifdef SPAZNET_HAS_TLS
+          ,
+          tls_(std::move(other.tls_))
+#endif
+    {
         other.owns_fd_ = false;
     }
 
@@ -48,6 +63,9 @@ class Socket {
             fd_ = other.fd_;
             io_context_ = other.io_context_;
             owns_fd_ = other.owns_fd_;
+#ifdef SPAZNET_HAS_TLS
+            tls_ = std::move(other.tls_);
+#endif
             other.owns_fd_ = false;
         }
         return *this;
@@ -70,6 +88,17 @@ class Socket {
     IOContext* context() const {
         return io_context_;
     }
+
+#ifdef SPAZNET_HAS_TLS
+    void attach_tls(std::unique_ptr<detail::TlsStream> tls) {
+        tls_ = std::move(tls);
+    }
+    [[nodiscard]] auto has_tls() const noexcept -> bool {
+        return static_cast<bool>(tls_);
+    }
+    // Complete the TLS handshake. Returns true on success.
+    ValueTask<bool> async_handshake();
+#endif
 
     // Async read. Resizes `buffer` to the bytes received and returns that
     // count; returns 0 on orderly EOF (buffer cleared) and -1 on a hard
@@ -187,6 +216,12 @@ class Server {
     // currently suspended on accept.
     std::mutex listen_fds_mutex_;
     std::vector<int> listen_fds_;
+#ifdef SPAZNET_HAS_TLS
+    // listen_fd -> shared SSL_CTX for that TLS listener. Cleared when the
+    // listen fd is closed. Plain listen_tcp() fds are absent from this map.
+    std::unordered_map<int, std::shared_ptr<detail::TlsContext>> tls_listen_;
+    class TlsHandshakeHandler;
+#endif
 #ifdef SPAZNET_HAS_COROUTINES
     // Track active per-connection coroutines so stop() can drain them
     // before the IOContext is torn down. Each handle_connection
@@ -262,6 +297,15 @@ class Server {
     // Start listening on a port (schedules the listen task)
     void listen_tcp(uint16_t port);
     void listen_udp(uint16_t port);
+
+#ifdef SPAZNET_HAS_TLS
+    // Same bind/listen as listen_tcp, but accepted connections complete a
+    // TLS handshake (ALPN from cfg) before the connection factory/handler
+    // runs. Dispatchers then see plaintext bytes via Socket /
+    // BufferedConnection. One protocol per listener — set cfg.alpn to
+    // {"http/1.1"} or {"h2"} as appropriate.
+    void listen_tls(uint16_t port, TlsConfig cfg);
+#endif
 
     // ---- Low-level callbacks (preferred, coroutine runtime only). ----
     // set_connection_handler is invoked once per accepted TCP

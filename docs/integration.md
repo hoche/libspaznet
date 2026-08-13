@@ -10,11 +10,14 @@ you want to track upstream or pin to a snapshot.
   AppleClang from Xcode 15+. The library uses `<format>`,
   `<coroutine>`, and `<span>`.
 - **CMake 3.20+**.
+- **TCP TLS (HTTPS)** — optional. Default: **OpenSSL 1.1.1+** via
+  `SPAZNET_ENABLE_TLS` (auto-disables with a warning if missing).
+  Enables `Server::listen_tls` for HTTP/1.1 and HTTP/2.
 - **QUIC TLS backend** — *only* required if you want QUIC + HTTP/3.
   Default: **OpenSSL 3.5+**. Alternate: **wolfSSL** with QUIC
   (`-DSPAZNET_USE_WOLFSSL=ON`). Without a usable backend the rest of
-  the library (UDP, HTTP/1.1, HTTP/2 parser, WebSocket) builds fine;
-  `SPAZNET_BUILD_QUIC` auto-disables with a warning.
+  the library builds fine; `SPAZNET_BUILD_QUIC` auto-disables with a
+  warning. Independent of `SPAZNET_ENABLE_TLS`.
 
 ## Option 1: install + `find_package`
 
@@ -45,9 +48,10 @@ cmake -B build -DCMAKE_PREFIX_PATH=/opt/spaznet
 ```
 
 The core `spaznet::spaznet` package brings `Threads::Threads`
-unconditionally and does **not** pull a TLS library. Link
-`spaznet::quic_http3` for QUIC + HTTP/3; that target carries the
-selected TLS backend (OpenSSL or wolfSSL).
+unconditionally, and `find_dependency(OpenSSL)` when the install was
+built with `SPAZNET_ENABLE_TLS`. Link `spaznet::quic_http3` for
+QUIC + HTTP/3; that target carries the selected QUIC TLS backend
+(OpenSSL 3.5 or wolfSSL) separately from core TCP TLS.
 
 ### `find_package` from `vcpkg` / `Conan` / system package manager
 
@@ -90,10 +94,10 @@ because no usable TLS backend was found), the build skips:
 build QUIC against a QUIC-enabled wolfSSL instead — OpenSSL is then
 not required.
 
-The HTTP/1.1, HTTP/2 parser, WebSocket, and UDP paths build with no
-TLS dependency.
+Cleartext HTTP/1.1, HTTP/2 (h2c), WebSocket, and UDP build with
+`-DSPAZNET_ENABLE_TLS=OFF` and no OpenSSL on core. HTTPS needs TLS on.
 
-To force-disable:
+To force-disable QUIC:
 
 ```cmake
 set(SPAZNET_BUILD_QUIC OFF CACHE BOOL "" FORCE)

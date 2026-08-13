@@ -8,6 +8,9 @@
 #include <libspaznet/detail/socket_compat.hpp>
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/server.hpp>
+#ifdef SPAZNET_HAS_TLS
+#include <libspaznet/detail/tls_stream.hpp>
+#endif
 #include <map>
 #include <optional>
 #include <sstream>
@@ -75,10 +78,125 @@ namespace {
 //        result <  0  + EAGAIN/EWOULDBLOCK/EINTR → spurious; re-await.
 //        result <  0  otherwise → hard error, buffer cleared, return.
 
+#ifdef SPAZNET_HAS_TLS
+ValueTask<bool> Socket::async_handshake() {
+    if (!tls_) {
+        co_return true;
+    }
+    detail::TlsStream* stream = tls_.get();
+    while (true) {
+        struct HandshakeAwaiter {
+            Socket* socket;
+            detail::TlsStream* stream;
+            mutable detail::TlsIoResult result{};
+            mutable uint32_t wait_events = PlatformIO::EVENT_READ;
+            mutable bool ready_flag = false;
+
+            bool await_ready() const noexcept {
+                result = stream->handshake();
+                if (result.kind == detail::TlsIoResult::Kind::Ok ||
+                    result.kind == detail::TlsIoResult::Kind::Error ||
+                    result.kind == detail::TlsIoResult::Kind::Closed) {
+                    ready_flag = true;
+                    return true;
+                }
+                wait_events = (result.kind == detail::TlsIoResult::Kind::WantWrite)
+                                  ? PlatformIO::EVENT_WRITE
+                                  : PlatformIO::EVENT_READ;
+                ready_flag = false;
+                return false;
+            }
+
+            void await_suspend(std::coroutine_handle<ValueTaskPromise<bool>> h) {
+                socket->context()->register_io(socket->fd(), wait_events,
+                                               CoroutineHandle::from_handle(h));
+            }
+
+            detail::TlsIoResult await_resume() noexcept {
+                if (!ready_flag) {
+                    result = stream->handshake();
+                }
+                return result;
+            }
+        };
+
+        auto r = co_await HandshakeAwaiter{this, stream};
+        if (r.kind == detail::TlsIoResult::Kind::Ok) {
+            co_return true;
+        }
+        if (r.kind == detail::TlsIoResult::Kind::WantRead ||
+            r.kind == detail::TlsIoResult::Kind::WantWrite) {
+            continue;
+        }
+        co_return false;
+    }
+}
+#endif // SPAZNET_HAS_TLS
+
 ValueTask<ssize_t> Socket::async_read(std::vector<uint8_t>& buffer, std::size_t size) {
     buffer.resize(size);
 
     while (true) {
+#ifdef SPAZNET_HAS_TLS
+        if (tls_) {
+            detail::TlsStream* stream = tls_.get();
+            struct TlsReadAwaiter {
+                Socket* socket;
+                detail::TlsStream* stream;
+                std::vector<uint8_t>* buffer;
+                std::size_t size;
+                mutable detail::TlsIoResult result{};
+                mutable uint32_t wait_events = PlatformIO::EVENT_READ;
+                mutable bool ready_flag = false;
+
+                bool await_ready() const noexcept {
+                    result = stream->read(buffer->data(), size);
+                    if (result.kind == detail::TlsIoResult::Kind::WantRead) {
+                        wait_events = PlatformIO::EVENT_READ;
+                        ready_flag = false;
+                        return false;
+                    }
+                    if (result.kind == detail::TlsIoResult::Kind::WantWrite) {
+                        wait_events = PlatformIO::EVENT_WRITE;
+                        ready_flag = false;
+                        return false;
+                    }
+                    ready_flag = true;
+                    return true;
+                }
+
+                void await_suspend(std::coroutine_handle<ValueTaskPromise<ssize_t>> h) {
+                    socket->context()->register_io(socket->fd(), wait_events,
+                                                   CoroutineHandle::from_handle(h));
+                }
+
+                detail::TlsIoResult await_resume() noexcept {
+                    if (!ready_flag) {
+                        result = stream->read(buffer->data(), size);
+                    }
+                    return result;
+                }
+            };
+
+            auto r = co_await TlsReadAwaiter{this, stream, &buffer, size};
+            if (r.kind == detail::TlsIoResult::Kind::Ok && r.n > 0) {
+                buffer.resize(r.n);
+                co_return static_cast<ssize_t>(r.n);
+            }
+            if (r.kind == detail::TlsIoResult::Kind::WantRead ||
+                r.kind == detail::TlsIoResult::Kind::WantWrite) {
+                continue;
+            }
+            if (r.kind == detail::TlsIoResult::Kind::Closed ||
+                (r.kind == detail::TlsIoResult::Kind::Ok && r.n == 0)) {
+                buffer.clear();
+                co_return 0;
+            }
+            buffer.clear();
+            co_return -1;
+        }
+#endif
+
         struct ReadAwaiter {
             Socket* socket;
             std::vector<uint8_t>* buffer;
@@ -150,6 +268,61 @@ Task Socket::async_write(std::vector<uint8_t> data) {
     std::size_t total_sent = 0;
 
     while (total_sent < data.size()) {
+#ifdef SPAZNET_HAS_TLS
+        if (tls_) {
+            detail::TlsStream* stream = tls_.get();
+            struct TlsWriteAwaiter {
+                Socket* socket;
+                detail::TlsStream* stream;
+                const uint8_t* data_ptr;
+                std::size_t remaining;
+                mutable detail::TlsIoResult result{};
+                mutable uint32_t wait_events = PlatformIO::EVENT_WRITE;
+                mutable bool ready_flag = false;
+
+                bool await_ready() const noexcept {
+                    result = stream->write(data_ptr, remaining);
+                    if (result.kind == detail::TlsIoResult::Kind::WantRead) {
+                        wait_events = PlatformIO::EVENT_READ;
+                        ready_flag = false;
+                        return false;
+                    }
+                    if (result.kind == detail::TlsIoResult::Kind::WantWrite) {
+                        wait_events = PlatformIO::EVENT_WRITE;
+                        ready_flag = false;
+                        return false;
+                    }
+                    ready_flag = true;
+                    return true;
+                }
+
+                void await_suspend(std::coroutine_handle<TaskPromise> h) {
+                    socket->context()->register_io(socket->fd(), wait_events,
+                                                   CoroutineHandle::from_handle(h));
+                }
+
+                detail::TlsIoResult await_resume() noexcept {
+                    if (!ready_flag) {
+                        result = stream->write(data_ptr, remaining);
+                    }
+                    return result;
+                }
+            };
+
+            auto r = co_await TlsWriteAwaiter{this, stream, data.data() + total_sent,
+                                              data.size() - total_sent};
+            if (r.kind == detail::TlsIoResult::Kind::Ok && r.n > 0) {
+                total_sent += r.n;
+                continue;
+            }
+            if (r.kind == detail::TlsIoResult::Kind::WantRead ||
+                r.kind == detail::TlsIoResult::Kind::WantWrite) {
+                continue;
+            }
+            break;
+        }
+#endif
+
         struct WriteAwaiter {
             Socket* socket;
             const uint8_t* data_ptr;
@@ -213,6 +386,12 @@ Task Socket::async_write(std::vector<uint8_t> data) {
 
 void Socket::close() {
     if (owns_fd_ && fd_ >= 0) {
+#ifdef SPAZNET_HAS_TLS
+        if (tls_) {
+            tls_->shutdown();
+            tls_.reset();
+        }
+#endif
         // Remove from both platform I/O and pending I/O map (remove_io
         // now handles both under its spinlock).
         io_context_->remove_io(fd_);
@@ -338,7 +517,9 @@ class Server::DatagramReadHandler : public IoHandler,
     int fd_;
 };
 
-void Server::listen_tcp(uint16_t port) {
+namespace {
+
+auto create_tcp_listen_fd(uint16_t port) -> int {
     // Use getaddrinfo for IPv4/IPv6 compatibility
     struct addrinfo hints {
     }, *result = nullptr;
@@ -385,6 +566,13 @@ void Server::listen_tcp(uint16_t port) {
         close_socket(listen_fd);
         throw std::runtime_error("Failed to listen on socket");
     }
+    return listen_fd;
+}
+
+} // namespace
+
+void Server::listen_tcp(uint16_t port) {
+    int listen_fd = create_tcp_listen_fd(port);
 
     running_.store(true);
     {
@@ -397,6 +585,146 @@ void Server::listen_tcp(uint16_t port) {
     primary_context().set_io_handler(listen_fd, PlatformIO::EVENT_READ,
                                      std::make_shared<ListenHandler>(*this, listen_fd));
 }
+
+#ifdef SPAZNET_HAS_TLS
+void Server::listen_tls(uint16_t port, TlsConfig cfg) {
+    auto tls_ctx = detail::TlsContext::create(cfg);
+    int listen_fd = create_tcp_listen_fd(port);
+
+    running_.store(true);
+    {
+        std::lock_guard<std::mutex> lock(listen_fds_mutex_);
+        listen_fds_.push_back(listen_fd);
+        tls_listen_[listen_fd] = std::move(tls_ctx);
+    }
+    primary_context().set_io_handler(listen_fd, PlatformIO::EVENT_READ,
+                                     std::make_shared<ListenHandler>(*this, listen_fd));
+}
+
+// Completes SSL_accept on a freshly accepted fd, then hands the connection
+// to connection_factory_ (stashing the TlsStream for BufferedConnection) or
+// to the coroutine connection_handler_ path.
+class Server::TlsHandshakeHandler : public IoHandler,
+                                    public std::enable_shared_from_this<TlsHandshakeHandler> {
+  public:
+    TlsHandshakeHandler(Server& server, int fd, IOContext* target,
+                        std::unique_ptr<detail::TlsStream> stream)
+        : server_(server), fd_(fd), target_(target), stream_(std::move(stream)) {}
+
+    void start() {
+        advance();
+    }
+
+    void on_readable() override {
+        advance();
+    }
+    void on_writable() override {
+        advance();
+    }
+    void on_error() override {
+        fail();
+    }
+    void shutdown() override {
+        fail();
+    }
+
+  private:
+    void arm(uint32_t events) {
+        target_->set_io_handler(fd_, events, shared_from_this());
+    }
+
+    void fail() {
+        if (done_) {
+            return;
+        }
+        done_ = true;
+        target_->remove_io(fd_);
+        {
+            std::lock_guard<std::mutex> lock(server_.reactor_conns_mutex_);
+            server_.reactor_connections_.erase(fd_);
+        }
+        if (stream_) {
+            stream_->shutdown();
+            stream_.reset();
+        }
+        close_socket(fd_);
+        fd_ = -1;
+    }
+
+    void finish_ok() {
+        if (done_) {
+            return;
+        }
+        done_ = true;
+        target_->remove_io(fd_);
+        {
+            std::lock_guard<std::mutex> lock(server_.reactor_conns_mutex_);
+            server_.reactor_connections_.erase(fd_);
+        }
+
+        if (server_.connection_factory_) {
+            detail::TlsStream::stash_for_fd(fd_, std::move(stream_));
+            const int fd = fd_;
+            IOContext* target = target_;
+            Server* server = &server_;
+            // Capture Server*, not this — the handshake handler may be
+            // destroyed long before on_closed fires on the real connection.
+            auto on_closed = [server, fd, target]() {
+                server->finish_reactor_connection(fd, target);
+            };
+            auto handler = server_.connection_factory_(fd, *target, std::move(on_closed));
+            if (handler) {
+                {
+                    std::lock_guard<std::mutex> lock(server_.reactor_conns_mutex_);
+                    server_.reactor_connections_[fd] = ReactorConn{std::move(handler), target};
+                }
+                target->increment_active_connections();
+            } else {
+                // Factory declined; claim any leftover stash and close.
+                (void)detail::TlsStream::claim_for_fd(fd);
+                close_socket(fd);
+            }
+            return;
+        }
+
+#ifdef SPAZNET_HAS_COROUTINES
+        Socket socket(fd_, &server_.primary_context());
+        socket.attach_tls(std::move(stream_));
+        // Handshake already done; mark stream so async_handshake is a no-op
+        // if somehow called again (handshake_done_ is already true).
+        server_.primary_context().schedule(server_.handle_connection(std::move(socket)));
+#else
+        close_socket(fd_);
+#endif
+    }
+
+    void advance() {
+        if (done_ || !stream_) {
+            return;
+        }
+        auto r = stream_->handshake();
+        if (r.kind == detail::TlsIoResult::Kind::Ok) {
+            finish_ok();
+            return;
+        }
+        if (r.kind == detail::TlsIoResult::Kind::WantRead) {
+            arm(PlatformIO::EVENT_READ);
+            return;
+        }
+        if (r.kind == detail::TlsIoResult::Kind::WantWrite) {
+            arm(PlatformIO::EVENT_WRITE);
+            return;
+        }
+        fail();
+    }
+
+    Server& server_;
+    int fd_;
+    IOContext* target_;
+    std::unique_ptr<detail::TlsStream> stream_;
+    bool done_{false};
+};
+#endif // SPAZNET_HAS_TLS
 
 void Server::listen_udp(uint16_t port) {
     // Use getaddrinfo for IPv4/IPv6 compatibility
@@ -541,6 +869,40 @@ bool Server::accept_ready(int listen_fd) {
         // Set non-blocking
         detail::set_nonblocking(client_fd);
 
+#ifdef SPAZNET_HAS_TLS
+        std::shared_ptr<detail::TlsContext> tls_ctx;
+        {
+            std::lock_guard<std::mutex> lock(listen_fds_mutex_);
+            auto it = tls_listen_.find(listen_fd);
+            if (it != tls_listen_.end()) {
+                tls_ctx = it->second;
+            }
+        }
+        if (tls_ctx) {
+            try {
+                auto stream = detail::TlsStream::create_server(tls_ctx, client_fd);
+                IOContext* target =
+                    connection_factory_ ? &pick_accept_loop() : &primary_context();
+                auto hs = std::make_shared<TlsHandshakeHandler>(*this, client_fd, target,
+                                                                std::move(stream));
+                {
+                    std::lock_guard<std::mutex> lock(reactor_conns_mutex_);
+                    reactor_connections_[client_fd] = ReactorConn{hs, target};
+                }
+                // Start on the target loop's IO thread so set_io_handler /
+                // handshake progress never race a different loop.
+                if (target == &primary_context()) {
+                    hs->start();
+                } else {
+                    target->post_to_io_thread([hs]() { hs->start(); });
+                }
+            } catch (...) {
+                close_socket(client_fd);
+            }
+            continue;
+        }
+#endif
+
         // Reactor path takes precedence over the coroutine-based
         // connection_handler_ (see ConnectionFactory's docs above).
         // Accept-and-shard: the listen fd stays on loop 0; the client fd is
@@ -593,6 +955,12 @@ bool Server::accept_ready(int listen_fd) {
         }
     }
     if (should_close) {
+#ifdef SPAZNET_HAS_TLS
+        {
+            std::lock_guard<std::mutex> lock(listen_fds_mutex_);
+            tls_listen_.erase(listen_fd);
+        }
+#endif
         primary_context().remove_io(listen_fd);
         close_socket(listen_fd);
     }
@@ -634,6 +1002,18 @@ Task Server::handle_connection(Socket socket) {
             ConnGuard& operator=(const ConnGuard&) = delete;
         };
         ConnGuard cg(this, socket.fd());
+#ifdef SPAZNET_HAS_TLS
+        // When accept handed us a TlsStream that has not finished
+        // handshake yet (should not happen — TlsHandshakeHandler completes
+        // it first), finish here. Already-done handshakes return immediately.
+        if (socket.has_tls()) {
+            bool ok = co_await socket.async_handshake();
+            if (!ok) {
+                socket.close();
+                co_return;
+            }
+        }
+#endif
         try {
             co_await connection_handler_(std::move(socket));
         } catch (...) {
@@ -686,6 +1066,12 @@ void Server::stop() {
         primary_context().remove_io(fd);
         close_socket(fd);
     }
+#ifdef SPAZNET_HAS_TLS
+    {
+        std::lock_guard<std::mutex> lock(listen_fds_mutex_);
+        tls_listen_.clear();
+    }
+#endif
 
 #ifdef SPAZNET_HAS_COROUTINES
     // Step 3: shutdown(2) every active client fd. This forces any

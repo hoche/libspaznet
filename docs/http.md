@@ -73,6 +73,31 @@ behavioral divergence between them is treated as a bug. See
 `docs/concurrency-and-coroutines.md` for how the two execution models
 differ under the hood.
 
+### HTTPS (TLS-over-TCP)
+
+When the core is built with `SPAZNET_ENABLE_TLS` (default `ON` if
+OpenSSL 1.1.1+ is found; defines `SPAZNET_HAS_TLS`), call
+`Server::listen_tls(port, TlsConfig)` alongside or instead of
+`listen_tcp`. TLS terminates under `Socket` / `BufferedConnection`, so
+existing HTTP dispatchers see plaintext bytes with no code changes.
+
+```cpp
+#include <libspaznet/tls_config.hpp>
+
+spaznet::TlsConfig cfg;
+cfg.cert_pem = /* PEM string */;
+cfg.key_pem = /* PEM string */;
+cfg.alpn = {"http/1.1"};   // this listener speaks HTTP/1.1 only
+server.listen_tls(8443, std::move(cfg));
+// Optional: keep cleartext too
+server.listen_tcp(8080);
+```
+
+Per-protocol ALPN: an HTTP/1.1 TLS listener advertises `http/1.1`; an
+HTTP/2 TLS listener advertises `h2`. There is no ALPN mux that routes
+both protocols on one port. `example/http/demo/hello.cpp --tls` listens
+on 8443 with a self-signed cert (`curl -k https://127.0.0.1:8443/`).
+
 ### `HTTPRequest`
 
 The handler receives a fully-parsed request:
@@ -238,10 +263,12 @@ with:
 curl --http2-prior-knowledge -s -i http://127.0.0.1:8080/
 ```
 
-For h2-over-TLS (the `h2` ALPN), terminate TLS in front; libspaznet
-does not include a TLS server for TCP today.  The QUIC stack
-(`example/quic-http3`) is a separate path that does include TLS via
-OpenSSL 3.5+.
+For h2-over-TLS, use `Server::listen_tls` with `alpn = {"h2"}` (requires
+`SPAZNET_HAS_TLS`). Same dual-dispatcher story as cleartext h2c —
+`example/http2/demo/hello.cpp --tls` listens on 8443
+(`curl -k --http2 https://127.0.0.1:8443/`). The QUIC stack
+(`example/quic-http3`) remains a separate UDP path with its own TLS
+backend (OpenSSL 3.5+ or wolfSSL).
 
 ### Two dispatchers, one handler
 
@@ -296,7 +323,7 @@ how the two execution models differ under the hood.
 
 ### What's not in `example/http2`
 
-- HTTP/2 over TLS (no TLS terminator in the core; terminate in front).
+- WebSocket over TLS (`wss`) — TLS-over-TCP is in for HTTP/HTTP2; WSS is still open.
 - HPACK dynamic table (intentional — see above).
 - PUSH_PROMISE / server push (disabled via SETTINGS).
 - Trailers, priority frames (priority frames are silently dropped
