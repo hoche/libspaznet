@@ -103,12 +103,18 @@ TEST_P(TCPServerTest, ListenOnPort) {
     ASSERT_NE(port, 0u);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    // Try to connect
+    // Full request/response — bare connect()+close() races the accept
+    // path against an already-gone peer and has segfaulted under CI load
+    // (Ubuntu 25.10) without giving the reactor dispatcher a chance to
+    // run a real exchange.
     int client = connect_to_server(port);
-    if (client >= 0) {
-        close_socket(client);
-    }
-    // Connection may succeed or fail depending on handler, but shouldn't crash
+    ASSERT_GE(client, 0);
+    const std::string req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    ASSERT_EQ(send(client, req.data(), req.size(), 0), static_cast<ssize_t>(req.size()));
+    char buf[512]{};
+    ssize_t n = recv(client, buf, sizeof(buf) - 1, 0);
+    EXPECT_GT(n, 0);
+    close_socket(client);
 }
 
 TEST_P(TCPServerTest, MultiplePorts) {
