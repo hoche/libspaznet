@@ -21,6 +21,7 @@ using namespace spaznet;
 using spaznet::http::testing_support::DispatcherKind;
 using spaznet::http::testing_support::DispatcherKindName;
 using spaznet::http::testing_support::install_dispatcher;
+using spaznet::http::testing_support::listen_on_random_port;
 using spaznet::http::testing_support::AllDispatcherKinds;
 
 class ConcurrentHTTPHandler : public spaznet::http::HTTPHandler {
@@ -49,7 +50,8 @@ class ConcurrentConnectionsTest : public ::testing::TestWithParam<DispatcherKind
     void SetUp() override {
         server = std::make_unique<Server>(4); // 4 threads for concurrency
         install_dispatcher(*server, std::make_unique<ConcurrentHTTPHandler>(), GetParam());
-        server->listen_tcp(5555);
+        port = listen_on_random_port(*server);
+        ASSERT_NE(port, 0u);
 
         server_thread = std::thread([this]() { server->run(); });
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -70,7 +72,7 @@ class ConcurrentConnectionsTest : public ::testing::TestWithParam<DispatcherKind
         struct sockaddr_in addr {};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-        addr.sin_port = htons(5555);
+        addr.sin_port = htons(port);
 
         if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
             close_socket(sock);
@@ -94,6 +96,7 @@ class ConcurrentConnectionsTest : public ::testing::TestWithParam<DispatcherKind
 
     std::unique_ptr<Server> server;
     std::thread server_thread;
+    uint16_t port{0};
 };
 
 TEST_P(ConcurrentConnectionsTest, MultipleSequentialConnections) {

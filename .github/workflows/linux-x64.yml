@@ -53,6 +53,6 @@ jobs:
               grep -q "SPAZNET_BUILD_QUIC:BOOL=ON" CMakeCache.txt
             fi
             cmake --build . --parallel "$jobs"
-            # Tests stay serial: several integration suites bind fixed ports.
+            # Tests stay serial: some suites still assume one process at a time.
             ctest --output-on-failure --timeout 180
           '

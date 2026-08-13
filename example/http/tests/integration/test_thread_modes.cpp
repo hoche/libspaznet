@@ -8,7 +8,6 @@
 #include <cstring>
 #include <libspaznet/http/dispatcher.hpp>
 #include <libspaznet/server.hpp>
-#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -20,31 +19,10 @@
 using namespace spaznet;
 using spaznet::http::testing_support::DispatcherKind;
 using spaznet::http::testing_support::install_dispatcher;
+using spaznet::http::testing_support::listen_on_random_port;
 using spaznet::http::testing_support::AllDispatcherKinds;
 
 namespace {
-
-static uint16_t listen_on_random_port(Server& server) {
-    // Avoid "pick free port, close it, then bind later" races by binding directly and retrying.
-    //
-    // We intentionally avoid port 0 because Server currently doesn't expose the chosen port back to
-    // the caller.
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<int> dist(20000, 65000);
-
-    constexpr int kMaxAttempts = 200;
-    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
-        uint16_t port = static_cast<uint16_t>(dist(gen));
-        try {
-            server.listen_tcp(port);
-            return port;
-        } catch (...) {
-            // Most likely EADDRINUSE; retry with another port.
-        }
-    }
-    return 0;
-}
 
 static std::string send_http_request(uint16_t port, const std::string& path = "/") {
     int sock = socket(AF_INET, SOCK_STREAM, 0);

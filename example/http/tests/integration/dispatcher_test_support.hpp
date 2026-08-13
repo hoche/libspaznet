@@ -19,7 +19,9 @@
 #include <libspaznet/http/handler.hpp>
 #include <libspaznet/server.hpp>
 
+#include <cstdint>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -63,6 +65,27 @@ inline auto AllDispatcherKinds() -> std::vector<DispatcherKind> {
 #else
     return {DispatcherKind::Reactor};
 #endif
+}
+
+// Bind directly on a random high port (retry on EADDRINUSE). Prefer this over
+// hard-coded ports: matrix jobs and back-to-back suites otherwise collide, and
+// Server does not yet expose the OS-chosen port for listen_tcp(0).
+inline auto listen_on_random_port(::spaznet::Server& server) -> uint16_t {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> dist(20000, 65000);
+
+    constexpr int kMaxAttempts = 200;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        const auto port = static_cast<uint16_t>(dist(gen));
+        try {
+            server.listen_tcp(port);
+            return port;
+        } catch (...) {
+            // Most likely EADDRINUSE; retry with another port.
+        }
+    }
+    return 0;
 }
 
 } // namespace spaznet::http::testing_support

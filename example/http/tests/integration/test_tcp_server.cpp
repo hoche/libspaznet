@@ -18,6 +18,7 @@ using namespace spaznet;
 using spaznet::http::testing_support::DispatcherKind;
 using spaznet::http::testing_support::DispatcherKindName;
 using spaznet::http::testing_support::install_dispatcher;
+using spaznet::http::testing_support::listen_on_random_port;
 using spaznet::http::testing_support::AllDispatcherKinds;
 
 // Simple test HTTP handler
@@ -97,11 +98,12 @@ TEST_P(TCPServerTest, ServerStartup) {
 }
 
 TEST_P(TCPServerTest, ListenOnPort) {
-    EXPECT_NO_THROW(server->listen_tcp(9999));
+    const uint16_t port = listen_on_random_port(*server);
+    ASSERT_NE(port, 0u);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // Try to connect
-    int client = connect_to_server(9999);
+    int client = connect_to_server(port);
     if (client >= 0) {
         close_socket(client);
     }
@@ -109,13 +111,15 @@ TEST_P(TCPServerTest, ListenOnPort) {
 }
 
 TEST_P(TCPServerTest, MultiplePorts) {
-    EXPECT_NO_THROW(server->listen_tcp(9998));
-    EXPECT_NO_THROW(server->listen_tcp(9997));
+    const uint16_t port1 = listen_on_random_port(*server);
+    const uint16_t port2 = listen_on_random_port(*server);
+    ASSERT_NE(port1, 0u);
+    ASSERT_NE(port2, 0u);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // Both ports should be listening
-    int client1 = connect_to_server(9998);
-    int client2 = connect_to_server(9997);
+    int client1 = connect_to_server(port1);
+    int client2 = connect_to_server(port2);
 
     if (client1 >= 0)
         close_socket(client1);
@@ -134,10 +138,11 @@ TEST_P(TCPServerTest, ServerShutdown) {
 // data), then call stop() and assert it returns inside the drain
 // deadline.
 TEST_P(TCPServerTest, StopDrainsIdleConnection) {
-    server->listen_tcp(9996);
+    const uint16_t port = listen_on_random_port(*server);
+    ASSERT_NE(port, 0u);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    int client = connect_to_server(9996);
+    int client = connect_to_server(port);
     ASSERT_GE(client, 0);
 
     // Send one full request and read the response so the server side has
@@ -175,12 +180,13 @@ TEST_P(TCPServerTest, StopDrainsIdleConnection) {
 // stop(); if the guard's release path is wrong, stop() will block
 // for ~1s waiting on a phantom active-connection count.
 TEST_P(TCPServerTest, StopReturnsImmediatelyAfterShortLivedConnections) {
-    server->listen_tcp(9995);
+    const uint16_t port = listen_on_random_port(*server);
+    ASSERT_NE(port, 0u);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     constexpr int kNumConnections = 25;
     for (int i = 0; i < kNumConnections; ++i) {
-        int client = connect_to_server(9995);
+        int client = connect_to_server(port);
         ASSERT_GE(client, 0);
         std::string req = "GET /x HTTP/1.1\r\n"
                           "Host: localhost\r\n"

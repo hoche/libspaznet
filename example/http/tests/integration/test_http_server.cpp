@@ -19,6 +19,7 @@ using namespace spaznet;
 using spaznet::http::testing_support::DispatcherKind;
 using spaznet::http::testing_support::DispatcherKindName;
 using spaznet::http::testing_support::install_dispatcher;
+using spaznet::http::testing_support::listen_on_random_port;
 using spaznet::http::testing_support::AllDispatcherKinds;
 
 // Use a unique test handler name to avoid ODR clashes with handlers in other
@@ -61,7 +62,8 @@ class HTTPServerTest : public ::testing::TestWithParam<DispatcherKind> {
         handler = handler_unique.get();
         server = std::make_unique<Server>(2);
         install_dispatcher(*server, std::move(handler_unique), GetParam());
-        server->listen_tcp(8888);
+        port = listen_on_random_port(*server);
+        ASSERT_NE(port, 0u);
 
         server_thread = std::thread([this]() { server->run(); });
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -82,7 +84,7 @@ class HTTPServerTest : public ::testing::TestWithParam<DispatcherKind> {
         struct sockaddr_in addr {};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-        addr.sin_port = htons(8888);
+        addr.sin_port = htons(port);
 
         if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
             close_socket(sock);
@@ -175,6 +177,7 @@ class HTTPServerTest : public ::testing::TestWithParam<DispatcherKind> {
     HTTPServerTestHandler* handler{nullptr}; // owned by the server
     std::unique_ptr<Server> server;
     std::thread server_thread;
+    uint16_t port{0};
 };
 
 TEST_P(HTTPServerTest, HandleGETRequest) {
