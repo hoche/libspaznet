@@ -343,24 +343,30 @@ Coroutines are the optional layer, not the foundation: the reactor core (`IoHand
 
 **Backend** means which I/O demultiplexer the lock is tied to. `all` = present regardless of demux (epoll / kqueue / poll / IOCP). epoll and kqueue keep interest sets in the kernel and add **no** mutex of their own. A given binary includes at most one of the poll / IOCP table locks.
 
+**Runtime** means which execution model exercises the lock: `both` (present and used no matter which dispatcher a connection uses), `coroutine` (only reachable through a `Task`-returning `Handler`; compiled out entirely under `-DSPAZNET_ENABLE_COROUTINES=OFF`), or `reactor` (only reachable through an `IoHandler` / `make_reactor_dispatcher` path; present in every build, coroutines or not). See *Execution Models* above for what distinguishes the two.
+
 #### Core library (`src/`, `include/libspaznet/`)
 
 
-| Location                               | File                                          | Backend        | Guards                                                                                                                                                      |
-| -------------------------------------- | --------------------------------------------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TaskQueue::mutex_`                    | `include/libspaznet/platform/io_context.hpp`  | all            | both ends of each worker's task queue                                                                                                                       |
-| `IOContext::timer_mutex_`              | `include/libspaznet/platform/io_context.hpp`  | all            | timer min-heap + cancelled-set + suspended-tasks map                                                                                                        |
-| `IOContext::map_lock_`                 | `include/libspaznet/platform/io_context.hpp`  | all            | `pending_io_` map and platform `add_fd` / `modify_fd` / `remove_fd` side-table updates                                                                      |
-| `IOContext::worker_wake_mutex_`        | `include/libspaznet/platform/io_context.hpp`  | all            | pairs with `worker_wake_cv_`; idle workers park here instead of busy-yielding                                                                               |
-| `IOContext::worker_join_mutex_`        | `include/libspaznet/platform/io_context.hpp`  | all            | serializes `join_workers()` between `run()`'s exit path and `~IOContext`                                                                                    |
-| `Server::listen_fds_mutex_`            | `include/libspaznet/server.hpp`               | all            | listening-socket vector                                                                                                                                     |
-| `Server::client_fds_mutex_`            | `include/libspaznet/server.hpp`               | all            | active-client-fd set used by `Server::stop()` to drain in-flight connections                                                                                |
-| `PlatformIOPoll::mutex_`               | `src/platform/platform_io_poll.cpp`           | poll / WSAPoll | interest-set tables (`pollfds_` / `fd_info_`); compiled when `USE_POLL` is selected (non-Windows default fallback, or `-DSPAZNET_FORCE_POLL=ON` on Windows) |
-| `PlatformIOIOCP::mutex_`               | `src/platform/platform_io_iocp.cpp`           | IOCP (Winsock) | IOCP fd/probe tables; compiled when `USE_IOCP` is selected (default on Windows)                                                                             |
-| `detail::ensure_winsock()` `once_flag` | `include/libspaznet/detail/socket_compat.hpp` | Winsock        | process-wide `WSAStartup` / `WSACleanup`; fires at most once (not a `std::mutex`)                                                                           |
+| Location                               | File                                              | Backend        | Runtime   | Guards                                                                                                                                                 |
+| --------------------------------------- | -------------------------------------------------- | --------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TaskQueue::mutex_`                    | `include/libspaznet/platform/io_context.hpp`      | all            | coroutine | both ends of each worker's coroutine task queue (`thread_queues_`)                                                                                     |
+| `CallbackQueue::mutex_`                | `include/libspaznet/platform/io_context.hpp`      | all            | both      | both ends of `post()`'s round-robin callback queues (`callback_queues_`) and the single IO-thread-affine queue behind `post_to_io_thread()` (`io_thread_queue_`) |
+| `IOContext::timer_mutex_`              | `include/libspaznet/platform/io_context.hpp`      | all            | both      | timer min-heap + cancelled-set + (coroutine-only) suspended-tasks map                                                                                  |
+| `IOContext::map_lock_`                 | `include/libspaznet/platform/io_context.hpp`      | all            | both      | `pending_io_` map and platform `add_fd` / `modify_fd` / `remove_fd` side-table updates                                                                 |
+| `IOContext::reap_mutex_`               | `include/libspaznet/platform/io_context.hpp`      | all            | reactor   | the reap list backing `defer_destruction()` — lets a reactor state machine tear itself down safely from inside its own callback                       |
+| `IOContext::worker_wake_mutex_`        | `include/libspaznet/platform/io_context.hpp`      | all            | both      | pairs with `worker_wake_cv_`; idle workers park here instead of busy-yielding                                                                          |
+| `IOContext::worker_join_mutex_`        | `include/libspaznet/platform/io_context.hpp`      | all            | both      | serializes `join_workers()` between `run()`'s exit path and `~IOContext`                                                                               |
+| `Server::listen_fds_mutex_`            | `include/libspaznet/server.hpp`                   | all            | both      | listening-socket vector                                                                                                                                |
+| `Server::client_fds_mutex_`            | `include/libspaznet/server.hpp`                   | all            | coroutine | active-client-fd set used by `Server::stop()` to drain in-flight coroutine connections                                                                |
+| `Server::reactor_conns_mutex_`         | `include/libspaznet/server.hpp`                   | all            | reactor   | `reactor_connections_` (fd → `IoHandler`) registry backing `set_connection_factory`, from acceptance until `on_closed` fires or `stop()` tears it down |
+| `ResponseWriter<Response>::State::mu`  | `include/libspaznet/reactor/response_writer.hpp`  | —              | both      | the shared completion state (`deliver`, `on_ready`, `completed`) so `complete()` can race safely against `on_ready()` registration from any thread    |
+| `PlatformIOPoll::mutex_`               | `src/platform/platform_io_poll.cpp`               | poll / WSAPoll | both      | interest-set tables (`pollfds_` / `fd_info_`); compiled when `USE_POLL` is selected (non-Windows default fallback, or `-DSPAZNET_FORCE_POLL=ON` on Windows) |
+| `PlatformIOIOCP::mutex_`               | `src/platform/platform_io_iocp.cpp`               | IOCP (Winsock) | both      | IOCP fd/probe tables; compiled when `USE_IOCP` is selected (default on Windows)                                                                        |
+| `detail::ensure_winsock()` `once_flag` | `include/libspaznet/detail/socket_compat.hpp`     | Winsock        | both      | process-wide `WSAStartup` / `WSACleanup`; fires at most once (not a `std::mutex`)                                                                      |
 
 
-Everything else in core — coroutine ref-counts, the per-fd generation counter that defeats fd-reuse, statistics, timer ids, `running_` / `active_connections_` flags, etc. — lives in `std::atomic<…>` and never reaches for a mutex.
+Everything else in core — coroutine ref-counts, the per-fd generation counter that defeats fd-reuse, statistics, timer ids, `running_` / `active_connections_` flags, etc. — lives in `std::atomic<…>` and never reaches for a mutex. Reactor connection state itself (`BufferedConnection` and everything built on it) needs no lock at all: exactly one thread per `IOContext` ever calls `on_readable()`/`on_writable()` — see [`docs/reactor-threading.md`](docs/reactor-threading.md) and `docs/concurrency-and-coroutines.md`'s "Reactor Threading Model".
 
 See `docs/mutex-vs-atomics.md` for why the core locks are mutexes rather than atomics.
 
@@ -369,12 +375,13 @@ See `docs/mutex-vs-atomics.md` for why the core locks are mutexes rather than at
 These ship with the optional protocol stacks under `example/`; they are not part of the core `spaznet` target and are not demos. Backend is `—` because they sit above the demux.
 
 
-| Location        | File                                        | Backend | Guards                                                                                                          |
-| --------------- | ------------------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------- |
-| `WriteGate::m`  | `example/http-websocket/src/dispatcher.cpp` | —       | fair async write gate so dispatcher control frames and application `send()` cannot interleave on one connection |
-| `ConnState::mu` | `example/http2/src/dispatcher.cpp`          | —       | per-connection HTTP/2 state and the serialized outbound frame queue                                             |
+| Location        | File                                        | Backend | Runtime   | Guards                                                                                                                                                                                                             |
+| --------------- | ------------------------------------------- | ------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `WriteGate::m`  | `example/http-websocket/src/dispatcher.cpp` | —       | coroutine | fair async write gate so dispatcher control frames and application `send()` cannot interleave on one connection — the reactor dispatcher's `OutputBuffer` serializes writes by construction, so it needs no gate |
+| `ConnState::mu` | `example/http2/src/dispatcher.cpp`          | —       | coroutine | per-connection HTTP/2 state and the serialized outbound frame queue — the reactor dispatcher's `Http2Connection` needs no lock, since every mutating entry point is provably reached from the IO thread alone via `post_to_io_thread()` (`assert(ctx_.is_io_thread())` instead) |
 
 
+Neither of these has a reactor-side counterpart lock: the reactor dispatchers for WebSocket and HTTP/2 achieve the same single-writer/single-mutator guarantee through `OutputBuffer` and IO-thread affinity instead of a mutex.
 
 
 #### Demos only (`example/*/demo`)
@@ -382,12 +389,13 @@ These ship with the optional protocol stacks under `example/`; they are not part
 Demo binaries may take locks for application-level shared state. None of these are linked into the core library or the protocol example libraries.
 
 
-| Demo         | Location                   | File                                   | Backend | Guards                                                                     |
-| ------------ | -------------------------- | -------------------------------------- | ------- | -------------------------------------------------------------------------- |
-| `ws_chat`    | `ChatRoom::mu_`            | `example/http-websocket/demo/chat.cpp` | —       | room session map (`sessions_`) across `on_open` / `on_close` / `broadcast` |
-| `ws_chat`    | `Session::mu`              | `example/http-websocket/demo/chat.cpp` | —       | that session's outbound message outbox                                     |
-| `udp_relay`  | `Relay::peers_mutex_`      | `example/udp/demo/relay.cpp`           | —       | peer table shared across datagram worker threads                           |
-| `udp_statsd` | `StatsdAggregator::mutex_` | `example/udp/demo/statsd.cpp`          | —       | counter/gauge maps between the handler and the reporter thread             |
+| Demo         | Location                   | File                                     | Backend | Runtime   | Guards                                                                                                                                                        |
+| ------------ | -------------------------- | ----------------------------------------- | ------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ws_chat`    | `ChatRoom::mu_`            | `example/http-websocket/demo/chat.cpp`   | —       | coroutine | room session map (`sessions_`) across `on_open` / `on_close` / `broadcast`                                                                                   |
+| `ws_chat`    | `Session::mu`              | `example/http-websocket/demo/chat.cpp`   | —       | coroutine | that session's outbound message outbox                                                                                                                       |
+| `ws_chat`    | `ChatRoomReactor::mu_`     | `example/http-websocket/demo/chat.cpp`   | —       | reactor   | same room session map, coroutine-free counterpart of `ChatRoom::mu_` — no per-session outbox needed since `Connection::send()` is a direct synchronous write |
+| `udp_relay`  | `Relay::peers_mutex_`      | `example/udp/demo/relay.cpp`             | —       | both      | peer table shared across datagram worker threads; the same `Relay` instance backs both `--reactor` and the default coroutine dispatcher                     |
+| `udp_statsd` | `StatsdAggregator::mutex_` | `example/udp/demo/statsd.cpp`            | —       | both      | counter/gauge maps between the handler and the reporter thread; the same `StatsdAggregator` instance backs both dispatchers                                 |
 
 
 Other demos (`http_hello`, `http_showcase`, `http2_*`, `ws_echo`, `udp_echo`, etc.) do not introduce their own mutexes.
