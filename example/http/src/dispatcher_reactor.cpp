@@ -274,13 +274,21 @@ class Http1Connection : public std::enable_shared_from_this<Http1Connection> {
 
 } // namespace
 
+auto attach_reactor_dispatcher(::spaznet::IOContext& ctx,
+                               std::shared_ptr<::spaznet::BufferedConnection> conn,
+                               std::shared_ptr<HTTPHandler> handler,
+                               std::vector<std::uint8_t> initial_buffer,
+                               std::function<void()> on_closed) -> void {
+    auto dispatcher = std::make_shared<Http1Connection>(ctx, conn, std::move(handler));
+    dispatcher->start(std::move(initial_buffer), std::move(on_closed));
+}
+
 auto make_reactor_dispatcher(std::unique_ptr<HTTPHandler> handler) -> ::spaznet::ConnectionFactory {
     std::shared_ptr<HTTPHandler> shared(handler.release());
     return [shared](int fd, ::spaznet::IOContext& ctx,
                     std::function<void()> on_closed) -> std::shared_ptr<::spaznet::IoHandler> {
         auto conn = std::make_shared<::spaznet::BufferedConnection>(ctx, fd);
-        auto dispatcher = std::make_shared<Http1Connection>(ctx, conn, shared);
-        dispatcher->start({}, std::move(on_closed));
+        attach_reactor_dispatcher(ctx, conn, shared, {}, std::move(on_closed));
         return conn;
     };
 }

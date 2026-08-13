@@ -9,9 +9,11 @@
 // example/http-websocket/.
 
 #include <libspaznet/http/handler.hpp>
+#include <libspaznet/reactor/buffered_connection.hpp>
 #include <libspaznet/server.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -42,5 +44,21 @@ auto serve_keep_alive(::spaznet::Socket socket, HTTPHandler& handler,
 // tests/integration/test_dispatcher_differential.cpp for the harness that
 // checks exactly that.
 auto make_reactor_dispatcher(std::unique_ptr<HTTPHandler> handler) -> ::spaznet::ConnectionFactory;
+
+// Lower-level building block make_reactor_dispatcher() is built on:
+// attach the reactor HTTP/1.1 keep-alive loop to an already-constructed
+// BufferedConnection, optionally seeded with bytes already read off the
+// wire. Mirrors serve_keep_alive's role for the coroutine runtime above —
+// example/http-websocket's reactor dispatcher uses this exactly the way
+// its coroutine counterpart uses serve_keep_alive: peek at the
+// connection to decide HTTP vs. WebSocket, then hand off here (with
+// whatever was already read) if it turns out to be plain HTTP.
+// `on_closed` fires exactly once, whenever the connection this attaches
+// to is done. Call at most once per `conn`.
+auto attach_reactor_dispatcher(::spaznet::IOContext& ctx,
+                               std::shared_ptr<::spaznet::BufferedConnection> conn,
+                               std::shared_ptr<HTTPHandler> handler,
+                               std::vector<std::uint8_t> initial_buffer,
+                               std::function<void()> on_closed) -> void;
 
 } // namespace spaznet::http

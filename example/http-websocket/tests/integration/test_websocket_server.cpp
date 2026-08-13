@@ -1,4 +1,7 @@
 #include <gtest/gtest.h>
+
+#include "dispatcher_test_support.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -177,12 +180,18 @@ std::string handshake_request(const std::string& key) {
 
 } // namespace
 
-class EchoWSHandler : public spaznet::websocket::Handler {
-  public:
+// Shared between both Handler flavors below so the test fixture can read
+// open_count/close_count regardless of which dispatcher is under test.
+struct OpenCloseCounters {
     std::atomic<int> open_count{0};
     std::atomic<int> close_count{0};
+};
+
+class EchoWSHandler : public spaznet::websocket::Handler {
+  public:
+    explicit EchoWSHandler(OpenCloseCounters& counters) : counters_(counters) {}
     Task on_open(spaznet::websocket::Connection&) override {
-        open_count.fetch_add(1);
+        counters_.open_count.fetch_add(1);
         co_return;
     }
     Task handle_message(const spaznet::websocket::Message& message,
@@ -190,23 +199,46 @@ class EchoWSHandler : public spaznet::websocket::Handler {
         co_await conn.send(message.opcode, message.data);
     }
     Task on_close(spaznet::websocket::Connection&) override {
-        close_count.fetch_add(1);
+        counters_.close_count.fetch_add(1);
         co_return;
     }
+
+  private:
+    OpenCloseCounters& counters_;
 };
 
-class WebSocketServerTest : public ::testing::Test {
+class EchoWSHandlerReactor : public spaznet::websocket::reactor::Handler {
+  public:
+    explicit EchoWSHandlerReactor(OpenCloseCounters& counters) : counters_(counters) {}
+    void on_open(spaznet::websocket::reactor::Connection&) override {
+        counters_.open_count.fetch_add(1);
+    }
+    void handle_message(const spaznet::websocket::Message& message,
+                        spaznet::websocket::reactor::Connection& conn) override {
+        conn.send(message.opcode, message.data);
+    }
+    void on_close(spaznet::websocket::reactor::Connection&) override {
+        counters_.close_count.fetch_add(1);
+    }
+
+  private:
+    OpenCloseCounters& counters_;
+};
+
+using spaznet::websocket::testing_support::DispatcherKind;
+using spaznet::websocket::testing_support::DispatcherKindName;
+
+class WebSocketServerTest : public ::testing::TestWithParam<DispatcherKind> {
   protected:
     void SetUp() override {
-        // Keep a raw pointer to the server-owned handler so the
-        // open_count / close_count assertions below actually observe
-        // the handler the server is calling into. (The old code
-        // constructed two separate handler instances and read counters
-        // off the wrong one.)
-        auto handler_unique = std::make_unique<EchoWSHandler>();
-        handler = handler_unique.get();
         server = std::make_unique<Server>(2);
-        server->set_connection_handler(spaznet::websocket::make_dispatcher(nullptr, std::move(handler_unique)));
+        if (GetParam() == DispatcherKind::Reactor) {
+            server->set_connection_factory(spaznet::websocket::make_reactor_dispatcher(
+                nullptr, std::make_unique<EchoWSHandlerReactor>(counters)));
+        } else {
+            server->set_connection_handler(spaznet::websocket::make_dispatcher(
+                nullptr, std::make_unique<EchoWSHandler>(counters)));
+        }
         port = 7877;
         server->listen_tcp(port);
         server_thread = std::thread([this]() { server->run(); });
@@ -221,12 +253,16 @@ class WebSocketServerTest : public ::testing::Test {
     }
 
     uint16_t port{};
-    EchoWSHandler* handler{nullptr}; // owned by the server
+    OpenCloseCounters counters;
     std::unique_ptr<Server> server;
     std::thread server_thread;
 };
 
-TEST_F(WebSocketServerTest, PerformsRFC6455Handshake) {
+INSTANTIATE_TEST_SUITE_P(Dispatchers, WebSocketServerTest,
+                         ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                         DispatcherKindName);
+
+TEST_P(WebSocketServerTest, PerformsRFC6455Handshake) {
     int fd = connect_client(port);
     ASSERT_GE(fd, 0);
     std::string key = "dGhlIHNhbXBsZSBub25jZQ=="; // RFC6455 example key
@@ -243,11 +279,11 @@ TEST_F(WebSocketServerTest, PerformsRFC6455Handshake) {
     EXPECT_NE(resp_str.find("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), std::string::npos);
     // Give the server a beat to invoke on_open after the 101 response.
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    EXPECT_EQ(handler->open_count.load(), 1);
+    EXPECT_EQ(counters.open_count.load(), 1);
     close_socket(fd);
 }
 
-TEST_F(WebSocketServerTest, EchoesMaskedTextFrame) {
+TEST_P(WebSocketServerTest, EchoesMaskedTextFrame) {
     int fd = connect_client(port);
     ASSERT_GE(fd, 0);
     std::string key = "dGhlIHNhbXBsZSBub25jZQ==";
@@ -275,7 +311,7 @@ TEST_F(WebSocketServerTest, EchoesMaskedTextFrame) {
     close_socket(fd);
 }
 
-TEST_F(WebSocketServerTest, RespondsToPingWithPong) {
+TEST_P(WebSocketServerTest, RespondsToPingWithPong) {
     int fd = connect_client(port);
     ASSERT_GE(fd, 0);
     auto req = handshake_request("dGhlIHNhbXBsZSBub25jZQ==");
@@ -296,7 +332,7 @@ TEST_F(WebSocketServerTest, RespondsToPingWithPong) {
     close_socket(fd);
 }
 
-TEST_F(WebSocketServerTest, HandlesFragmentedMessage) {
+TEST_P(WebSocketServerTest, HandlesFragmentedMessage) {
     int fd = connect_client(port);
     ASSERT_GE(fd, 0);
     auto req = handshake_request("dGhlIHNhbXBsZSBub25jZQ==");
@@ -343,7 +379,7 @@ TEST_F(WebSocketServerTest, HandlesFragmentedMessage) {
     close_socket(fd);
 }
 
-TEST_F(WebSocketServerTest, RejectsUnmaskedClientFrame) {
+TEST_P(WebSocketServerTest, RejectsUnmaskedClientFrame) {
     int fd = connect_client(port);
     ASSERT_GE(fd, 0);
     auto req = handshake_request("dGhlIHNhbXBsZSBub25jZQ==");
@@ -403,7 +439,7 @@ uint16_t close_code(const spaznet::websocket::Frame& f) {
 
 } // namespace
 
-TEST_F(WebSocketServerTest, RejectsReservedOpcode) {
+TEST_P(WebSocketServerTest, RejectsReservedOpcode) {
     int fd = open_and_handshake(port);
     ASSERT_GE(fd, 0);
 
@@ -418,7 +454,7 @@ TEST_F(WebSocketServerTest, RejectsReservedOpcode) {
     close_socket(fd);
 }
 
-TEST_F(WebSocketServerTest, RejectsRsvBitSet) {
+TEST_P(WebSocketServerTest, RejectsRsvBitSet) {
     int fd = open_and_handshake(port);
     ASSERT_GE(fd, 0);
 
@@ -433,7 +469,7 @@ TEST_F(WebSocketServerTest, RejectsRsvBitSet) {
     close_socket(fd);
 }
 
-TEST_F(WebSocketServerTest, RejectsNonMinimal16BitLength) {
+TEST_P(WebSocketServerTest, RejectsNonMinimal16BitLength) {
     int fd = open_and_handshake(port);
     ASSERT_GE(fd, 0);
 
@@ -452,7 +488,7 @@ TEST_F(WebSocketServerTest, RejectsNonMinimal16BitLength) {
     close_socket(fd);
 }
 
-TEST_F(WebSocketServerTest, RejectsNonMinimal64BitLength) {
+TEST_P(WebSocketServerTest, RejectsNonMinimal64BitLength) {
     int fd = open_and_handshake(port);
     ASSERT_GE(fd, 0);
 
@@ -469,7 +505,7 @@ TEST_F(WebSocketServerTest, RejectsNonMinimal64BitLength) {
     close_socket(fd);
 }
 
-TEST_F(WebSocketServerTest, RejectsLength64HighBitSet) {
+TEST_P(WebSocketServerTest, RejectsLength64HighBitSet) {
     int fd = open_and_handshake(port);
     ASSERT_GE(fd, 0);
 
@@ -490,7 +526,7 @@ TEST_F(WebSocketServerTest, RejectsLength64HighBitSet) {
 // with 1009 (message too big) BEFORE the server allocates the payload buffer
 // or reads any payload bytes. We send the header bytes only and expect the
 // server to respond with Close 1009 without us ever sending the body.
-TEST_F(WebSocketServerTest, RejectsOversizePayloadWithoutAllocating) {
+TEST_P(WebSocketServerTest, RejectsOversizePayloadWithoutAllocating) {
     int fd = open_and_handshake(port);
     ASSERT_GE(fd, 0);
 

@@ -1,12 +1,18 @@
 // Broadcast chat-room WebSocket demo (with an HTTP/1.1 fallback for plain
 // requests on the same port).
 //
-//   $ ./ws_chat
+//   $ ./ws_chat [--reactor]
 //   # then open http://localhost:8080/ in two or more browser tabs, or:
 //   $ wscat -c ws://localhost:8080/
 //   > hello
 //   < * user5 joined (2 online)
 //   < user5: hello
+//
+// --reactor selects the coroutine-free dispatcher (ChatRoomReactor,
+// defined below ChatRoom) instead of the default coroutine one
+// (ChatRoom); both speak the identical protocol, though their internal
+// broadcast plumbing differs quite a bit -- see ChatRoomReactor's own
+// comment.
 //
 // The HTTP fallback on the same port serves a tiny self-contained HTML +
 // JavaScript chat client (see kChatPage below), so the whole demo can be
@@ -43,10 +49,12 @@
 #include <libspaznet/server.hpp>
 #include <libspaznet/websocket/dispatcher.hpp>
 #include <libspaznet/websocket/handler.hpp>
+#include <libspaznet/websocket/reactor_handler.hpp>
 #include <libspaznet/websocket/send.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -291,12 +299,110 @@ class ChatRoom : public spaznet::websocket::Handler {
     std::unordered_map<int, std::shared_ptr<Session>> sessions_;
 };
 
+// Coroutine-free counterpart of ChatRoom. Notably simpler: since
+// reactor::Connection::send() is a direct, synchronous write into the
+// target's OutputBuffer rather than a co_await'd socket write, there's no
+// need for chat.cpp's own outbox/writer_loop/interval-poll machinery --
+// that whole apparatus existed only to give the coroutine side an async
+// context to co_await conn.send() from when broadcasting into a
+// *different* connection's coroutine frame. Here, broadcasting is just
+// "call send() from wherever" -- except "wherever" here is one
+// connection's handle_message() touching another connection's
+// BufferedConnection, which on_readable()/on_writable() run inline on a
+// single dedicated thread (see IOContext::run()), and which a posted
+// closure can end up racing today if the Server has extra worker
+// threads. ctx->post() (queued via the same reactor primitive that
+// carries every other posted callback) is the least-risky thing to
+// route the actual send through pending real per-connection loop
+// affinity -- see the threading milestone in the reactor-port plan.
+class ChatRoomReactor : public spaznet::websocket::reactor::Handler {
+  public:
+    void on_open(spaznet::websocket::reactor::Connection& conn) override {
+        int id = conn.id();
+        std::size_t online = 0;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            sessions_.insert_or_assign(id, conn);
+            online = sessions_.size();
+        }
+        std::string notice = "* user" + std::to_string(id) + " joined (" +
+                             std::to_string(online) + " online)\n";
+        broadcast(id, {notice.begin(), notice.end()});
+    }
+
+    void handle_message(const spaznet::websocket::Message& message,
+                        spaznet::websocket::reactor::Connection& conn) override {
+        if (message.opcode != spaznet::websocket::Opcode::Text) {
+            return;
+        }
+        std::string framed = "user" + std::to_string(conn.id()) + ": " +
+                             std::string(message.data.begin(), message.data.end());
+        broadcast(conn.id(), {framed.begin(), framed.end()});
+    }
+
+    void on_close(spaznet::websocket::reactor::Connection& conn) override {
+        int id = conn.id();
+        bool had;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            had = sessions_.erase(id) > 0;
+        }
+        if (!had) {
+            return;
+        }
+        std::string notice = "* user" + std::to_string(id) + " left\n";
+        broadcast(id, {notice.begin(), notice.end()});
+    }
+
+  private:
+    // Posts `bytes` (as a Text frame) onto every connection except
+    // `exclude_id`'s own IOContext, to be sent from there. See the class
+    // comment above for why post() rather than a direct call.
+    void broadcast(int exclude_id, std::vector<uint8_t> bytes) {
+        std::vector<spaznet::websocket::reactor::Connection> targets;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            targets.reserve(sessions_.size());
+            for (auto& [id, conn] : sessions_) {
+                if (id != exclude_id) {
+                    targets.push_back(conn);
+                }
+            }
+        }
+        auto shared_bytes = std::make_shared<std::vector<uint8_t>>(std::move(bytes));
+        for (auto& target : targets) {
+            auto* ctx = target.context();
+            if (ctx == nullptr) {
+                continue;
+            }
+            ctx->post([target, shared_bytes] {
+                target.send(spaznet::websocket::Opcode::Text, *shared_bytes);
+            });
+        }
+    }
+
+    std::mutex mu_;
+    std::unordered_map<int, spaznet::websocket::reactor::Connection> sessions_;
+};
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    bool use_reactor = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--reactor") == 0) {
+            use_reactor = true;
+        }
+    }
+
     spaznet::Server server(4);
-    server.set_connection_handler(spaznet::websocket::make_dispatcher(
-        std::make_unique<HttpFallback>(), std::make_unique<ChatRoom>()));
+    if (use_reactor) {
+        server.set_connection_factory(spaznet::websocket::make_reactor_dispatcher(
+            std::make_unique<HttpFallback>(), std::make_unique<ChatRoomReactor>()));
+    } else {
+        server.set_connection_handler(spaznet::websocket::make_dispatcher(
+            std::make_unique<HttpFallback>(), std::make_unique<ChatRoom>()));
+    }
     server.listen_tcp(8080);
     server.run();
 }

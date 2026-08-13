@@ -6,6 +6,67 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
+## 2026-08-12 — WebSocket reactor dispatcher
+
+Eighth milestone of the reactor port (see the "Milestone websocket-reactor
+progress note" in the reactor-port plan). Unlike HTTP/1.1, UDP, and
+QUIC/HTTP3, WebSocket's coroutine `Handler` couldn't be reused as-is —
+`conn.send()` is a real `co_await`'d socket write, not an already-synchronous
+call wearing a `Task` wrapper — so this milestone adds a parallel
+synchronous handler interface rather than changing the existing one.
+
+### Added
+- `spaznet::websocket::reactor::Handler` / `Connection`
+  (`example/http-websocket/include/libspaznet/websocket/reactor_handler.hpp`)
+  — the coroutine-free counterpart of `websocket::Handler`/`Connection`.
+  `Connection::send()` writes a `Frame` (handler.cpp's `Frame::serialize()`,
+  unchanged) straight into the target's `BufferedConnection::OutputBuffer` —
+  no suspension possible or needed, so there's no `WriteGate` equivalent on
+  this side. Unlike the coroutine `Connection`, this one is copyable (a
+  `weak_ptr` + fd + `IOContext*`), so a handler can stash one for later
+  (e.g. a broadcast) without risking a dangling pointer.
+- `spaznet::websocket::make_reactor_dispatcher(std::unique_ptr<HTTPHandler>,
+  std::unique_ptr<reactor::Handler>) -> ConnectionFactory`
+  (`example/http-websocket/src/dispatcher_reactor.cpp`) — same
+  upgrade-sniffing rules and on-the-wire framing as `make_dispatcher`, built
+  on a `WsConnection` state machine (`Sniffing` / `ReadingHeader` /
+  `ReadingPayload`) instead of a suspended coroutine frame. Falls through to
+  `http::attach_reactor_dispatcher` (new, see below) for the non-WS-upgrade
+  case instead of duplicating the HTTP/1.1 keep-alive loop.
+- `spaznet::http::attach_reactor_dispatcher(ctx, conn, handler,
+  initial_buffer, on_closed)`
+  (`example/http/include/libspaznet/http/dispatcher.hpp`) — the reactor-side
+  counterpart of the already-public `http::serve_keep_alive`: attaches the
+  HTTP/1.1 reactor loop to an already-constructed `BufferedConnection`,
+  seeded with bytes a caller already peeked at. `make_reactor_dispatcher`
+  now calls this internally; behavior is unchanged.
+- `example/http-websocket/src/handshake.hpp`/`.cpp` — RFC 6455 §4.2
+  handshake parsing and `Sec-WebSocket-Accept` computation, extracted
+  verbatim out of `dispatcher.cpp`'s anonymous namespace so both dispatchers
+  share one implementation instead of risking drift.
+- `ws_echo --reactor` / `ws_chat --reactor` — opt-in CLI flag on both demos.
+  `ws_chat --reactor`'s `ChatRoomReactor` is notably simpler than the
+  coroutine `ChatRoom`: no outbox queue, no `writer_loop`, no interval poll
+  — broadcasting is a direct `send()` per target connection, posted via
+  `IOContext::post()` since another connection's `BufferedConnection` isn't
+  safe to touch from an arbitrary thread without going through the event
+  loop (see the plan note for the exact reasoning and its relationship to
+  the pending `threading` milestone).
+- `example/http-websocket/tests/integration/dispatcher_test_support.hpp` —
+  carries the shared `DispatcherKind`/name-generator (no `install_dispatcher`
+  helper here, since the two runtimes use different `Handler` classes,
+  unlike the other three protocols). `test_websocket_server.cpp` is now
+  `TEST_P`-parameterized over both dispatchers (22 tests total, including
+  the full RFC 6455 malformed-frame compliance suite).
+
+Verified with the full suite (13 ctest targets) under
+`-DSPAZNET_ENABLE_COROUTINES=ON`, again with `-DSPAZNET_BUILD_QUIC=ON` (15
+targets, against a local OpenSSL 3.5 build), and confirmed
+`-DSPAZNET_ENABLE_COROUTINES=OFF` still configures/builds/passes
+`UnitTests` unchanged. Manually smoke-tested both demos in both modes,
+including a two-client `ws_chat --reactor` session confirming join/message/
+leave notifications actually cross connections via `post()`.
+
 ## 2026-08-12 — UDP + QUIC/HTTP3 reactor dispatchers
 
 Seventh milestone of the reactor port (see the "Milestone udp-quic-reactor

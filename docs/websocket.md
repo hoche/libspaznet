@@ -63,6 +63,60 @@ target_link_libraries(myapp PRIVATE spaznet::spaznet spaznet::http_websocket)
 combined dispatcher reuses example/http's HTTP/1.1 keep-alive serve
 loop on the non-upgrade path).
 
+### Two dispatchers, two handler interfaces
+
+Unlike `example/http`, `example/udp`, and `example/quic-http3` — where
+the same handler class runs under either dispatcher — WebSocket's two
+runtimes have genuinely different `Handler` interfaces, because sending
+a frame is a real suspension point on the coroutine side:
+
+- **`make_dispatcher(...)`** (above) — coroutine-based, registered via
+  `Server::set_connection_handler`. Handlers implement
+  `spaznet::websocket::Handler` (`handler.hpp`); `Connection::send()`
+  `co_await`s the socket write behind a per-connection `WriteGate`.
+- **`make_reactor_dispatcher(...)`** — coroutine-free, registered via
+  `Server::set_connection_factory`. Handlers implement
+  `spaznet::websocket::reactor::Handler` (`reactor_handler.hpp`);
+  `Connection::send()` writes straight into the target connection's
+  `OutputBuffer` — nothing to suspend on, so no `WriteGate` either.
+
+```cpp
+#include <libspaznet/websocket/reactor_handler.hpp>
+
+class EchoWSReactor : public spaznet::websocket::reactor::Handler {
+public:
+    void on_open(spaznet::websocket::reactor::Connection&) override {}
+    void on_close(spaznet::websocket::reactor::Connection&) override {}
+
+    void handle_message(const spaznet::websocket::Message& m,
+                        spaznet::websocket::reactor::Connection& conn) override {
+        conn.send(m.opcode, m.data);
+    }
+};
+
+server.set_connection_factory(spaznet::websocket::make_reactor_dispatcher(
+    std::make_unique<HttpFallback>(), std::make_unique<EchoWSReactor>()));
+```
+
+Both dispatchers sniff the same upgrade request the same way, compute
+the same `Sec-WebSocket-Accept`, and serialize frames with the same
+`Frame::serialize()` — from a client's point of view they are
+indistinguishable. `example/http-websocket/demo/echo.cpp` and
+`chat.cpp` both accept a `--reactor` flag to switch, and
+`test_websocket_server.cpp` runs its whole suite (including the RFC
+6455 malformed-frame compliance cases) against both.
+
+One notable difference in shape, not behavior: `reactor::Connection` is
+a small copyable value (a `weak_ptr` plus the connection's fd), unlike
+the coroutine `Connection`, which is deliberately non-copyable because
+it aliases state living in a suspended coroutine frame. That makes it
+safe for a reactor handler to store a `Connection` for later — e.g. a
+chat room keeping one per session to broadcast to — without risking a
+dangling reference; see `example/http-websocket/demo/chat.cpp`'s
+`ChatRoomReactor` for a worked example, including why it posts the
+actual send through `IOContext::post()` rather than calling it inline
+from another connection's callback.
+
 ## Connection lifecycle
 
 ```

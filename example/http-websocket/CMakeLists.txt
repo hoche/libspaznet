@@ -4,7 +4,9 @@
 
 add_library(spaznet_http_websocket STATIC
     src/handler.cpp
+    src/handshake.cpp
     src/dispatcher.cpp
+    src/dispatcher_reactor.cpp
 )
 add_library(spaznet::http_websocket ALIAS spaznet_http_websocket)
 
