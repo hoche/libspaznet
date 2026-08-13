@@ -46,10 +46,36 @@ class TlsHello : public spaznet::http::HTTPHandler {
     }
 };
 
+auto curl_available() -> bool {
+#if defined(_WIN32)
+    auto* pipe = _popen("curl -V 2>NUL", "r");
+#else
+    auto* pipe = popen("curl -V 2>/dev/null", "r");
+#endif
+    if (pipe == nullptr) {
+        return false;
+    }
+    std::array<char, 256> buf{};
+    bool ok = false;
+    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) {
+        ok = true;
+    }
+#if defined(_WIN32)
+    _pclose(pipe);
+#else
+    pclose(pipe);
+#endif
+    return ok;
+}
+
 auto curl_get(const std::string& url) -> std::string {
     // -k: accept self-signed; --http1.1: force ALPN http/1.1 path.
     std::string cmd = "curl -sk --http1.1 --max-time 5 " + url + " 2>/dev/null";
+#if defined(_WIN32)
+    FILE* pipe = _popen(cmd.c_str(), "r");
+#else
     FILE* pipe = popen(cmd.c_str(), "r");
+#endif
     if (pipe == nullptr) {
         return {};
     }
@@ -58,7 +84,11 @@ auto curl_get(const std::string& url) -> std::string {
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) {
         out += buf.data();
     }
+#if defined(_WIN32)
+    _pclose(pipe);
+#else
     pclose(pipe);
+#endif
     return out;
 }
 
@@ -75,7 +105,8 @@ class HttpTlsTest : public ::testing::TestWithParam<DispatcherKind> {
         cfg.key_pem = std::move(key);
         cfg.alpn = {"http/1.1"};
 
-        server_ = std::make_unique<spaznet::Server>(2);
+        server_ = std::make_unique<spaznet::Server>(
+            GetParam() == DispatcherKind::Reactor ? 0 : 2);
         install_dispatcher(*server_, std::make_unique<TlsHello>(), GetParam());
         server_->listen_tls(kPort, std::move(cfg));
         thread_ = std::thread([this]() { server_->run(); });
@@ -96,6 +127,9 @@ class HttpTlsTest : public ::testing::TestWithParam<DispatcherKind> {
 };
 
 TEST_P(HttpTlsTest, CurlHttpsGet) {
+    if (!curl_available()) {
+        GTEST_SKIP() << "curl not available";
+    }
     auto body = curl_get("https://127.0.0.1:" + std::to_string(kPort) + "/");
     EXPECT_EQ(body, "tls-ok");
 }

@@ -233,7 +233,8 @@ class WsTlsTest : public ::testing::TestWithParam<DispatcherKind> {
         cfg.key_pem = std::move(key);
         cfg.alpn = {"http/1.1"};
 
-        server_ = std::make_unique<spaznet::Server>(2);
+        server_ = std::make_unique<spaznet::Server>(
+            GetParam() == DispatcherKind::Reactor ? 0 : 2);
         if (GetParam() == DispatcherKind::Reactor) {
             server_->set_connection_factory(spaznet::websocket::make_reactor_dispatcher(
                 nullptr, std::make_unique<EchoWSReactor>()));
