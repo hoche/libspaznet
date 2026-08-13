@@ -278,11 +278,18 @@ class Server {
     class DatagramReadHandler;
     // Drops fd from reactor_connections_ (called once the connection is
     // done with itself) and updates the active-connection count on the
-    // loop that owned it. Safe to call from any thread; safe to call from
+    // loop that owned it. Only decrements the gauge when an entry was
+    // actually erased — factories may fire on_closed during start() before
+    // the entry exists. Safe to call from any thread; safe to call from
     // inside the very IoHandler callback that's finishing, since it only
     // erases this Server's map entry — the object itself stays alive for
     // the rest of that callback via the shared_ptr the caller already holds.
     void finish_reactor_connection(int fd, IOContext* ctx);
+    // Run connection_factory_ for an accepted fd; register + gauge only if
+    // the connection is still live when the factory returns (start() may
+    // sync-close on an already-gone peer). Returns false if the factory
+    // declined (caller should close the fd).
+    auto adopt_reactor_factory_connection(int fd, IOContext* target) -> bool;
 
   public:
     // Historical constructor: one event loop with `num_threads` coroutine

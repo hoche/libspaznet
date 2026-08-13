@@ -41,10 +41,11 @@ class TestHTTPHandler : public spaznet::http::HTTPHandler {
 class TCPServerTest : public ::testing::TestWithParam<DispatcherKind> {
   protected:
     void SetUp() override {
-        // Reactor connections don't use coroutine workers; keep workers at 0
-        // for that path so stop() doesn't race worker threads during teardown.
-        const std::size_t workers = GetParam() == DispatcherKind::Reactor ? 0 : 2;
-        server = std::make_unique<Server>(workers);
+        // Reactor connections don't use coroutine workers; workers are
+        // idle on this path. Keep the same Server(2) as the coroutine
+        // fixture so stop()/IOContext teardown matches the well-tested
+        // shape (Server(0) was flaking ListenOnPort/Reactor under CI).
+        server = std::make_unique<Server>(2);
         // Set up a simple handler to handle connections
         install_dispatcher(*server, std::make_unique<TestHTTPHandler>(), GetParam());
         server_thread = std::thread([this]() { server->run(); });

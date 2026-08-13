@@ -105,8 +105,7 @@ class HttpTlsTest : public ::testing::TestWithParam<DispatcherKind> {
         cfg.key_pem = std::move(key);
         cfg.alpn = {"http/1.1"};
 
-        server_ = std::make_unique<spaznet::Server>(
-            GetParam() == DispatcherKind::Reactor ? 0 : 2);
+        server_ = std::make_unique<spaznet::Server>(2);
         install_dispatcher(*server_, std::make_unique<TlsHello>(), GetParam());
         server_->listen_tls(kPort, std::move(cfg));
         thread_ = std::thread([this]() { server_->run(); });

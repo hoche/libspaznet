@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstring>
@@ -460,13 +461,52 @@ void Server::set_sync_datagram_handler(SyncDatagramHandler handler) {
 }
 
 void Server::finish_reactor_connection(int fd, IOContext* ctx) {
+    // Only decrement when we actually removed a registered entry. A
+    // BufferedConnection can invoke on_closed synchronously from inside
+    // connection_factory_/start() — before accept_ready has inserted the
+    // map entry or incremented the gauge. Decrementing unconditionally
+    // then underflows active_connections; inserting the already-closed
+    // handler afterward leaves a zombie for stop() to use-after-free.
+    bool erased = false;
     {
         std::lock_guard<std::mutex> lock(reactor_conns_mutex_);
-        reactor_connections_.erase(fd);
+        erased = reactor_connections_.erase(fd) > 0;
     }
-    if (ctx != nullptr) {
+    if (erased && ctx != nullptr) {
         ctx->decrement_active_connections();
     }
+}
+
+auto Server::adopt_reactor_factory_connection(int fd, IOContext* target) -> bool {
+    // Factories (e.g. make_reactor_dispatcher) call start() before
+    // returning. A peer that already closed can fire on_closed
+    // synchronously inside that start(). Track that so we neither
+    // register a dead handler nor leave the active-connection gauge
+    // unbalanced.
+    auto closed = std::make_shared<std::atomic<bool>>(false);
+    auto on_closed = [this, fd, target, closed]() {
+        if (closed->exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        finish_reactor_connection(fd, target);
+    };
+    auto handler = connection_factory_(fd, *target, std::move(on_closed));
+    if (!handler) {
+        return false;
+    }
+    if (closed->load(std::memory_order_acquire)) {
+        // Sync-closed during start(): finish_reactor_connection saw no map
+        // entry (so did not decrement). Drop the dead handler.
+        return true;
+    }
+    {
+        std::lock_guard<std::mutex> lock(reactor_conns_mutex_);
+        reactor_connections_[fd] = ReactorConn{std::move(handler), target};
+    }
+    if (target != nullptr) {
+        target->increment_active_connections();
+    }
+    return true;
 }
 
 // Persistent reactor handler for a listening TCP socket: on_readable()
@@ -666,20 +706,7 @@ class Server::TlsHandshakeHandler : public IoHandler,
             detail::TlsStream::stash_for_fd(fd_, std::move(stream_));
             const int fd = fd_;
             IOContext* target = target_;
-            Server* server = &server_;
-            // Capture Server*, not this — the handshake handler may be
-            // destroyed long before on_closed fires on the real connection.
-            auto on_closed = [server, fd, target]() {
-                server->finish_reactor_connection(fd, target);
-            };
-            auto handler = server_.connection_factory_(fd, *target, std::move(on_closed));
-            if (handler) {
-                {
-                    std::lock_guard<std::mutex> lock(server_.reactor_conns_mutex_);
-                    server_.reactor_connections_[fd] = ReactorConn{std::move(handler), target};
-                }
-                target->increment_active_connections();
-            } else {
+            if (!server_.adopt_reactor_factory_connection(fd, target)) {
                 // Factory declined; claim any leftover stash and close.
                 (void)detail::TlsStream::claim_for_fd(fd);
                 close_socket(fd);
@@ -908,18 +935,9 @@ bool Server::accept_ready(int listen_fd) {
         // Accept-and-shard: the listen fd stays on loop 0; the client fd is
         // handed to a target loop and never registered on the accept loop.
         if (connection_factory_) {
-            int fd = client_fd; // captured by value below; client_fd is reused next loop iteration
+            int fd = client_fd; // finish/on_closed capture; client_fd reused next iter
             IOContext* target = &pick_accept_loop();
-            auto on_closed = [this, fd, target]() { finish_reactor_connection(fd, target); };
-            auto handler = connection_factory_(client_fd, *target, std::move(on_closed));
-            if (handler) {
-                {
-                    std::lock_guard<std::mutex> lock(reactor_conns_mutex_);
-                    reactor_connections_[client_fd] =
-                        ReactorConn{std::move(handler), target};
-                }
-                target->increment_active_connections();
-            } else {
+            if (!adopt_reactor_factory_connection(fd, target)) {
                 // Factory declined the connection outright (e.g. some
                 // limit); nothing registered it for events, so close it
                 // ourselves rather than leaking the fd.
