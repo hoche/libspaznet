@@ -6,6 +6,95 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
+## 2026-08-12 — Coroutine-free build: `-DSPAZNET_ENABLE_COROUTINES=OFF` builds everything
+
+Eleventh and final milestone of the reactor port (see the `coro-free-build`
+milestone in the reactor-port plan). Every prior milestone added a
+reactor sibling to one protocol's dispatcher; this one removes the last
+places that still forced a coroutine dependency onto the *build* even
+when nothing coroutine-specific was actually being used, so the payoff
+the whole port was for — a fully functional library with zero
+`<coroutine>` in the compiled output — actually builds and passes its
+full test suite.
+
+### Added
+- `docs/coro-free-build.md`: the build matrix, when to pick which
+  runtime, a state-machine authoring guide for a new reactor dispatcher,
+  and the connection-lifetime/re-entrancy rules every reactor dispatcher
+  in this tree follows.
+- A `coroutines: [ON, OFF]` matrix on the `Linux x64` CI workflow
+  (`.github/workflows/linux-x64.yml`) — every push/PR now builds and
+  runs the full test suite (including QUIC/HTTP3) under both
+  configurations.
+
+### Changed
+- `Server`/`Socket` (`include/libspaznet/server.hpp` / `src/server_impl.cpp`)
+  no longer require `SPAZNET_ENABLE_COROUTINES=ON` to compile at all —
+  previously the entire `Server` class was gated on it, even though
+  `set_connection_factory`/`set_sync_datagram_handler` and every reactor
+  dispatcher have had no coroutine dependency since Milestone 5. Only
+  `Socket`, the `Task`-returning handler typedefs, and the
+  coroutine-specific accept/datagram/shutdown code paths are now
+  `#ifdef SPAZNET_HAS_COROUTINES`; TCP accept and UDP receive are always
+  driven by two new reactor-native `IoHandler`s (`Server::ListenHandler`,
+  `Server::DatagramReadHandler`) registered via `IOContext::set_io_handler`,
+  replacing the coroutine `accept_connections`/`receive_udp` loops for
+  that half of the work regardless of which handler ends up dispatching
+  each connection/datagram.
+- Every protocol's public dispatcher header (`http/dispatcher.hpp`,
+  `http2/dispatcher.hpp`, `udp/dispatcher.hpp`, `http3/service.hpp`,
+  `websocket/dispatcher.hpp`) now `#ifdef SPAZNET_HAS_COROUTINES`s its
+  `make_dispatcher(...)` declaration — previously these declared a
+  function returning a `Task`-based `ConnectionHandler`/`DatagramHandler`
+  unconditionally, which meant *declaring* the coroutine-only half of
+  the API leaked into a coroutine-free build even where nothing called
+  it.
+- `websocket/handler.hpp` split in place: `Opcode`, `Frame`, and
+  `Message` (pure data, no coroutine dependency) are now always
+  declared; the coroutine-only `Connection`/`Handler` classes and the
+  `WriteGate` forward declaration are `#ifdef SPAZNET_HAS_COROUTINES`.
+  This is what let `websocket/reactor_handler.hpp` — which reuses
+  `Opcode`/`Frame`/`Message` from this header — become includable in a
+  coroutine-free build; previously it transitively required `Task` to
+  exist just to name three plain structs. `websocket/send.hpp` (entirely
+  a coroutine `Task`-returning free function) is now `#ifdef`'d in full.
+- Each protocol's `CMakeLists.txt` now excludes its coroutine-only
+  `dispatcher.cpp` from the source list when `SPAZNET_ENABLE_COROUTINES`
+  is `OFF` (`example/http`, `example/http2`, `example/http-websocket`,
+  `example/udp`) — these files have no non-coroutine content at all
+  (unlike `example/quic-http3/src/http3/service.cpp`, which is `#ifdef`'d
+  internally instead since most of that file is protocol-neutral).
+- Every demo (`http_hello`, `http_showcase`, `http2_hello`,
+  `http2_showcase`, `udp_echo`, `udp_relay`, `udp_statsd`, `ws_echo`,
+  `ws_chat`) now guards its coroutine handler class and its
+  `--reactor`-flag branch with `#ifdef SPAZNET_HAS_COROUTINES`, and
+  defaults `use_reactor` to `true` when coroutines aren't built in,
+  instead of defining a handler class that referenced `Task` unconditionally.
+- Every protocol's differential-testing helper
+  (`example/*/tests/integration/dispatcher_test_support.hpp`) gained an
+  `AllDispatcherKinds()` function returning `{Coroutine, Reactor}` when
+  `SPAZNET_HAS_COROUTINES` is defined and just `{Reactor}` otherwise;
+  every `INSTANTIATE_TEST_SUITE_P` across the tree now uses
+  `::testing::ValuesIn(AllDispatcherKinds())` instead of a hardcoded
+  `::testing::Values(Coroutine, Reactor)`, so the same test files build
+  and run (reactor-only) in both configurations rather than needing a
+  coroutine-only test binary to be excluded wholesale.
+- HTTP/1.1 and WebSocket's performance benchmarks
+  (`test_throughput.cpp`, `test_latency.cpp`, `test_concurrent_performance.cpp`,
+  `test_websocket_rfc6455_performance.cpp`, `bench_thread_modes.cpp`)
+  now install `make_reactor_dispatcher(...)` when coroutines are off
+  instead of being coroutine-only, so performance coverage isn't lost
+  in that configuration.
+- Root `CMakeLists.txt`: `src/server_impl.cpp`/`include/libspaznet/server.hpp`
+  and the `test_performance`/`test_server_reactor` targets are no longer
+  conditionally built; `SPAZNET_BUILD_EXAMPLES` is no longer force-disabled
+  (with a warning) when `SPAZNET_ENABLE_COROUTINES` is `OFF`.
+
+### Verified
+- Full test suite (13 ctest targets without QUIC, 15 with) passes under
+  both `-DSPAZNET_ENABLE_COROUTINES=ON` and `=OFF`, and under `=OFF`
+  with `-DSPAZNET_BUILD_QUIC=ON` against a local OpenSSL 3.5 install.
+
 ## 2026-08-12 — Reactor threading: per-loop affinity replaces per-connection locks
 
 Tenth milestone of the reactor port (see the "Milestone threading

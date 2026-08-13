@@ -87,7 +87,9 @@ class QuicHttp3Service {
 // The Listener's SendFn (configured inside QuicHttp3Service) should
 // route outbound datagrams via `::sendto(datagram.fd, ...)` so the
 // reply goes back through the same listening socket.
+#ifdef SPAZNET_HAS_COROUTINES
 auto make_dispatcher(std::unique_ptr<QuicHttp3Service> service) -> ::spaznet::DatagramHandler;
+#endif // SPAZNET_HAS_COROUTINES
 
 // Coroutine-free counterpart of make_dispatcher: same QuicHttp3Service,
 // same per-datagram work — bind_fd() then handle_datagram() — just

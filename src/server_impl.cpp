@@ -56,6 +56,7 @@ namespace {
 
 } // namespace
 
+#ifdef SPAZNET_HAS_COROUTINES
 // Socket implementation
 //
 // Awaiter design notes:
@@ -220,6 +221,7 @@ void Socket::close() {
         owns_fd_ = false;
     }
 }
+#endif // SPAZNET_HAS_COROUTINES
 
 // Server implementation
 Server::Server(std::size_t num_threads)
@@ -229,6 +231,7 @@ Server::~Server() {
     stop();
 }
 
+#ifdef SPAZNET_HAS_COROUTINES
 void Server::set_connection_handler(ConnectionHandler handler) {
     connection_handler_ = std::move(handler);
 }
@@ -236,6 +239,7 @@ void Server::set_connection_handler(ConnectionHandler handler) {
 void Server::set_datagram_handler(DatagramHandler handler) {
     datagram_handler_ = std::move(handler);
 }
+#endif // SPAZNET_HAS_COROUTINES
 
 void Server::set_connection_factory(ConnectionFactory factory) {
     connection_factory_ = std::move(factory);
@@ -252,6 +256,52 @@ void Server::finish_reactor_connection(int fd) {
     }
     io_context_->decrement_active_connections();
 }
+
+// Persistent reactor handler for a listening TCP socket: on_readable()
+// drains accept_ready()'s accept() loop, then — unless accept_ready()
+// says otherwise (stop() flipped running_, or a hard accept() error
+// already closed the fd) — re-registers itself for the next readability
+// event via shared_from_this(), the same "read to EAGAIN, then re-arm"
+// pattern BufferedConnection::on_readable() uses. A nested class of
+// Server so it can call the private accept_ready() directly. Defined here
+// (ahead of listen_tcp()'s first use) rather than down by accept_ready()
+// itself so the compiler has seen its full definition — including the
+// `public IoHandler` base — by the time listen_tcp() upcasts a
+// shared_ptr<ListenHandler> to shared_ptr<IoHandler>.
+class Server::ListenHandler : public IoHandler,
+                               public std::enable_shared_from_this<ListenHandler> {
+  public:
+    ListenHandler(Server& server, int fd) : server_(server), fd_(fd) {}
+
+    void on_readable() override {
+        if (server_.accept_ready(fd_)) {
+            server_.io_context_->set_io_handler(fd_, PlatformIO::EVENT_READ, shared_from_this());
+        }
+    }
+    void on_writable() override {}
+
+  private:
+    Server& server_;
+    int fd_;
+};
+
+// Same pattern as ListenHandler, for a UDP socket's datagram_ready().
+class Server::DatagramReadHandler : public IoHandler,
+                                    public std::enable_shared_from_this<DatagramReadHandler> {
+  public:
+    DatagramReadHandler(Server& server, int fd) : server_(server), fd_(fd) {}
+
+    void on_readable() override {
+        if (server_.datagram_ready(fd_)) {
+            server_.io_context_->set_io_handler(fd_, PlatformIO::EVENT_READ, shared_from_this());
+        }
+    }
+    void on_writable() override {}
+
+  private:
+    Server& server_;
+    int fd_;
+};
 
 void Server::listen_tcp(uint16_t port) {
     // Use getaddrinfo for IPv4/IPv6 compatibility
@@ -306,8 +356,11 @@ void Server::listen_tcp(uint16_t port) {
         std::lock_guard<std::mutex> lock(listen_fds_mutex_);
         listen_fds_.push_back(listen_fd);
     }
-    // Schedule accept loop on the IOContext (works in both threaded and non-threaded modes).
-    io_context_->schedule(accept_connections(listen_fd));
+    // Register a persistent reactor handler on the IOContext (works in
+    // both threaded and non-threaded modes, no coroutine involved) — see
+    // ListenHandler below and accept_ready()'s comment in server.hpp.
+    io_context_->set_io_handler(listen_fd, PlatformIO::EVENT_READ,
+                                std::make_shared<ListenHandler>(*this, listen_fd));
 }
 
 void Server::listen_udp(uint16_t port) {
@@ -351,24 +404,11 @@ void Server::listen_udp(uint16_t port) {
         std::lock_guard<std::mutex> lock(listen_fds_mutex_);
         listen_fds_.push_back(udp_fd);
     }
-    io_context_->schedule(receive_udp(udp_fd));
+    io_context_->set_io_handler(udp_fd, PlatformIO::EVENT_READ,
+                                std::make_shared<DatagramReadHandler>(*this, udp_fd));
 }
 
-Task Server::receive_udp(int udp_fd) {
-    struct ReadableAwaiter {
-        IOContext* ctx;
-        int fd;
-        [[nodiscard]] bool await_ready() const noexcept {
-            return false;
-        }
-        void await_suspend(std::coroutine_handle<TaskPromise> h) const {
-            ctx->register_io(fd, PlatformIO::EVENT_READ, CoroutineHandle::from_handle(h));
-        }
-        void await_resume() const noexcept {}
-    };
-
-    Socket udp_socket(udp_fd, io_context_.get(), /*owns_fd=*/false);
-
+bool Server::datagram_ready(int udp_fd) {
     while (running_.load(std::memory_order_acquire)) {
         std::vector<uint8_t> buffer(64 * 1024);
         sockaddr_storage addr{};
@@ -381,10 +421,12 @@ Task Server::receive_udp(int udp_fd) {
         if (received < 0) {
             const int err = detail::last_socket_error();
             if (detail::is_retryable_socket_error(err)) {
-                co_await ReadableAwaiter{io_context_.get(), udp_fd};
-                continue;
+                return true; // Drained to EAGAIN; caller re-arms read interest.
             }
-            break;
+            // Hard error: matches the old coroutine loop's behavior of
+            // just exiting without independently closing udp_fd —
+            // Server::stop()'s listen_fds_ cleanup owns that.
+            return false;
         }
 
         if (received == 0) {
@@ -408,7 +450,9 @@ Task Server::receive_udp(int udp_fd) {
 
         // Reactor path takes precedence: a plain synchronous call, no
         // coroutine involved. Falls back to the coroutine-based
-        // datagram_handler_ if no sync handler is installed.
+        // datagram_handler_ (fire-and-forget via schedule(), matching how
+        // accept_ready() below hands off connection_handler_) if no sync
+        // handler is installed.
         if (sync_datagram_handler_) {
             Datagram dg;
             dg.data = buffer;
@@ -421,7 +465,9 @@ Task Server::receive_udp(int udp_fd) {
                 sync_datagram_handler_(std::move(dg));
             } catch (...) {
             }
-        } else if (datagram_handler_) {
+        }
+#ifdef SPAZNET_HAS_COROUTINES
+        else if (datagram_handler_) {
             Datagram dg;
             dg.data = buffer;
             dg.peer_addr = host;
@@ -430,29 +476,16 @@ Task Server::receive_udp(int udp_fd) {
             dg.peer_len = addr_len;
             dg.fd = udp_fd;
             try {
-                co_await datagram_handler_(std::move(dg));
+                io_context_->schedule(datagram_handler_(std::move(dg)));
             } catch (...) {
             }
         }
-
+#endif
     }
-
-    co_return;
+    return false; // running_ went false.
 }
 
-Task Server::accept_connections(int listen_fd) {
-    struct ReadableAwaiter {
-        IOContext* ctx;
-        int fd;
-        [[nodiscard]] bool await_ready() const noexcept {
-            return false;
-        }
-        void await_suspend(std::coroutine_handle<TaskPromise> h) const {
-            ctx->register_io(fd, PlatformIO::EVENT_READ, CoroutineHandle::from_handle(h));
-        }
-        void await_resume() const noexcept {}
-    };
-
+bool Server::accept_ready(int listen_fd) {
     while (running_.load(std::memory_order_acquire)) {
         struct sockaddr_storage client_addr {}; // Can hold IPv4 or IPv6
         socklen_t client_len = sizeof(client_addr);
@@ -463,11 +496,9 @@ Task Server::accept_connections(int listen_fd) {
         if (client_fd < 0) {
             const int err = detail::last_socket_error();
             if (detail::is_retryable_socket_error(err)) {
-                // Wait until the listening socket becomes readable (new connection ready).
-                co_await ReadableAwaiter{io_context_.get(), listen_fd};
-                continue;
+                return true; // Drained to EAGAIN; caller re-arms read interest.
             }
-            break;
+            break; // Hard error: fall through to the listen-fd cleanup below.
         }
 
         // Set non-blocking
@@ -494,14 +525,22 @@ Task Server::accept_connections(int listen_fd) {
             continue;
         }
 
+#ifdef SPAZNET_HAS_COROUTINES
         // Create socket and handle connection
         Socket socket(client_fd, io_context_.get());
         io_context_->schedule(handle_connection(std::move(socket)));
+#else
+        // No connection_factory_ installed and no coroutine runtime to
+        // fall back to — nothing can drive this connection, so drop it
+        // rather than leak the fd.
+        close_socket(client_fd);
+#endif
     }
 
-    // If we exit the accept loop due to error while still running, close the listening fd here.
-    // During normal shutdown, stop() closes all listening fds and may destroy this coroutine while
-    // suspended.
+    // Either running_ went false, or accept() hit a hard error: same
+    // listen-fd cleanup the coroutine path used to do after its loop
+    // exited. During normal shutdown, stop() has usually already done
+    // this (in which case this is a no-op) — see stop()'s Step 2.
     bool should_close = false;
     {
         std::lock_guard<std::mutex> lock(listen_fds_mutex_);
@@ -515,9 +554,10 @@ Task Server::accept_connections(int listen_fd) {
         io_context_->remove_io(listen_fd);
         close_socket(listen_fd);
     }
-    co_return;
+    return false;
 }
 
+#ifdef SPAZNET_HAS_COROUTINES
 Task Server::handle_connection(Socket socket) {
     // Low-level path: if the user installed a connection_handler_,
     // hand the Socket over and let them speak whatever protocol they
@@ -564,6 +604,7 @@ Task Server::handle_connection(Socket socket) {
     socket.close();
     co_return;
 }
+#endif // SPAZNET_HAS_COROUTINES
 
 void Server::run() {
     io_context_->run();
@@ -589,6 +630,7 @@ void Server::stop() {
         close_socket(fd);
     }
 
+#ifdef SPAZNET_HAS_COROUTINES
     // Step 3: shutdown(2) every active client fd. This forces any
     // coroutine suspended on recv/send for that connection to wake up
     // with an error, unwind through its destructors, and decrement
@@ -606,6 +648,7 @@ void Server::stop() {
 #endif
         }
     }
+#endif // SPAZNET_HAS_COROUTINES
 
     // Step 3.5: force-close every reactor connection still registered.
     // Unlike coroutines, these have no suspended call stack to unwind —
@@ -647,6 +690,7 @@ void Server::stop() {
         }
     }
 
+#ifdef SPAZNET_HAS_COROUTINES
     // Step 4: drain in-flight coroutines, with a deadline so a wedged
     // handler can't deadlock stop(). 1 second is a defensible upper bound
     // for any reasonable in-flight request to either complete or fail
@@ -657,6 +701,7 @@ void Server::stop() {
            std::chrono::steady_clock::now() < drain_deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+#endif // SPAZNET_HAS_COROUTINES
 
     // Step 5: signal the IOContext loop to exit. After this returns,
     // worker threads (joined inside IOContext::run) will terminate. Any

@@ -21,7 +21,7 @@
 
 namespace spaznet {
 
-
+#ifdef SPAZNET_HAS_COROUTINES
 // Socket wrapper
 class Socket {
   private:
@@ -82,6 +82,7 @@ class Socket {
 
     void close();
 };
+#endif // SPAZNET_HAS_COROUTINES
 
 } // namespace spaznet
 
@@ -102,6 +103,7 @@ struct Datagram {
     int fd{-1};                // the UDP socket the datagram arrived on
 };
 
+#ifdef SPAZNET_HAS_COROUTINES
 // Per-connection callback: the Server invokes this once for each
 // accepted TCP connection, handing ownership of the Socket.  The
 // connection lives until the Task completes; the Socket destructor
@@ -111,6 +113,7 @@ using ConnectionHandler = std::function<Task(Socket)>;
 // Per-datagram callback: the Server invokes this once for each UDP
 // datagram received on any port it's listening on.
 using DatagramHandler = std::function<Task(Datagram)>;
+#endif // SPAZNET_HAS_COROUTINES
 
 // Reactor-side per-connection callback: invoked once for each accepted TCP
 // connection with the fd (already set non-blocking), the IOContext it was
@@ -151,15 +154,17 @@ using SyncDatagramHandler = std::function<void(Datagram)>;
 class Server {
   private:
     std::unique_ptr<IOContext> io_context_;
+#ifdef SPAZNET_HAS_COROUTINES
     ConnectionHandler connection_handler_;
     DatagramHandler datagram_handler_;
+#endif
     ConnectionFactory connection_factory_;
     SyncDatagramHandler sync_datagram_handler_;
-    std::unordered_map<int, std::coroutine_handle<>> socket_handles_;
     // Track active listening sockets so stop()/destructor can close them even if coroutines are
     // currently suspended on accept.
     std::mutex listen_fds_mutex_;
     std::vector<int> listen_fds_;
+#ifdef SPAZNET_HAS_COROUTINES
     // Track active per-connection coroutines so stop() can drain them
     // before the IOContext is torn down. Each handle_connection
     // increments active_connections_ on entry and decrements on exit (RAII
@@ -169,6 +174,7 @@ class Server {
     std::mutex client_fds_mutex_;
     std::unordered_set<int> active_client_fds_;
     std::atomic<int> active_connections_{0};
+#endif
     // Reactor-side counterpart of active_client_fds_: connections minted by
     // connection_factory_, keyed by fd. Server owns the shared_ptr from the
     // point the factory returns it until the connection reports itself
@@ -178,9 +184,24 @@ class Server {
     std::unordered_map<int, std::shared_ptr<IoHandler>> reactor_connections_;
     std::atomic<bool> running_;
 
+#ifdef SPAZNET_HAS_COROUTINES
     Task handle_connection(Socket socket);
-    Task accept_connections(int listen_fd);
-    Task receive_udp(int udp_fd);
+#endif
+    // Reactor-native accept/datagram loops — always built, no coroutine
+    // involved. Each is invoked from a small persistent IoHandler
+    // (ListenHandler / DatagramReadHandler, defined in server_impl.cpp)
+    // registered on the listening fd; both drain their fd with
+    // non-blocking syscalls in a loop until EAGAIN, exactly reproducing
+    // what the old accept_connections()/receive_udp() coroutines did
+    // between suspension points. Returns true if the fd should have its
+    // read interest re-armed (drained to EAGAIN while still running_);
+    // false if the caller should NOT re-arm — either stop() flipped
+    // running_ off, or (accept_ready only) a hard accept() error caused
+    // this listen fd to be closed already.
+    bool accept_ready(int listen_fd);
+    bool datagram_ready(int udp_fd);
+    class ListenHandler;
+    class DatagramReadHandler;
     // Drops fd from reactor_connections_ (called once the connection is
     // done with itself) and updates the shared active-connection count.
     // Safe to call from any thread; safe to call from inside the very
@@ -198,14 +219,19 @@ class Server {
     void listen_tcp(uint16_t port);
     void listen_udp(uint16_t port);
 
-    // ---- Low-level callbacks (preferred). ----
+    // ---- Low-level callbacks (preferred, coroutine runtime only). ----
     // set_connection_handler is invoked once per accepted TCP
     // connection.  set_datagram_handler is invoked once per received
     // UDP datagram.  Examples under example/<protocol>/ provide
     // factory helpers (e.g. spaznet::http::make_dispatcher) that
-    // build these callbacks from higher-level handler interfaces.
+    // build these callbacks from higher-level handler interfaces. Only
+    // declared when SPAZNET_HAS_COROUTINES is defined — with coroutines
+    // disabled, set_connection_factory/set_sync_datagram_handler below are
+    // the only acceptance strategy.
+#ifdef SPAZNET_HAS_COROUTINES
     void set_connection_handler(ConnectionHandler handler);
     void set_datagram_handler(DatagramHandler handler);
+#endif
 
     // ---- Reactor-side callbacks. ----
     // set_connection_factory / set_sync_datagram_handler are the

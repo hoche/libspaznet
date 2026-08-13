@@ -19,6 +19,7 @@ using namespace spaznet;
 using spaznet::http::testing_support::DispatcherKind;
 using spaznet::http::testing_support::DispatcherKindName;
 using spaznet::http::testing_support::install_dispatcher;
+using spaznet::http::testing_support::AllDispatcherKinds;
 
 // Use a unique test handler name to avoid ODR clashes with handlers in other
 // test translation units (e.g., test_tcp_server.cpp) that also define
@@ -227,5 +228,5 @@ TEST_P(HTTPServerTest, ResponseBody) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Dispatchers, HTTPServerTest,
-                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        ::testing::ValuesIn(AllDispatcherKinds()),
                         DispatcherKindName);

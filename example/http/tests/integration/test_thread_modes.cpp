@@ -20,6 +20,7 @@
 using namespace spaznet;
 using spaznet::http::testing_support::DispatcherKind;
 using spaznet::http::testing_support::install_dispatcher;
+using spaznet::http::testing_support::AllDispatcherKinds;
 
 namespace {
 
@@ -156,7 +157,7 @@ TEST_P(ServerThreadModeTest, HandlesRequestsInBothModes) {
 INSTANTIATE_TEST_SUITE_P(
     ThreadModes, ServerThreadModeTest,
     ::testing::Combine(::testing::Values(std::size_t{0}, std::size_t{4}),
-                       ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor)),
+                       ::testing::ValuesIn(AllDispatcherKinds())),
     [](const ::testing::TestParamInfo<std::tuple<std::size_t, DispatcherKind>>& info) {
         std::string name = std::get<0>(info.param) == 0 ? "NonThreaded" : "Threaded";
         name += (std::get<1>(info.param) == DispatcherKind::Reactor) ? "_Reactor" : "_Coroutine";
@@ -183,5 +184,5 @@ TEST_P(ServerDefaultModeTest, DefaultIsNonThreadedAndWorks) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Dispatchers, ServerDefaultModeTest,
-                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        ::testing::ValuesIn(AllDispatcherKinds()),
                         spaznet::http::testing_support::DispatcherKindName);

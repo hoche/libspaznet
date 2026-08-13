@@ -187,6 +187,7 @@ struct OpenCloseCounters {
     std::atomic<int> close_count{0};
 };
 
+#ifdef SPAZNET_HAS_COROUTINES
 class EchoWSHandler : public spaznet::websocket::Handler {
   public:
     explicit EchoWSHandler(OpenCloseCounters& counters) : counters_(counters) {}
@@ -206,6 +207,7 @@ class EchoWSHandler : public spaznet::websocket::Handler {
   private:
     OpenCloseCounters& counters_;
 };
+#endif // SPAZNET_HAS_COROUTINES
 
 class EchoWSHandlerReactor : public spaznet::websocket::reactor::Handler {
   public:
@@ -225,6 +227,7 @@ class EchoWSHandlerReactor : public spaznet::websocket::reactor::Handler {
     OpenCloseCounters& counters_;
 };
 
+using spaznet::websocket::testing_support::AllDispatcherKinds;
 using spaznet::websocket::testing_support::DispatcherKind;
 using spaznet::websocket::testing_support::DispatcherKindName;
 
@@ -235,10 +238,13 @@ class WebSocketServerTest : public ::testing::TestWithParam<DispatcherKind> {
         if (GetParam() == DispatcherKind::Reactor) {
             server->set_connection_factory(spaznet::websocket::make_reactor_dispatcher(
                 nullptr, std::make_unique<EchoWSHandlerReactor>(counters)));
-        } else {
+        }
+#ifdef SPAZNET_HAS_COROUTINES
+        else {
             server->set_connection_handler(spaznet::websocket::make_dispatcher(
                 nullptr, std::make_unique<EchoWSHandler>(counters)));
         }
+#endif
         port = 7877;
         server->listen_tcp(port);
         server_thread = std::thread([this]() { server->run(); });
@@ -259,7 +265,7 @@ class WebSocketServerTest : public ::testing::TestWithParam<DispatcherKind> {
 };
 
 INSTANTIATE_TEST_SUITE_P(Dispatchers, WebSocketServerTest,
-                         ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                         ::testing::ValuesIn(AllDispatcherKinds()),
                          DispatcherKindName);
 
 TEST_P(WebSocketServerTest, PerformsRFC6455Handshake) {

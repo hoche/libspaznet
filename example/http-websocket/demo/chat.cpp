@@ -156,6 +156,8 @@ class HttpFallback : public spaznet::http::HTTPHandler {
     }
 };
 
+#ifdef SPAZNET_HAS_COROUTINES
+
 // Per-connection state: an outbound queue fed by *other* connections'
 // handle_message calls, drained only by this connection's own writer_loop.
 struct Session {
@@ -299,6 +301,8 @@ class ChatRoom : public spaznet::websocket::Handler {
     std::unordered_map<int, std::shared_ptr<Session>> sessions_;
 };
 
+#endif // SPAZNET_HAS_COROUTINES
+
 // Coroutine-free counterpart of ChatRoom. Notably simpler: since
 // reactor::Connection::send() is a direct, synchronous write into the
 // target's OutputBuffer rather than a co_await'd socket write, there's no
@@ -379,7 +383,11 @@ class ChatRoomReactor : public spaznet::websocket::reactor::Handler {
 } // namespace
 
 int main(int argc, char** argv) {
+#ifdef SPAZNET_HAS_COROUTINES
     bool use_reactor = false;
+#else
+    bool use_reactor = true; // Coroutine dispatcher isn't built in this configuration.
+#endif
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--reactor") == 0) {
             use_reactor = true;
@@ -390,10 +398,13 @@ int main(int argc, char** argv) {
     if (use_reactor) {
         server.set_connection_factory(spaznet::websocket::make_reactor_dispatcher(
             std::make_unique<HttpFallback>(), std::make_unique<ChatRoomReactor>()));
-    } else {
+    }
+#ifdef SPAZNET_HAS_COROUTINES
+    else {
         server.set_connection_handler(spaznet::websocket::make_dispatcher(
             std::make_unique<HttpFallback>(), std::make_unique<ChatRoom>()));
     }
+#endif
     server.listen_tcp(8080);
     server.run();
 }

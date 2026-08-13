@@ -55,7 +55,12 @@ class ThroughputTest : public ::testing::Test {
 
         handler = std::make_unique<ThroughputHTTPHandler>();
         server = std::make_unique<Server>(4);
+#ifdef SPAZNET_HAS_COROUTINES
         server->set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<ThroughputHTTPHandler>()));
+#else
+        server->set_connection_factory(
+            spaznet::http::make_reactor_dispatcher(std::make_unique<ThroughputHTTPHandler>()));
+#endif
         server->listen_tcp(9000);
 
         server_thread = std::thread([this]() { server->run(); });
@@ -247,7 +252,12 @@ TEST_F(ThroughputTest, LargeResponseThroughput) {
         }
     };
 
+#ifdef SPAZNET_HAS_COROUTINES
     server->set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<LargeResponseHandler>()));
+#else
+    server->set_connection_factory(
+        spaznet::http::make_reactor_dispatcher(std::make_unique<LargeResponseHandler>()));
+#endif
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     const int num_requests = 100;

@@ -19,6 +19,7 @@
 
 namespace spaznet::http {
 
+#ifdef SPAZNET_HAS_COROUTINES
 // Build a ConnectionHandler that speaks HTTP/1.1 on the accepted
 // connection.  Ownership of `handler` is transferred into the
 // dispatcher; the same handler instance is shared across all
@@ -33,6 +34,7 @@ auto make_dispatcher(std::unique_ptr<HTTPHandler> handler) -> ::spaznet::Connect
 // asking the kernel for those same bytes a second time.
 auto serve_keep_alive(::spaznet::Socket socket, HTTPHandler& handler,
                       std::vector<std::uint8_t> initial_buffer) -> ::spaznet::Task;
+#endif // SPAZNET_HAS_COROUTINES
 
 // Reactor-side counterpart of make_dispatcher: no Task, no co_await,
 // anywhere. Hand the result to Server::set_connection_factory instead of

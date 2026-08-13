@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include <string>
+#include <vector>
 
 namespace spaznet::websocket::testing_support {
 
@@ -21,6 +22,18 @@ enum class DispatcherKind { Coroutine, Reactor };
 
 inline auto DispatcherKindName(const ::testing::TestParamInfo<DispatcherKind>& info) -> std::string {
     return info.param == DispatcherKind::Reactor ? "Reactor" : "Coroutine";
+}
+
+// The coroutine dispatcher only exists when this binary was built with
+// SPAZNET_ENABLE_COROUTINES; instantiate test suites from this instead
+// of a hardcoded {Coroutine, Reactor} list so they still build and run
+// (Reactor-only) when it's off.
+inline auto AllDispatcherKinds() -> std::vector<DispatcherKind> {
+#ifdef SPAZNET_HAS_COROUTINES
+    return {DispatcherKind::Coroutine, DispatcherKind::Reactor};
+#else
+    return {DispatcherKind::Reactor};
+#endif
 }
 
 } // namespace spaznet::websocket::testing_support

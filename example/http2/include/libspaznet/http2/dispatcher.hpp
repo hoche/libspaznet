@@ -20,7 +20,9 @@
 
 namespace spaznet::http2 {
 
+#ifdef SPAZNET_HAS_COROUTINES
 auto make_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::ConnectionHandler;
+#endif // SPAZNET_HAS_COROUTINES
 
 // Coroutine-free counterpart of make_dispatcher: identical wire behavior
 // (preface, SETTINGS, multiplexed streams, HPACK, flow control, PING,

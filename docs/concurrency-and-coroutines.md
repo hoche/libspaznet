@@ -39,9 +39,13 @@ This document explains how `libspaznet` schedules work, how coroutines move betw
 > the new "Reactor Threading Model" section below) — every reactor
 > dispatcher's `ResponseWriter` completion and cross-connection send now
 > goes through it, and HTTP/2's former per-connection `recursive_mutex`
-> is gone as a result. Only `coro-free-build` remains before the whole
-> library builds coroutine-free end to end. A full rewrite of this
-> document for the dual-runtime model is tracked alongside that work.
+> is gone as a result. `-DSPAZNET_ENABLE_COROUTINES=OFF` now builds the
+> core library, all five protocol libraries, every demo, and the full
+> test suite with zero coroutine code compiled in — see
+> `docs/coro-free-build.md` for the build matrix, the reactor
+> state-machine authoring rules, and the connection-lifetime/re-entrancy
+> rules every reactor dispatcher in this tree follows. A full rewrite of
+> this document for the dual-runtime model is tracked as future work.
 
 ## Architecture Overview
 

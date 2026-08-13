@@ -15,6 +15,8 @@
 
 #include <span>
 
+#ifdef SPAZNET_HAS_COROUTINES
+
 namespace spaznet {
 class Socket;
 }
@@ -26,3 +28,5 @@ auto send_message(::spaznet::Socket& socket, Opcode opcode,
     -> ::spaznet::Task;
 
 } // namespace spaznet::websocket
+
+#endif // SPAZNET_HAS_COROUTINES

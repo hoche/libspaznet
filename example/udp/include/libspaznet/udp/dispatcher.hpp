@@ -12,8 +12,10 @@
 
 namespace spaznet::udp {
 
+#ifdef SPAZNET_HAS_COROUTINES
 // Coroutine runtime: install via Server::set_datagram_handler.
 auto make_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::DatagramHandler;
+#endif // SPAZNET_HAS_COROUTINES
 
 // Coroutine-free reactor runtime: install via
 // Server::set_sync_datagram_handler. See dispatcher.hpp's HTTP/1.1

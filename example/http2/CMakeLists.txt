@@ -3,11 +3,14 @@
 # spaznet::http3 (transitively via the core static lib) for the
 # RFC 7541 §B Huffman codec shared with QPACK.
 
-add_library(spaznet_http2 STATIC
+set(SPAZNET_HTTP2_SOURCES
     src/codec.cpp
-    src/dispatcher.cpp
     src/dispatcher_reactor.cpp
 )
+if(SPAZNET_ENABLE_COROUTINES)
+    list(APPEND SPAZNET_HTTP2_SOURCES src/dispatcher.cpp)
+endif()
+add_library(spaznet_http2 STATIC ${SPAZNET_HTTP2_SOURCES})
 add_library(spaznet::http2 ALIAS spaznet_http2)
 
 target_compile_features(spaznet_http2 PUBLIC cxx_std_20)

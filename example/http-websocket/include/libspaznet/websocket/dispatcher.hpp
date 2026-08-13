@@ -18,8 +18,10 @@
 
 namespace spaznet::websocket {
 
+#ifdef SPAZNET_HAS_COROUTINES
 auto make_dispatcher(std::unique_ptr<::spaznet::http::HTTPHandler> http_handler,
                      std::unique_ptr<Handler> ws_handler) -> ::spaznet::ConnectionHandler;
+#endif
 
 // Coroutine-free counterpart of make_dispatcher: same upgrade-sniffing
 // behavior (a null http_handler still means "404 to every non-WS

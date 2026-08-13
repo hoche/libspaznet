@@ -149,14 +149,16 @@ set(HEADERS
     include/libspaznet/utils/header_utils.hpp
 )
 
-# Server (and its Socket wrapper) is still 100% coroutine-based today — its
-# reactor counterpart is a later milestone (server-reactor-entry, then a
-# reactor dispatcher per protocol). Only add it, and the example/ protocol
-# libraries that depend on it, when coroutines are enabled.
-if(SPAZNET_ENABLE_COROUTINES)
-    list(APPEND SOURCES src/server_impl.cpp)
-    list(APPEND HEADERS include/libspaznet/server.hpp)
-endif()
+# Server (and its Socket wrapper) is always built: Socket and the
+# coroutine-only accept/datagram-dispatch paths are #ifdef
+# SPAZNET_HAS_COROUTINES inside server.hpp/server_impl.cpp, but
+# listen_tcp()/listen_udp() themselves drive a reactor-native
+# ListenHandler/DatagramReadHandler (IoHandler, no coroutine) either way,
+# so Server::set_connection_factory/set_sync_datagram_handler work with
+# SPAZNET_ENABLE_COROUTINES=OFF. See the reactor-port plan's
+# coro-free-build milestone note.
+list(APPEND SOURCES src/server_impl.cpp)
+list(APPEND HEADERS include/libspaznet/server.hpp)
 
 # ---- Library target -----------------------------------------------------
 add_library(spaznet STATIC ${SOURCES} ${HEADERS})
@@ -362,38 +364,34 @@ spaznet_apply_test_warnings(test_unit)
 
 add_test(NAME UnitTests COMMAND test_unit)
 
-if(SPAZNET_ENABLE_COROUTINES)
-    # Drives Server::listen_tcp/connect, i.e. the coroutine-only Server API.
-    add_executable(test_performance
-        tests/test_main.cpp
-        tests/performance/test_iperf_integration.cpp
-    )
-    target_link_libraries(test_performance PRIVATE spaznet GTest::gtest GTest::gmock)
-    spaznet_apply_test_warnings(test_performance)
-    add_test(NAME PerformanceTests COMMAND test_performance)
+# Shells out to an external iperf3/iperf process; doesn't touch Server or
+# any coroutine API, so it builds either way.
+add_executable(test_performance
+    tests/test_main.cpp
+    tests/performance/test_iperf_integration.cpp
+)
+target_link_libraries(test_performance PRIVATE spaznet GTest::gtest GTest::gmock)
+spaznet_apply_test_warnings(test_performance)
+add_test(NAME PerformanceTests COMMAND test_performance)
 
-    # Server (and thus its reactor entry points) is coroutine-only today —
-    # see the SOURCES/HEADERS comment above.
-    add_executable(test_server_reactor
-        tests/test_main.cpp
-        tests/integration/test_server_reactor.cpp
-    )
-    target_link_libraries(test_server_reactor PRIVATE spaznet GTest::gtest GTest::gmock)
-    spaznet_apply_test_warnings(test_server_reactor)
-    add_test(NAME ServerReactorTests COMMAND test_server_reactor)
-endif()
+# Server is always built now (see the SOURCES/HEADERS comment above), and
+# this test only exercises its reactor entry points (ConnectionFactory /
+# SyncDatagramHandler / destroy-based shutdown), so it builds either way too.
+add_executable(test_server_reactor
+    tests/test_main.cpp
+    tests/integration/test_server_reactor.cpp
+)
+target_link_libraries(test_server_reactor PRIVATE spaznet GTest::gtest GTest::gmock)
+spaznet_apply_test_warnings(test_server_reactor)
+add_test(NAME ServerReactorTests COMMAND test_server_reactor)
 
 # ---- example/ subprojects ----
+# Every protocol has a reactor-side dispatcher now (make_reactor_dispatcher),
+# so example/ builds under SPAZNET_ENABLE_COROUTINES=OFF too — each
+# protocol's own CMakeLists.txt excludes its coroutine-only dispatcher.cpp
+# (and coroutine-only tests/demo code paths) in that case. See the
+# reactor-port plan's coro-free-build milestone note.
 option(SPAZNET_BUILD_EXAMPLES "Build example protocol libraries (HTTP, etc.)" ON)
-if(SPAZNET_BUILD_EXAMPLES AND NOT SPAZNET_ENABLE_COROUTINES)
-    message(WARNING
-        "SPAZNET_ENABLE_COROUTINES=OFF: Server and every example/ protocol "
-        "dispatcher are still coroutine-only (their reactor counterparts "
-        "haven't landed yet), so SPAZNET_BUILD_EXAMPLES is being forced OFF. "
-        "Only the reactor-kernel parts of the core library (fd table, "
-        "timers, post()) will build.")
-    set(SPAZNET_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-endif()
 if(SPAZNET_BUILD_EXAMPLES)
     add_subdirectory(example/http)
     add_subdirectory(example/http-websocket)

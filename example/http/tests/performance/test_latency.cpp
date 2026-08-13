@@ -34,7 +34,12 @@ class LatencyTest : public ::testing::Test {
   protected:
     void SetUp() override {
         server = std::make_unique<Server>(4);
+#ifdef SPAZNET_HAS_COROUTINES
         server->set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<LatencyHTTPHandler>()));
+#else
+        server->set_connection_factory(
+            spaznet::http::make_reactor_dispatcher(std::make_unique<LatencyHTTPHandler>()));
+#endif
         server->listen_tcp(9001);
 
         server_thread = std::thread([this]() { server->run(); });

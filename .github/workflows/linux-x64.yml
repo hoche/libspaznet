@@ -9,20 +9,34 @@ on:
 
 jobs:
   build-test:
-    name: Build and Test - Linux x64
+    name: Build and Test - Linux x64 (coroutines ${{ matrix.coroutines }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        coroutines: [ "ON", "OFF" ]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Build and test in Ubuntu 25.10 container
+        env:
+          SPAZNET_ENABLE_COROUTINES: ${{ matrix.coroutines }}
         run: |
           # Host runner is still 24.04 (OpenSSL 3.0). Pull OpenSSL 3.5 from
           # ubuntu:25.10 apt instead of building it from source. Native amd64
           # — no QEMU.
+          #
+          # The coroutines=OFF leg exists to keep the reactor-only build (no
+          # C++20 <coroutine> dependency at all — see docs/coro-free-build.md)
+          # from silently regressing: every core/example target still has to
+          # configure, build, and pass its full test suite with
+          # -DSPAZNET_ENABLE_COROUTINES=OFF, exercising only the reactor
+          # dispatchers.
           docker run --rm \
             -v ${{ github.workspace }}:/workspace -w /workspace \
+            -e SPAZNET_ENABLE_COROUTINES \
             ubuntu:25.10 bash -c '
             set -e
             export DEBIAN_FRONTEND=noninteractive
@@ -32,8 +46,12 @@ jobs:
             jobs="$(nproc)"
             export CMAKE_BUILD_PARALLEL_LEVEL="$jobs"
             mkdir -p build && cd build
-            cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
-            grep -q "SPAZNET_BUILD_QUIC:BOOL=ON" CMakeCache.txt
+            cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                  -DSPAZNET_ENABLE_COROUTINES="$SPAZNET_ENABLE_COROUTINES" ..
+            grep -q "SPAZNET_ENABLE_COROUTINES:BOOL=$SPAZNET_ENABLE_COROUTINES" CMakeCache.txt
+            if [ "$SPAZNET_ENABLE_COROUTINES" = "ON" ]; then
+              grep -q "SPAZNET_BUILD_QUIC:BOOL=ON" CMakeCache.txt
+            fi
             cmake --build . --parallel "$jobs"
             # Tests stay serial: several integration suites bind fixed ports.
             ctest --output-on-failure --timeout 180

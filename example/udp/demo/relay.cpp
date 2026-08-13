@@ -90,7 +90,11 @@ class Relay : public spaznet::udp::Handler {
 };
 
 int main(int argc, char** argv) {
+#ifdef SPAZNET_HAS_COROUTINES
     bool use_reactor = false;
+#else
+    bool use_reactor = true; // Coroutine dispatcher isn't built in this configuration.
+#endif
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--reactor") == 0) {
             use_reactor = true;
@@ -100,9 +104,12 @@ int main(int argc, char** argv) {
     spaznet::Server server(2);
     if (use_reactor) {
         server.set_sync_datagram_handler(spaznet::udp::make_reactor_dispatcher(std::make_unique<Relay>()));
-    } else {
+    }
+#ifdef SPAZNET_HAS_COROUTINES
+    else {
         server.set_datagram_handler(spaznet::udp::make_dispatcher(std::make_unique<Relay>()));
     }
+#endif
     server.listen_udp(8080);
     server.run();
 }

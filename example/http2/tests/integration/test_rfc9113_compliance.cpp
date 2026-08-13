@@ -22,6 +22,7 @@ using namespace spaznet;
 using spaznet::http2::testing_support::DispatcherKind;
 using spaznet::http2::testing_support::DispatcherKindName;
 using spaznet::http2::testing_support::install_dispatcher;
+using spaznet::http2::testing_support::AllDispatcherKinds;
 
 // RFC 9113 Compliant Test Handler
 class RFC9113TestHandler : public spaznet::http2::Handler {
@@ -301,7 +302,7 @@ TEST_P(RFC9113IntegrationTest, RequestResponseExchange) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Dispatchers, RFC9113IntegrationTest,
-                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        ::testing::ValuesIn(AllDispatcherKinds()),
                         DispatcherKindName);
 
 // Test RFC 9113 Section 5.1 - Stream States
@@ -525,5 +526,5 @@ TEST_P(HTTP2MultiplexingTest, FrameLoopUnblockedBySlowHandler) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Dispatchers, HTTP2MultiplexingTest,
-                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        ::testing::ValuesIn(AllDispatcherKinds()),
                         DispatcherKindName);

@@ -2,12 +2,15 @@
 # Depends on example/http for the HTTP/1.1 serve loop used when an
 # incoming request turns out not to be a WS upgrade.
 
-add_library(spaznet_http_websocket STATIC
+set(SPAZNET_WS_SOURCES
     src/handler.cpp
     src/handshake.cpp
-    src/dispatcher.cpp
     src/dispatcher_reactor.cpp
 )
+if(SPAZNET_ENABLE_COROUTINES)
+    list(APPEND SPAZNET_WS_SOURCES src/dispatcher.cpp)
+endif()
+add_library(spaznet_http_websocket STATIC ${SPAZNET_WS_SOURCES})
 add_library(spaznet::http_websocket ALIAS spaznet_http_websocket)
 
 target_compile_features(spaznet_http_websocket PUBLIC cxx_std_20)

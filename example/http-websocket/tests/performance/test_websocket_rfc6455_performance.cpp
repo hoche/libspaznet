@@ -2,6 +2,7 @@
 #include "perf_budget.hpp"
 #include <chrono>
 #include <libspaznet/websocket/dispatcher.hpp>
+#include <libspaznet/websocket/reactor_handler.hpp>
 #include <libspaznet/websocket/send.hpp>
 #include <libspaznet/server.hpp>
 #include <sstream>
@@ -151,6 +152,7 @@ std::string handshake_request(const std::string& key) {
     return oss.str();
 }
 
+#ifdef SPAZNET_HAS_COROUTINES
 class EchoWSHandler : public spaznet::websocket::Handler {
   public:
     Task on_open(spaznet::websocket::Connection&) override {
@@ -164,13 +166,29 @@ class EchoWSHandler : public spaznet::websocket::Handler {
         co_return;
     }
 };
+#endif // SPAZNET_HAS_COROUTINES
+
+class EchoWSHandlerReactor : public spaznet::websocket::reactor::Handler {
+  public:
+    void on_open(spaznet::websocket::reactor::Connection&) override {}
+    void handle_message(const spaznet::websocket::Message& message,
+                        spaznet::websocket::reactor::Connection& conn) override {
+        conn.send(message.opcode, message.data);
+    }
+    void on_close(spaznet::websocket::reactor::Connection&) override {}
+};
 
 } // namespace
 
 TEST(WebSocketPerformance, EchoesHundredsOfFramesQuickly) {
     const uint16_t port = 7999;
     Server server(4);
+#ifdef SPAZNET_HAS_COROUTINES
     server.set_connection_handler(spaznet::websocket::make_dispatcher(nullptr, std::make_unique<EchoWSHandler>()));
+#else
+    server.set_connection_factory(
+        spaznet::websocket::make_reactor_dispatcher(nullptr, std::make_unique<EchoWSHandlerReactor>()));
+#endif
     server.listen_tcp(port);
     std::thread t([&]() { server.run(); });
     std::this_thread::sleep_for(std::chrono::milliseconds(200));

@@ -65,6 +65,7 @@ void dispatch_one(QuicHttp3Service& service, ::spaznet::Datagram& dg) {
 
 } // namespace
 
+#ifdef SPAZNET_HAS_COROUTINES
 auto make_dispatcher(std::unique_ptr<QuicHttp3Service> service)
     -> ::spaznet::DatagramHandler {
     // shared_ptr so the std::function payload stays copyable.
@@ -78,6 +79,7 @@ auto make_dispatcher(std::unique_ptr<QuicHttp3Service> service)
         co_return;
     };
 }
+#endif // SPAZNET_HAS_COROUTINES
 
 auto make_reactor_dispatcher(std::unique_ptr<QuicHttp3Service> service)
     -> ::spaznet::SyncDatagramHandler {

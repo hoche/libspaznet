@@ -1,11 +1,14 @@
 # example/http — HTTP/1.1 only.  Built on top of the core libspaznet
 # target via Server::set_connection_handler.  See docs/http.md.
 
-add_library(spaznet_http STATIC
+set(SPAZNET_HTTP_SOURCES
     src/handler.cpp
-    src/dispatcher.cpp
     src/dispatcher_reactor.cpp
 )
+if(SPAZNET_ENABLE_COROUTINES)
+    list(APPEND SPAZNET_HTTP_SOURCES src/dispatcher.cpp)
+endif()
+add_library(spaznet_http STATIC ${SPAZNET_HTTP_SOURCES})
 add_library(spaznet::http ALIAS spaznet_http)
 
 target_compile_features(spaznet_http PUBLIC cxx_std_20)

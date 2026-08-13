@@ -20,6 +20,7 @@ using namespace spaznet;
 using spaznet::http::testing_support::DispatcherKind;
 using spaznet::http::testing_support::DispatcherKindName;
 using spaznet::http::testing_support::install_dispatcher;
+using spaznet::http::testing_support::AllDispatcherKinds;
 
 // RFC 9112 Compliant Test Handler
 class RFC9112TestHandler : public spaznet::http::HTTPHandler {
@@ -473,5 +474,5 @@ TEST_P(RFC9112IntegrationTest, MalformedRequestLineGetsFullBadRequestResponseThe
 }
 
 INSTANTIATE_TEST_SUITE_P(Dispatchers, RFC9112IntegrationTest,
-                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        ::testing::ValuesIn(AllDispatcherKinds()),
                         DispatcherKindName);

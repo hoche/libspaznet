@@ -164,6 +164,7 @@ auto pick_free_udp_port() -> uint16_t {
 using ::spaznet::http3::testing_support::DispatcherKind;
 using ::spaznet::http3::testing_support::DispatcherKindName;
 using ::spaznet::http3::testing_support::install_dispatcher;
+using ::spaznet::http3::testing_support::AllDispatcherKinds;
 
 class QuicHttp3CurlInterop : public ::testing::TestWithParam<DispatcherKind> {};
 
@@ -238,5 +239,5 @@ TEST_P(QuicHttp3CurlInterop, RealCurlReceivesResponseBody) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Dispatchers, QuicHttp3CurlInterop,
-                         ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                         ::testing::ValuesIn(AllDispatcherKinds()),
                          DispatcherKindName);

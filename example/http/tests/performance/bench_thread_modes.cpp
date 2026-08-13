@@ -816,14 +816,23 @@ int main(int argc, char** argv) {
 
     // HTTP benchmarks per thread count, once per dispatcher kind — same
     // BenchHandler, same protocol, only the execution model differs (see
-    // the DispatcherKind comment above).
+    // the DispatcherKind comment above). The coroutine arm only exists
+    // when this binary was built with SPAZNET_ENABLE_COROUTINES.
+#ifdef SPAZNET_HAS_COROUTINES
+    std::vector<DispatcherKind> dispatcher_kinds = {DispatcherKind::Coroutine, DispatcherKind::Reactor};
+#else
+    std::vector<DispatcherKind> dispatcher_kinds = {DispatcherKind::Reactor};
+#endif
     for (std::size_t threads : thread_counts) {
-        for (DispatcherKind kind : {DispatcherKind::Coroutine, DispatcherKind::Reactor}) {
+        for (DispatcherKind kind : dispatcher_kinds) {
             Server server(threads);
+#ifdef SPAZNET_HAS_COROUTINES
             if (kind == DispatcherKind::Coroutine) {
                 server.set_connection_handler(
                     spaznet::http::make_dispatcher(std::make_unique<BenchHandler>()));
-            } else {
+            } else
+#endif
+            {
                 server.set_connection_factory(
                     spaznet::http::make_reactor_dispatcher(std::make_unique<BenchHandler>()));
             }

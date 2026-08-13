@@ -27,6 +27,7 @@ using namespace spaznet;
 using spaznet::http::testing_support::DispatcherKind;
 using spaznet::http::testing_support::DispatcherKindName;
 using spaznet::http::testing_support::install_dispatcher;
+using spaznet::http::testing_support::AllDispatcherKinds;
 
 namespace {
 
@@ -143,5 +144,5 @@ TEST_P(DeferredHandlerTest, MultipleSequentialDeferredRequestsAllComplete) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Dispatchers, DeferredHandlerTest,
-                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        ::testing::ValuesIn(AllDispatcherKinds()),
                         DispatcherKindName);

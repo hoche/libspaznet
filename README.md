@@ -329,6 +329,7 @@ For detailed information about the coroutine execution model, thread scheduling,
 | QUIC security model | [`docs/quic-security.md`](docs/quic-security.md) |
 | Threading & tuning | [`docs/threading.md`](docs/threading.md) |
 | Coroutine model | [`docs/concurrency-and-coroutines.md`](docs/concurrency-and-coroutines.md) |
+| Building without coroutines (reactor runtime) | [`docs/coro-free-build.md`](docs/coro-free-build.md) |
 | Coroutine pitfalls (don't do these) | [`docs/coroutine-pitfalls.md`](docs/coroutine-pitfalls.md) |
 | Mutex vs. atomic posture | [`docs/mutex-vs-atomics.md`](docs/mutex-vs-atomics.md) |
 | Performance numbers | [`docs/performance.md`](docs/performance.md) |

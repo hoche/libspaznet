@@ -21,6 +21,7 @@ using namespace spaznet;
 using spaznet::udp::testing_support::DispatcherKind;
 using spaznet::udp::testing_support::DispatcherKindName;
 using spaznet::udp::testing_support::install_dispatcher;
+using spaznet::udp::testing_support::AllDispatcherKinds;
 
 class TestUDPHandler : public spaznet::udp::Handler {
   public:
@@ -141,5 +142,5 @@ TEST_P(UDPServerTest, BinaryData) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Dispatchers, UDPServerTest,
-                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        ::testing::ValuesIn(AllDispatcherKinds()),
                         DispatcherKindName);

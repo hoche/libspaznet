@@ -6,14 +6,18 @@
 #include <string>
 #include <vector>
 
+#ifdef SPAZNET_HAS_COROUTINES
 namespace spaznet {
 class Socket;
 }
+#endif
 
 namespace spaznet::websocket {
 
+#ifdef SPAZNET_HAS_COROUTINES
 using ::spaznet::Socket;
 using ::spaznet::Task;
+#endif
 
 enum class Opcode : uint8_t {
     Continuation = 0x0,
@@ -54,6 +58,8 @@ struct Message {
     Opcode opcode;
     std::vector<uint8_t> data;
 };
+
+#ifdef SPAZNET_HAS_COROUTINES
 
 // Per-connection async write gate. Opaque here; defined in dispatcher.cpp.
 // Serializes every write to a single connection so the dispatcher's control
@@ -135,5 +141,7 @@ class Handler {
     // Handle WebSocket connection close
     virtual auto on_close(Connection& conn) -> Task = 0;
 };
+
+#endif // SPAZNET_HAS_COROUTINES
 
 } // namespace spaznet::websocket
