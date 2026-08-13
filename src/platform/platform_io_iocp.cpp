@@ -103,6 +103,18 @@ class PlatformIOIOCP : public PlatformIO {
         if (CreateIoCompletionPort(as_handle(fd), iocp_handle_,
                                    static_cast<ULONG_PTR>(static_cast<UINT_PTR>(fd)), 0) ==
             nullptr) {
+            const DWORD err = GetLastError();
+            // A socket stays associated with an IOCP for its lifetime. We
+            // drop FdRecord on remove_fd (e.g. TLS handshake finish_ok), then
+            // add_fd again for the first post-handshake async_read. Treat
+            // "already associated" as success so WSS/HTTP keep getting
+            // zero-byte WSARecv wakes — without this, await_ready only
+            // works when ciphertext is already buffered (HTTPS often is;
+            // WSS echo after 101 is not).
+            if (err == ERROR_INVALID_PARAMETER) {
+                rec.associated = true;
+                return true;
+            }
             return false;
         }
         rec.associated = true;

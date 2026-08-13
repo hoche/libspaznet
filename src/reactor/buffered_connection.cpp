@@ -165,16 +165,21 @@ void BufferedConnection::start() {
     if (closed_) {
         return;
     }
-    ctx_.set_io_handler(fd_, PlatformIO::EVENT_READ, shared_from_this());
 #ifdef SPAZNET_HAS_TLS
     // listen_tls may leave decrypted app data buffered inside OpenSSL after
     // SSL_accept while the TCP recv buffer is empty. IOCP's zero-byte WSARecv
     // (and sometimes epoll) then never wakes us. Opportunistically drain now —
     // same idea as Socket::async_read's await_ready SSL_read.
+    //
+    // Important on Windows: do this BEFORE arming a read probe. feed_network()
+    // uses a synchronous recv; that must not run while a zero-byte WSARecv is
+    // outstanding on the same socket.
     if (tls_) {
         on_readable();
+        return;
     }
 #endif
+    ctx_.set_io_handler(fd_, PlatformIO::EVENT_READ, shared_from_this());
 }
 
 void BufferedConnection::on_readable() {

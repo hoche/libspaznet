@@ -6,6 +6,15 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
+## 2026-08-13 — IOCP re-associate after TLS handshake remove_io
+
+Windows: `CreateIoCompletionPort` on a socket that was associated, then
+`remove_fd`'d (TLS `finish_ok`), then `add_fd`'d again used to fail. Post-
+handshake `async_read` never armed, so WSS hung after 101 while HTTPS often
+still worked via already-buffered request bytes. Treat
+`ERROR_INVALID_PARAMETER` as success. Also drain TLS before arming the
+reactor read probe so sync `recv` does not race an outstanding WSARecv.
+
 ## 2026-08-13 — TLS memory BIOs (fix Windows WSS / IOCP)
 
 `TlsStream` no longer uses `SSL_set_fd` socket BIOs. Ciphertext is
