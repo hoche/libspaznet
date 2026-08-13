@@ -1,11 +1,16 @@
 // HTTP/2 feature showcase using example/http2.
 //
-// The centerpiece is multiplexing: the dispatcher runs each stream as
-// its own detached coroutine on a single TCP connection, so several
-// concurrent requests make progress in parallel instead of queueing
-// behind each other the way HTTP/1.1 keep-alive requests do.
+// The centerpiece is multiplexing: both dispatchers below run every
+// stream's handler independently of the others on a single TCP
+// connection, so several concurrent requests make progress in parallel
+// instead of queueing behind each other the way HTTP/1.1 keep-alive
+// requests do — the coroutine dispatcher via a detached per-stream
+// coroutine, the reactor dispatcher via a synchronous call per stream
+// that never blocks the frame-reading loop (see
+// libspaznet/http2/handler.hpp and dispatcher_reactor.cpp).
 //
-//   $ ./http2_showcase
+//   $ ./http2_showcase           # coroutine dispatcher (default)
+//   $ ./http2_showcase --reactor # coroutine-free reactor dispatcher
 //   $ curl --http2-prior-knowledge http://localhost:8080/
 //
 //   # The multiplexing demo — 8 requests that each sleep 1s. Over
@@ -24,9 +29,11 @@
 // DATA-frame request bodies, and dispatcher-enforced
 // MAX_CONCURRENT_STREAMS / SETTINGS / PING / flow control.
 //
-// Per Handler's contract, this code only ever populates `response` —
-// it never calls socket.async_write() directly (that would race with
-// other streams' frames on the shared connection writer).
+// Per Handler's contract, this code only ever completes a
+// ResponseWriter — it never touches a socket directly (under the
+// coroutine dispatcher that would race with other streams' frames on
+// the shared connection writer; the reactor dispatcher has no
+// per-handler socket access at all).
 
 #include <libspaznet/http2/dispatcher.hpp>
 #include <libspaznet/http2/handler.hpp>
@@ -38,12 +45,15 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
+#include <utility>
 
 namespace {
 
 using spaznet::http2::Request;
 using spaznet::http2::Response;
+using spaznet::http2::ResponseWriter;
 
 constexpr std::string_view kIndexPage =
     "libspaznet HTTP/2 showcase\n"
@@ -121,8 +131,13 @@ std::string now_iso_ms() {
     return std::to_string(ms) + " ms since epoch";
 }
 
-spaznet::Task handle_slow(const Request& req, const ParsedPath& parsed, Response& resp,
-                          spaznet::Socket& socket) {
+// Defers completion to a detached background thread that sleeps, then
+// calls writer.complete() — proving neither dispatcher's frame loop (nor,
+// under the coroutine dispatcher, any other stream's handler) is blocked
+// while this one "sleeps". See handler.hpp's ResponseWriter comment and
+// example/http/tests/integration/test_deferred_handler.cpp, which
+// exercises the exact same pattern.
+void handle_slow(const Request& req, const ParsedPath& parsed, ResponseWriter writer) {
     int delay_ms = 100;
     auto it = parsed.query.find("ms");
     if (it != parsed.query.end()) {
@@ -139,18 +154,20 @@ spaznet::Task handle_slow(const Request& req, const ParsedPath& parsed, Response
         delay_ms = 60000;
     }
 
-    std::ostringstream out;
-    out << "stream " << req.stream_id << ": sleeping " << delay_ms << " ms\n";
-    out << "  start: " << now_iso_ms() << "\n";
+    const std::uint32_t stream_id = req.stream_id;
+    const std::string start = now_iso_ms();
+    std::thread([stream_id, delay_ms, start, writer]() mutable {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
 
-    // While this stream's coroutine is suspended here, the dispatcher's
-    // frame-reading loop and the other streams' handler coroutines on
-    // this same connection keep running — that's the multiplexing this
-    // route exists to demonstrate.
-    co_await socket.context()->sleep_for(std::chrono::milliseconds(delay_ms));
+        std::ostringstream out;
+        out << "stream " << stream_id << ": slept " << delay_ms << " ms\n";
+        out << "  start: " << start << "\n";
+        out << "  end:   " << now_iso_ms() << "\n";
 
-    out << "  end:   " << now_iso_ms() << "\n";
-    set_text(resp, out.str());
+        Response resp;
+        set_text(resp, out.str());
+        writer.complete(std::move(resp));
+    }).detach();
 }
 
 void handle_stream_info(const Request& req, Response& resp) {
@@ -188,16 +205,22 @@ void handle_status(const std::string& path, Response& resp) {
 
 class Showcase : public spaznet::http2::Handler {
   public:
-    spaznet::Task handle_request(const spaznet::http2::Request& req,
-                                 spaznet::http2::Response& resp,
-                                 spaznet::Socket& socket) override {
-        resp.status_code = 200;
+    void handle_request(const Request& req, ResponseWriter writer) override {
         ParsedPath parsed = parse_path(req.path);
+
+        if (req.method == "GET" && parsed.path == "/slow") {
+            // Deferred — handle_slow completes `writer` itself, later,
+            // from a background thread.
+            handle_slow(req, parsed, writer);
+            return;
+        }
+
+        Response resp;
+        resp.stream_id = req.stream_id;
+        resp.status_code = 200;
 
         if (req.method == "GET" && parsed.path == "/") {
             set_text(resp, std::string(kIndexPage));
-        } else if (req.method == "GET" && parsed.path == "/slow") {
-            co_await handle_slow(req, parsed, resp, socket);
         } else if (req.method == "GET" && parsed.path == "/stream-info") {
             handle_stream_info(req, resp);
         } else if (req.method == "POST" && parsed.path == "/echo") {
@@ -208,13 +231,26 @@ class Showcase : public spaznet::http2::Handler {
             resp.set_status(404, "Not Found");
             set_text(resp, "No such route: " + req.method + " " + parsed.path + "\n");
         }
+        writer.complete(std::move(resp));
     }
 };
 
-int main() {
+int main(int argc, char** argv) {
+    bool use_reactor = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--reactor") {
+            use_reactor = true;
+        }
+    }
+
     spaznet::Server server(4);
-    server.set_connection_handler(
-        spaznet::http2::make_dispatcher(std::make_unique<Showcase>()));
+    if (use_reactor) {
+        server.set_connection_factory(
+            spaznet::http2::make_reactor_dispatcher(std::make_unique<Showcase>()));
+    } else {
+        server.set_connection_handler(
+            spaznet::http2::make_dispatcher(std::make_unique<Showcase>()));
+    }
     server.listen_tcp(8080);
     server.run();
 }

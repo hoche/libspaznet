@@ -205,16 +205,16 @@ the buffer off to the HTTP dispatcher.  See
 
 class MyHandler : public spaznet::http2::Handler {
 public:
-    spaznet::Task handle_request(
+    void handle_request(
         const spaznet::http2::Request& request,
-        spaznet::http2::Response& response,
-        spaznet::Socket& socket
+        spaznet::http2::ResponseWriter writer
     ) override {
+        spaznet::http2::Response response;
         response.status_code = 200;
         response.headers["content-type"] = "text/plain";
         const char body[] = "Hello, HTTP/2!\n";
         response.body.assign(body, body + sizeof(body) - 1);
-        co_return;
+        writer.complete(std::move(response));
     }
 };
 
@@ -242,6 +242,37 @@ For h2-over-TLS (the `h2` ALPN), terminate TLS in front; libspaznet
 does not include a TLS server for TCP today.  The QUIC stack
 (`example/quic-http3`) is a separate path that does include TLS via
 OpenSSL 3.5+.
+
+### Two dispatchers, one handler
+
+Same idea as HTTP/1.1 above — `example/http2` ships two
+interchangeable dispatchers for the same `Handler` interface:
+
+- **`make_dispatcher(...)`** (above) — coroutine-based, registered via
+  `Server::set_connection_handler`. Each stream's request runs as a
+  detached `Task` (`dispatch_request` in `dispatcher.cpp`).
+- **`make_reactor_dispatcher(...)`** — coroutine-free, registered via
+  `Server::set_connection_factory`. Each connection is a small explicit
+  state machine (`Http2Connection` in `dispatcher_reactor.cpp`) built on
+  `BufferedConnection` instead of a suspended coroutine frame per
+  connection plus a detached one per stream.
+
+```cpp
+server.set_connection_factory(
+    spaznet::http2::make_reactor_dispatcher(std::make_unique<MyHandler>()));
+```
+
+Both parse frames with the same `codec.cpp` (HPACK, `Frame`,
+`Settings`, `Parser`), enforce the same RFC 9113 limits and flow
+control, and answer through the same `ResponseWriter` — from a
+client's point of view they are indistinguishable, including how each
+handles multiplexing (see below). `example/http2/demo/hello.cpp` and
+`showcase.cpp` both accept a `--reactor` flag to switch, and the
+integration test suite (`example/http2/tests/integration/`) runs every
+scenario against both via `dispatcher_test_support.hpp`'s
+`DispatcherKind` parameterization — any behavioral divergence between
+them is treated as a bug. See `docs/concurrency-and-coroutines.md` for
+how the two execution models differ under the hood.
 
 ### What's implemented (RFC 9113)
 
@@ -277,44 +308,33 @@ OpenSSL 3.5+.
   "no other frames between HEADERS and CONTINUATION" doesn't bind
   us).  Tracked in [`api-status.md`](api-status.md).
 
-> Concurrent multiplexing **is** wired (2026-05-31): each fully-
-> arrived request dispatches as a detached coroutine, so a slow
-> handler on stream A no longer stalls PING-ACK, WINDOW_UPDATE, or
-> handlers for streams B / C / D.  Wire writes funnel through a
-> single per-connection writer coroutine to keep individual
-> frames atomic on the wire.  Handlers MUST NOT call
-> `socket.async_write` directly when running under the multiplexed
-> dispatcher — that bypasses the writer and races with other
-> handlers' frames.  Use the `Response` object instead.
+> Concurrent multiplexing **is** wired (2026-05-31; retrofitted onto
+> `ResponseWriter` in the reactor-port work): each fully-arrived
+> request dispatches independently of every other stream, so a slow
+> handler on stream A never stalls PING-ACK, WINDOW_UPDATE, or
+> handlers for streams B / C / D — under `make_dispatcher` because it
+> runs as a detached coroutine, under `make_reactor_dispatcher`
+> because `handle_request()` is a synchronous call that returns
+> immediately whether the handler answers inline or defers. Wire
+> writes funnel through a single per-connection writer (a writer
+> coroutine + queue for `make_dispatcher`, `BufferedConnection::write()`
+> directly for `make_reactor_dispatcher`) to keep individual frames
+> atomic on the wire. Handlers only ever talk to the connection through
+> `ResponseWriter` — there's no socket handle to misuse.
 
-## The `Socket&` parameter (HTTP/2 only)
+## Answering a request (both dispatchers)
 
-HTTP/1.1's `handle_request` has no `Socket&` parameter — writes are
-entirely mediated by `ResponseWriter`, so there's nothing to expose.
-HTTP/2's `handle_request` still takes one (its handler is still
-coroutine-based; see below). You usually don't need to touch it —
-it's exposed so that handlers needing to send raw bytes can — and if
-you do:
-
-- `socket.async_write(...)` writes raw bytes, bypassing the
-  per-connection writer. **Never do this under the HTTP/2
-  dispatcher** — see the multiplexing warning above.
-- It is **not safe** to capture `socket` and use it from another
-  coroutine running on a different IOContext thread.
-
-## Errors
-
-HTTP/1.1's `handle_request` has no explicit error path: build the
-response you want to send (including error responses) and complete
-`writer` with it.
+`handle_request(const Request&, ResponseWriter)` is a plain,
+synchronous, non-coroutine virtual function — no `co_await`, no
+`Task`, no `Socket&`. Answer immediately by building a `Response` and
+calling `writer.complete(std::move(response))` before returning;
+that's the entire handler for the common case:
 
 ```cpp
-void handle_request(const HTTPRequest& request, ResponseWriter writer) override {
+void handle_request(const Request& request, ResponseWriter writer) override {
     if (!authenticated(request)) {
-        HTTPResponse response;
+        Response response;
         response.status_code = 401;
-        response.reason_phrase = "Unauthorized";
-        response.set_header("WWW-Authenticate", "Basic realm=\"app\"");
         writer.complete(std::move(response));
         return;
     }
@@ -322,13 +342,27 @@ void handle_request(const HTTPRequest& request, ResponseWriter writer) override 
 }
 ```
 
-HTTP/2's `handle_request` is still a coroutine (`Task`); the
-equivalent there is `co_return` after setting `response.status_code`.
+If you need to defer — background work, a downstream call that
+finishes later, a timer — move or copy `writer` (cheap: a `shared_ptr`
+under the hood) into whatever will eventually have the answer, and
+call `.complete()` from there instead, on whatever thread that ends up
+being. Only the first `complete()` call across all copies of a given
+`writer` takes effect. Because HTTP/2 multiplexes several requests per
+connection, this is more than a convenience here: it's what lets one
+slow stream's deferred answer never block any other stream, or the
+frame-reading loop itself, the way it would if `handle_request` had to
+block until it had a `Response` in hand.
 
-If HTTP/1.1's `handle_request` throws (synchronously, before
-returning) the connection is closed. HTTP/2 sends
-`RST_STREAM(INTERNAL_ERROR)` and continues serving other streams on
-the same connection.
+## Errors
+
+Build the response you want to send (including error responses) and
+complete `writer` with it — there's no separate error path.
+
+If `handle_request` throws (synchronously, before returning, and
+without having completed `writer`), the dispatcher sends
+`RST_STREAM(INTERNAL_ERROR)` for that stream and continues serving
+other streams on the same connection; the connection itself stays up
+under both dispatchers.
 
 ## Related
 

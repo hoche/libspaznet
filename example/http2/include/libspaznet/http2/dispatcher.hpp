@@ -22,4 +22,16 @@ namespace spaznet::http2 {
 
 auto make_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::ConnectionHandler;
 
+// Coroutine-free counterpart of make_dispatcher: identical wire behavior
+// (preface, SETTINGS, multiplexed streams, HPACK, flow control, PING,
+// GOAWAY, RST_STREAM — see dispatcher_reactor.cpp's header comment) built
+// on Http2Connection, an explicit {Preface, FrameHeader, FramePayload}
+// state machine driven by BufferedConnection's callbacks instead of a
+// suspended coroutine frame per connection plus a detached one per
+// stream. Same Handler interface as make_dispatcher above — a single
+// Handler implementation works unchanged under either runtime. Hand the
+// result to Server::set_connection_factory instead of
+// set_connection_handler.
+auto make_reactor_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::ConnectionFactory;
+
 } // namespace spaznet::http2

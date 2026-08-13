@@ -6,6 +6,86 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
+## 2026-08-12 — HTTP/2 reactor dispatcher
+
+Ninth (and hardest, per the plan's own ordering) milestone of the reactor
+port (see the "Milestone http2-reactor progress note" in the reactor-port
+plan). The first protocol here where multiple requests are genuinely
+in-flight concurrently on one connection, which surfaced a real
+double-free race during verification — not just a lifetime bug like the
+earlier milestones.
+
+### Changed
+- `spaznet::http2::Handler::handle_request` is now `void
+  handle_request(const Request&, ResponseWriter)` — no `Task`, no
+  `Response&` out-parameter, no `Socket&`
+  (`example/http2/include/libspaznet/http2/handler.hpp`). `ResponseWriter`
+  is `spaznet::ResponseWriter<Response>`, the same completion token
+  HTTP/1.1 already uses. Dropping `Socket&` is deliberate: no existing
+  handler used it for anything but the connection the request already
+  arrived on, and keeping it would let a handler race the frame loop's
+  own writes.
+- The coroutine dispatcher (`example/http2/src/dispatcher.cpp`) now calls
+  `handle_request()` as a plain synchronous call and `co_await`s a small
+  `AwaitResponseReady` awaiter — same pattern HTTP/1.1's dispatcher
+  already uses.
+- `Http2Connection`'s error paths (`fatal()`) now always call
+  `close_after_flush()` before tearing down, fixing a pre-existing bug in
+  the coroutine dispatcher where a couple of malformed-frame paths sent a
+  `GOAWAY` but relied on coroutine-frame teardown to close the socket — a
+  race that could truncate the very `GOAWAY` just queued.
+
+### Added
+- `spaznet::http2::make_reactor_dispatcher(std::unique_ptr<Handler>) ->
+  ConnectionFactory` (`example/http2/src/dispatcher_reactor.cpp`) — same
+  wire protocol as `make_dispatcher` (preface, SETTINGS, multiplexed
+  streams, HPACK, flow control, PING, GOAWAY, RST_STREAM), same
+  `codec.cpp` unchanged, built on an `Http2Connection` state machine
+  (`Preface` / `FrameHeader` / `FramePayload`) driven by
+  `BufferedConnection` instead of a per-connection coroutine frame plus a
+  detached per-stream one. `writer_loop`/`out_queue` have no counterpart
+  here — every frame write goes straight through
+  `BufferedConnection::write()`.
+- `http2_hello --reactor` / `http2_showcase --reactor` — opt-in CLI flag
+  on both demos. `showcase.cpp`'s `/slow` route (the one deferred,
+  non-inline-completing handler) moved to a detached `std::thread` that
+  sleeps and calls `writer.complete()`, mirroring HTTP/1.1's
+  `test_deferred_handler.cpp` pattern.
+- `example/http2/tests/integration/dispatcher_test_support.hpp` — same
+  `DispatcherKind`/`install_dispatcher()` shape as the other protocols.
+  `test_rfc9113_compliance.cpp`'s dispatcher-facing tests (connection
+  preface, frame format, HEADERS/DATA/SETTINGS handling,
+  request/response exchange, and `HTTP2MultiplexingTest`'s multiplexing/
+  ordering/`FrameLoopUnblockedBySlowHandler` cases) are now `TEST_P` over
+  both dispatchers; pure codec-level tests that never touch a dispatcher
+  stayed as plain `TEST()`s.
+
+### Fixed
+- A reproducible double-free/corruption crash in the new reactor
+  dispatcher under real multiplexed load (several deferred `/slow`
+  handlers completing back-to-back from background threads while the
+  frame-reading loop was itself mid-frame). Fixed by adding a
+  `std::recursive_mutex` to `Http2Connection` guarding every access to
+  shared connection state and every write onto the connection —
+  recursive because the common case (a handler that completes inline)
+  re-enters the completion path synchronously while already holding it.
+- A latent use-after-free in the *coroutine* dispatcher's
+  `AwaitResponseReady::await_suspend`, found while wiring up the same
+  `ResponseWriter`-based `handle_request()` there: it only captured the
+  bare coroutine handle, not a reference keeping the coroutine frame
+  alive, and `dispatch_request` (unlike HTTP/1.1's `serve_keep_alive`)
+  has no caller of its own holding it alive across suspension. Fixed the
+  same way `TimerAwaiter` already does: wrap the handle in a
+  `std::shared_ptr<Task>` captured by the completion callback.
+
+Verified with the full suite (13 ctest targets), including both
+parameterizations of `HTTP2MultiplexingTest.FrameLoopUnblockedBySlowHandler`.
+Manually smoke-tested both demos in both modes with `curl
+--http2-prior-knowledge`, plus 15 repeated runs of 5 concurrent `/slow`
+requests via `curl --parallel` specifically targeting the fixed race (no
+recurrence), confirming genuine multiplexing throughout (all streams in a
+run share identical start/end timestamps).
+
 ## 2026-08-12 — WebSocket reactor dispatcher
 
 Eighth milestone of the reactor port (see the "Milestone websocket-reactor

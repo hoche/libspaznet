@@ -23,16 +23,22 @@ This document explains how `libspaznet` schedules work, how coroutines move betw
 > dependency at all. `Server`/`Socket` still only speak the coroutine
 > runtime internally (see `CHANGELOG.md`'s Milestone 5 entry), though
 > `Server::set_connection_factory`/`set_sync_datagram_handler` let a
-> reactor-side handler ride along without needing one. HTTP/1.1, UDP,
-> QUIC/HTTP3, and WebSocket dispatchers now each have a coroutine-free
-> reactor counterpart (`make_reactor_dispatcher`, see `docs/http.md` and
-> `docs/websocket.md`); WebSocket's reactor counterpart uses its own
-> synchronous `Handler`/`Connection` interface rather than reusing the
-> coroutine one, since sending a frame is a real suspension point on that
-> side (see `docs/websocket.md`'s "Two dispatchers" section). HTTP/2 still
-> only has the original coroutine dispatcher, pending its own milestone. A
-> full rewrite of this document for the dual-runtime model is tracked
-> alongside that work.
+> reactor-side handler ride along without needing one. HTTP/1.1, HTTP/2,
+> UDP, QUIC/HTTP3, and WebSocket dispatchers now each have a
+> coroutine-free reactor counterpart (`make_reactor_dispatcher`, see
+> `docs/http.md` and `docs/websocket.md`); WebSocket's reactor counterpart
+> uses its own synchronous `Handler`/`Connection` interface rather than
+> reusing the coroutine one, since sending a frame is a real suspension
+> point on that side (see `docs/websocket.md`'s "Two dispatchers"
+> section). HTTP/2's `Handler::handle_request` is now synchronous
+> (`ResponseWriter`-based, like HTTP/1.1) under *both* of its
+> dispatchers — its coroutine dispatcher just calls it as a plain
+> function and `co_await`s the writer's completion internally; see
+> `docs/http.md`'s "Two dispatchers" section for HTTP/2. Only the
+> `threading` and `coro-free-build` milestones remain before every
+> protocol's reactor path gets per-loop affinity and the whole library
+> builds coroutine-free end to end. A full rewrite of this document for
+> the dual-runtime model is tracked alongside that work.
 
 ## Architecture Overview
 
@@ -112,9 +118,11 @@ The scheduler expects **coroutine-aware callables** that return `Task` and yield
 
 ```cpp
 // Illustrative coroutine handler shape, not the literal current
-// HTTPHandler interface (which is now synchronous — see docs/http.md).
-// This still applies as-is to HTTP/2's Handler::handle_request, which
-// remains Task-based.
+// HTTPHandler or HTTP/2 Handler interface (both are now synchronous,
+// ResponseWriter-based — see docs/http.md). This still illustrates the
+// general "coroutine function, not a lambda" rule for any code you write
+// that talks directly to Task/IOContext::schedule, e.g. a custom
+// coroutine dispatcher of your own.
 Task MyHandler::handle_request(const Request& req,
                                Response& res,
                                Socket& sock) {

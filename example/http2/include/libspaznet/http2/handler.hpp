@@ -2,23 +2,14 @@
 
 #include <cstdint>
 #include <libspaznet/io_context.hpp>
+#include <libspaznet/reactor/response_writer.hpp>
 #include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-namespace spaznet {
-class Socket;
-}
-
 namespace spaznet::http2 {
-
-using ::spaznet::Socket;
-using ::spaznet::Task;
-
-
-
 
 inline constexpr int DEFAULT_HTTP_STATUS_CODE = 200;
 
@@ -239,6 +230,25 @@ class Connection {
     void close_stream(uint32_t stream_id);
 };
 
+// Runtime-neutral: no Task, no co_await, no Socket. Implementations that
+// can answer immediately just build a Response and call
+// `writer.complete(std::move(response))` before returning — that's the
+// entire handler, indistinguishable from a plain synchronous function.
+// Implementations that must defer (issue background work, wait on another
+// service, etc.) instead move/copy `writer` somewhere durable and call
+// `.complete()` from wherever the answer eventually becomes available —
+// a callback, a different thread, a timer, or a coroutine suspended on it
+// by the dispatcher. Calling `writer.complete()` more than once (including
+// via a stashed copy) is safe; only the first call has any effect. See
+// include/libspaznet/reactor/response_writer.hpp.
+//
+// Unlike HTTP/1.1, HTTP/2 multiplexes several requests concurrently on one
+// connection: both dispatchers call handle_request() once per stream as
+// soon as its HEADERS(+DATA) fully arrive, independent of whether earlier
+// streams' ResponseWriters have completed yet, so a slow stream never
+// blocks the frame-reading loop or any other stream's handler.
+using ResponseWriter = ::spaznet::ResponseWriter<Response>;
+
 class Handler {
   public:
     Handler() = default;
@@ -249,22 +259,12 @@ class Handler {
     Handler(Handler&&) = delete;
     auto operator=(Handler&&) -> Handler& = delete;
 
-    // Handle a single HTTP/2 request.  The dispatcher decodes HEADERS
-    // + DATA frames into `request` (including reassembled body),
-    // dispatches each fully-arrived request as a detached coroutine
-    // so multiple handlers can run concurrently on a single
-    // connection, and writes the populated `response` back as
-    // HEADERS + DATA frames on the same stream.
-    //
-    // The `socket` reference is exposed for advisory inspection only
-    // (peer addr, file descriptor).  Under the multiplexed
-    // dispatcher every wire write funnels through a per-connection
-    // writer coroutine for per-frame atomicity, so handlers MUST NOT
-    // call `socket.async_write` directly — doing so races with other
-    // handlers' frames and may corrupt the wire.  Build the response
-    // by populating the `response` object instead.
-    virtual auto handle_request(const Request& request, Response& response,
-                                Socket& socket) -> Task = 0;
+    // Handle a single HTTP/2 request. The dispatcher decodes HEADERS +
+    // DATA frames into `request` (including reassembled body) and, once
+    // `writer` completes, serializes the populated Response back as
+    // HEADERS + DATA frames on the same stream. See ResponseWriter above
+    // for the synchronous vs. deferred contract.
+    virtual void handle_request(const Request& request, ResponseWriter writer) = 0;
 };
 
 } // namespace spaznet::http2

@@ -10,6 +10,8 @@
 #include <thread>
 #include <vector>
 
+#include "dispatcher_test_support.hpp"
+
 #ifdef _WIN32
 #define close_socket closesocket
 #else
@@ -17,6 +19,9 @@
 #endif
 
 using namespace spaznet;
+using spaznet::http2::testing_support::DispatcherKind;
+using spaznet::http2::testing_support::DispatcherKindName;
+using spaznet::http2::testing_support::install_dispatcher;
 
 // RFC 9113 Compliant Test Handler
 class RFC9113TestHandler : public spaznet::http2::Handler {
@@ -24,29 +29,29 @@ class RFC9113TestHandler : public spaznet::http2::Handler {
     std::atomic<int> request_count{0};
     spaznet::http2::Request last_request;
 
-    Task handle_request(const spaznet::http2::Request& request, spaznet::http2::Response& response,
-                        Socket& socket) override {
+    void handle_request(const spaznet::http2::Request& request,
+                        spaznet::http2::ResponseWriter writer) override {
         request_count.fetch_add(1);
         last_request = request;
 
+        spaznet::http2::Response response;
         response.stream_id = request.stream_id;
         response.status_code = 200;
         response.set_status(200);
         response.headers["content-type"] = "text/plain";
         response.body = {'O', 'K'};
 
-        co_return;
+        writer.complete(std::move(response));
     }
-
 };
 
-class RFC9113IntegrationTest : public ::testing::Test {
+class RFC9113IntegrationTest : public ::testing::TestWithParam<DispatcherKind> {
   protected:
     void SetUp() override {
-        handler = std::make_unique<RFC9113TestHandler>();
+        auto handler_unique = std::make_unique<RFC9113TestHandler>();
+        handler = handler_unique.get();
         server = std::make_unique<Server>(2);
-        server->set_connection_handler(
-            spaznet::http2::make_dispatcher(std::make_unique<RFC9113TestHandler>()));
+        install_dispatcher(*server, std::move(handler_unique), GetParam());
         server->listen_tcp(9997);
 
         server_thread = std::thread([this]() { server->run(); });
@@ -105,13 +110,13 @@ class RFC9113IntegrationTest : public ::testing::Test {
         return {};
     }
 
-    std::unique_ptr<RFC9113TestHandler> handler;
+    RFC9113TestHandler* handler{nullptr};
     std::unique_ptr<Server> server;
     std::thread server_thread;
 };
 
 // Test RFC 9113 Section 3.5 - Connection Preface
-TEST_F(RFC9113IntegrationTest, ConnectionPreface) {
+TEST_P(RFC9113IntegrationTest, ConnectionPreface) {
     int sock = connect_to_server();
     ASSERT_GE(sock, 0);
 
@@ -124,7 +129,7 @@ TEST_F(RFC9113IntegrationTest, ConnectionPreface) {
 }
 
 // Test RFC 9113 Section 4.1 - Frame Format
-TEST_F(RFC9113IntegrationTest, FrameFormat) {
+TEST_P(RFC9113IntegrationTest, FrameFormat) {
     int sock = connect_to_server();
     ASSERT_GE(sock, 0);
 
@@ -139,7 +144,7 @@ TEST_F(RFC9113IntegrationTest, FrameFormat) {
 }
 
 // Test RFC 9113 Section 6.2 - HEADERS Frame
-TEST_F(RFC9113IntegrationTest, HeadersFrame) {
+TEST_P(RFC9113IntegrationTest, HeadersFrame) {
     int sock = connect_to_server();
     ASSERT_GE(sock, 0);
 
@@ -166,7 +171,7 @@ TEST_F(RFC9113IntegrationTest, HeadersFrame) {
 }
 
 // Test RFC 9113 Section 6.1 - DATA Frame
-TEST_F(RFC9113IntegrationTest, DataFrame) {
+TEST_P(RFC9113IntegrationTest, DataFrame) {
     int sock = connect_to_server();
     ASSERT_GE(sock, 0);
 
@@ -202,7 +207,7 @@ TEST_F(RFC9113IntegrationTest, DataFrame) {
 }
 
 // Test RFC 9113 Section 6.5.2 - SETTINGS Frame
-TEST_F(RFC9113IntegrationTest, SettingsFrame) {
+TEST_P(RFC9113IntegrationTest, SettingsFrame) {
     int sock = connect_to_server();
     ASSERT_GE(sock, 0);
 
@@ -220,8 +225,13 @@ TEST_F(RFC9113IntegrationTest, SettingsFrame) {
     close_socket(sock);
 }
 
+// The remaining tests below build/inspect Frame/Connection objects
+// directly and never touch a dispatcher or Server, so — unlike the
+// tests above — there's nothing runtime-specific to differentially
+// check; they run once each rather than under both DispatcherKinds.
+
 // Test RFC 9113 Section 6.8 - GOAWAY Frame
-TEST_F(RFC9113IntegrationTest, GoawayFrame) {
+TEST(RFC9113ProtocolBuilders, GoawayFrame) {
     // GOAWAY is typically sent by server, but we can test frame building
     spaznet::http2::Frame goaway = spaznet::http2::Parser::build_goaway_frame(0, 0);
 
@@ -231,7 +241,7 @@ TEST_F(RFC9113IntegrationTest, GoawayFrame) {
 }
 
 // Test RFC 9113 Section 6.4 - RST_STREAM Frame
-TEST_F(RFC9113IntegrationTest, RstStreamFrame) {
+TEST(RFC9113ProtocolBuilders, RstStreamFrame) {
     spaznet::http2::Frame rst = spaznet::http2::Parser::build_rst_stream_frame(1, 1); // PROTOCOL_ERROR
 
     EXPECT_EQ(rst.type, spaznet::http2::FrameType::RST_STREAM);
@@ -240,7 +250,7 @@ TEST_F(RFC9113IntegrationTest, RstStreamFrame) {
 }
 
 // Test RFC 9113 Section 6.9 - WINDOW_UPDATE Frame
-TEST_F(RFC9113IntegrationTest, WindowUpdateFrame) {
+TEST(RFC9113ProtocolBuilders, WindowUpdateFrame) {
     spaznet::http2::Frame window_update = spaznet::http2::Parser::build_window_update_frame(1, 65535);
 
     EXPECT_EQ(window_update.type, spaznet::http2::FrameType::WINDOW_UPDATE);
@@ -249,7 +259,7 @@ TEST_F(RFC9113IntegrationTest, WindowUpdateFrame) {
 }
 
 // Test RFC 9113 Section 6.7 - PING Frame
-TEST_F(RFC9113IntegrationTest, PingFrame) {
+TEST(RFC9113ProtocolBuilders, PingFrame) {
     std::vector<uint8_t> opaque = {1, 2, 3, 4, 5, 6, 7, 8};
     spaznet::http2::Frame ping = spaznet::http2::Parser::build_ping_frame(opaque, false);
 
@@ -260,7 +270,7 @@ TEST_F(RFC9113IntegrationTest, PingFrame) {
 }
 
 // Test RFC 9113 Section 8.1 - Request/Response Exchange
-TEST_F(RFC9113IntegrationTest, RequestResponseExchange) {
+TEST_P(RFC9113IntegrationTest, RequestResponseExchange) {
     int sock = connect_to_server();
     ASSERT_GE(sock, 0);
 
@@ -290,8 +300,12 @@ TEST_F(RFC9113IntegrationTest, RequestResponseExchange) {
     close_socket(sock);
 }
 
+INSTANTIATE_TEST_SUITE_P(Dispatchers, RFC9113IntegrationTest,
+                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        DispatcherKindName);
+
 // Test RFC 9113 Section 5.1 - Stream States
-TEST_F(RFC9113IntegrationTest, StreamStates) {
+TEST(RFC9113ProtocolBuilders, StreamStates) {
     spaznet::http2::Connection conn;
 
     EXPECT_EQ(conn.get_stream_state(1), spaznet::http2::StreamState::IDLE);
@@ -306,7 +320,7 @@ TEST_F(RFC9113IntegrationTest, StreamStates) {
 }
 
 // Test Multiple Streams per RFC 9113 Section 5.1.1
-TEST_F(RFC9113IntegrationTest, MultipleStreams) {
+TEST(RFC9113ProtocolBuilders, MultipleStreams) {
     spaznet::http2::Connection conn;
 
     // Open multiple streams
@@ -322,7 +336,7 @@ TEST_F(RFC9113IntegrationTest, MultipleStreams) {
 }
 
 // Test Large Response Body (multiple DATA frames)
-TEST_F(RFC9113IntegrationTest, LargeResponseBody) {
+TEST(RFC9113ProtocolBuilders, LargeResponseBody) {
     spaznet::http2::Response response;
     response.stream_id = 1;
     response.status_code = 200;
@@ -356,47 +370,34 @@ TEST_F(RFC9113IntegrationTest, LargeResponseBody) {
 // send HEADERS+END_STREAM for stream 1 (handler starts but blocks),
 // then immediately send PING.  Expect PING-ACK BEFORE the slow
 // handler is released.
-class HTTP2MultiplexingTest : public ::testing::Test {
+class HTTP2MultiplexingTest : public ::testing::TestWithParam<DispatcherKind> {
   protected:
+    // Defers completion to a detached background thread that polls
+    // `release`, same pattern as example/http's DeferredHandler — proves
+    // the handler call itself never blocks either dispatcher's
+    // frame-reading loop, regardless of how long the deferred completion
+    // takes to arrive.
     class SlowHandler : public spaznet::http2::Handler {
       public:
         std::atomic<bool> release{false};
         std::atomic<int> in_flight{0};
 
-        Task handle_request(const spaznet::http2::Request& request,
-                            spaznet::http2::Response& response, Socket&) override {
+        void handle_request(const spaznet::http2::Request& request,
+                            spaznet::http2::ResponseWriter writer) override {
             in_flight.fetch_add(1);
-            // Poll the release flag on the IOContext via short timer waits.
-            while (!release.load(std::memory_order_acquire)) {
-                co_await socket_yield();
-            }
-            in_flight.fetch_sub(1);
-            response.stream_id = request.stream_id;
-            response.status_code = 200;
-            response.set_status(200);
-            response.headers["content-type"] = "text/plain";
-            response.body = {'O', 'K'};
-            co_return;
-        }
-
-      private:
-        // Short sleep — really just a yield onto the next IOContext tick.
-        // We can't use std::this_thread::sleep because that blocks the
-        // worker thread.  The IOContext exposes a Timer awaitable.
-        struct YieldAwaiter {
-            bool await_ready() const noexcept {
-                return false;
-            }
-            void await_suspend(std::coroutine_handle<> h) {
-                std::thread([h]() {
+            std::thread([this, writer, stream_id = request.stream_id]() mutable {
+                while (!release.load(std::memory_order_acquire)) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                    h.resume();
-                }).detach();
-            }
-            void await_resume() const noexcept {}
-        };
-        static YieldAwaiter socket_yield() {
-            return {};
+                }
+                in_flight.fetch_sub(1);
+                spaznet::http2::Response response;
+                response.stream_id = stream_id;
+                response.status_code = 200;
+                response.set_status(200);
+                response.headers["content-type"] = "text/plain";
+                response.body = {'O', 'K'};
+                writer.complete(std::move(response));
+            }).detach();
         }
     };
 
@@ -404,7 +405,7 @@ class HTTP2MultiplexingTest : public ::testing::Test {
         auto h = std::make_unique<SlowHandler>();
         handler_raw = h.get();
         server = std::make_unique<Server>(2);
-        server->set_connection_handler(spaznet::http2::make_dispatcher(std::move(h)));
+        install_dispatcher(*server, std::move(h), GetParam());
         server->listen_tcp(9996);
         server_thread = std::thread([this]() { server->run(); });
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -435,7 +436,7 @@ class HTTP2MultiplexingTest : public ::testing::Test {
     std::thread server_thread;
 };
 
-TEST_F(HTTP2MultiplexingTest, FrameLoopUnblockedBySlowHandler) {
+TEST_P(HTTP2MultiplexingTest, FrameLoopUnblockedBySlowHandler) {
     int sock = connect_to_server();
     ASSERT_GE(sock, 0);
 
@@ -522,3 +523,7 @@ TEST_F(HTTP2MultiplexingTest, FrameLoopUnblockedBySlowHandler) {
     handler_raw->release.store(true, std::memory_order_release);
     close_socket(sock);
 }
+
+INSTANTIATE_TEST_SUITE_P(Dispatchers, HTTP2MultiplexingTest,
+                        ::testing::Values(DispatcherKind::Coroutine, DispatcherKind::Reactor),
+                        DispatcherKindName);

@@ -47,6 +47,7 @@
 #include <libspaznet/server.hpp>
 
 #include <algorithm>
+#include <coroutine>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -162,6 +163,38 @@ auto goaway_payload(std::uint32_t last_stream, std::uint32_t error_code)
     return p;
 }
 
+// Bridges a ResponseWriter's completion into dispatch_request's
+// resumption — same idea as example/http/src/dispatcher.cpp's
+// AwaitResponseReady, plus one addition dispatch_request specifically
+// needs: example/http's serve_keep_alive is always the *awaited* side of
+// some caller's `co_await` on its Task, which keeps its frame alive
+// (via that caller's own TaskAwaiter/CoroutineHandle) for as long as it
+// hasn't finished, regardless of what it suspends on internally.
+// dispatch_request has no such caller — it's scheduled directly via
+// IOContext::schedule() and never co_await'd by anything — so once a
+// worker thread resumes it to this suspension point and its local Task
+// goes out of scope, nothing else references the coroutine frame unless
+// this awaiter grabs its own reference. Mirrors TimerAwaiter's identical
+// need (see sleep_for's await_suspend in platform/io_context.hpp) for
+// exactly the same reason.
+struct AwaitResponseReady {
+    ResponseWriter writer;
+    ::spaznet::IOContext* ctx;
+
+    [[nodiscard]] auto await_ready() const -> bool {
+        return writer.is_completed();
+    }
+    void await_suspend(std::coroutine_handle<> handle) const {
+        auto* ctx_ptr = ctx;
+        auto task_handle = std::coroutine_handle<::spaznet::TaskPromise>::from_address(handle.address());
+        auto keep_alive = std::make_shared<::spaznet::Task>(task_handle);
+        writer.on_ready([ctx_ptr, handle, keep_alive]() mutable {
+            ctx_ptr->post([handle, keep_alive]() mutable { handle.resume(); });
+        });
+    }
+    void await_resume() const {}
+};
+
 // Forward decl — defined after enqueue_frame so it can reference back.
 auto writer_loop(std::shared_ptr<ConnState> state) -> ::spaznet::Task;
 
@@ -226,7 +259,13 @@ auto dispatch_request(std::shared_ptr<ConnState> state, Request req) -> ::spazne
 
     bool errored = false;
     try {
-        co_await state->handler.handle_request(req, resp, state->socket);
+        // No co_await at the call site: handle_request() is now a plain
+        // synchronous call. ResponseWriter's deliver callback below fills
+        // `resp` in place, so a handler that completes before returning
+        // (the common case) needs no suspension at all.
+        ResponseWriter writer([&resp](Response r) { resp = std::move(r); });
+        state->handler.handle_request(req, writer);
+        co_await AwaitResponseReady{writer, state->socket.context()};
     } catch (...) {
         errored = true;
     }

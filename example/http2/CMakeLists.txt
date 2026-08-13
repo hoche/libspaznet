@@ -6,6 +6,7 @@
 add_library(spaznet_http2 STATIC
     src/codec.cpp
     src/dispatcher.cpp
+    src/dispatcher_reactor.cpp
 )
 add_library(spaznet::http2 ALIAS spaznet_http2)
 
