@@ -1,14 +1,9 @@
 #include <libspaznet/quic/crypto.hpp>
+#include <libspaznet/quic/detail/tls_compat.hpp>
 
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
-
-#include <openssl/core_names.h>
-#include <openssl/err.h>
-#include <openssl/evp.h>
-#include <openssl/kdf.h>
-#include <openssl/params.h>
 
 namespace spaznet {
 namespace quic {
@@ -94,6 +89,16 @@ auto aead_hash(Aead aead) -> Hash {
 auto hkdf_extract(Hash hash, std::span<const uint8_t> salt, std::span<const uint8_t> ikm)
     -> std::vector<uint8_t> {
     const EVP_MD* md = evp_md(hash);
+#if defined(SPAZNET_TLS_WOLFSSL)
+    // wolfSSL lacks OpenSSL 3 EVP_KDF; use the QUIC HKDF helper.
+    // Note: wolfSSL_quic_hkdf_extract takes (secret=ikm, salt=salt).
+    std::vector<uint8_t> out(static_cast<std::size_t>(EVP_MD_size(md)));
+    if (wolfSSL_quic_hkdf_extract(out.data(), md, ikm.data(), ikm.size(), salt.data(),
+                                  salt.size()) != WOLFSSL_SUCCESS) {
+        throw std::runtime_error("wolfSSL_quic_hkdf_extract failed");
+    }
+    return out;
+#else
     EVP_KDF* kdf = EVP_KDF_fetch(nullptr, "HKDF", nullptr);
     if (kdf == nullptr) {
         throw_ossl("EVP_KDF_fetch(HKDF)");
@@ -122,10 +127,20 @@ auto hkdf_extract(Hash hash, std::span<const uint8_t> salt, std::span<const uint
     }
     EVP_KDF_CTX_free(ctx);
     return out;
+#endif
 }
 
 auto hkdf_expand(Hash hash, std::span<const uint8_t> prk, std::span<const uint8_t> info,
                  std::size_t out_len) -> std::vector<uint8_t> {
+#if defined(SPAZNET_TLS_WOLFSSL)
+    const EVP_MD* md = evp_md(hash);
+    std::vector<uint8_t> out(out_len);
+    if (wolfSSL_quic_hkdf_expand(out.data(), out_len, md, prk.data(), prk.size(), info.data(),
+                                 info.size()) != WOLFSSL_SUCCESS) {
+        throw std::runtime_error("wolfSSL_quic_hkdf_expand failed");
+    }
+    return out;
+#else
     EVP_KDF* kdf = EVP_KDF_fetch(nullptr, "HKDF", nullptr);
     if (kdf == nullptr) {
         throw_ossl("EVP_KDF_fetch(HKDF)");
@@ -154,6 +169,7 @@ auto hkdf_expand(Hash hash, std::span<const uint8_t> prk, std::span<const uint8_
     }
     EVP_KDF_CTX_free(ctx);
     return out;
+#endif
 }
 
 auto hkdf_expand_label(Hash hash, std::span<const uint8_t> secret, std::string_view label,
@@ -332,6 +348,17 @@ auto aead_seal_inplace(Aead aead, std::span<const uint8_t> key, std::span<const 
     if (tag_out.size() != tag_len) {
         return false;
     }
+#if defined(SPAZNET_TLS_WOLFSSL)
+    // wolfSSL's OpenSSL-compat EVP AEAD path does not reliably support
+    // in-place EncryptUpdate; seal into a temporary and copy back.
+    std::vector<uint8_t> sealed;
+    if (!aead_seal(aead, key, nonce, aad, body, sealed) || sealed.size() != body.size() + tag_len) {
+        return false;
+    }
+    std::memcpy(body.data(), sealed.data(), body.size());
+    std::memcpy(tag_out.data(), sealed.data() + body.size(), tag_len);
+    return true;
+#else
     const EVP_CIPHER* cipher = aead_cipher(aead);
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (ctx == nullptr) {
@@ -382,6 +409,7 @@ auto aead_seal_inplace(Aead aead, std::span<const uint8_t> key, std::span<const 
     } while (false);
     EVP_CIPHER_CTX_free(ctx);
     return ok;
+#endif
 }
 
 auto aead_open_inplace(Aead aead, std::span<const uint8_t> key, std::span<const uint8_t> nonce,
@@ -391,6 +419,16 @@ auto aead_open_inplace(Aead aead, std::span<const uint8_t> key, std::span<const 
     if (tag_in.size() != tag_len) {
         return false;
     }
+#if defined(SPAZNET_TLS_WOLFSSL)
+    std::vector<uint8_t> ciphertext(body.begin(), body.end());
+    ciphertext.insert(ciphertext.end(), tag_in.begin(), tag_in.end());
+    std::vector<uint8_t> plain;
+    if (!aead_open(aead, key, nonce, aad, ciphertext, plain) || plain.size() != body.size()) {
+        return false;
+    }
+    std::memcpy(body.data(), plain.data(), body.size());
+    return true;
+#else
     const EVP_CIPHER* cipher = aead_cipher(aead);
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (ctx == nullptr) {
@@ -434,6 +472,7 @@ auto aead_open_inplace(Aead aead, std::span<const uint8_t> key, std::span<const 
     } while (false);
     EVP_CIPHER_CTX_free(ctx);
     return ok;
+#endif
 }
 
 // ---- CipherCtx ----------------------------------------------------------
@@ -443,7 +482,7 @@ CipherCtx::~CipherCtx() {
 }
 
 CipherCtx::CipherCtx(CipherCtx&& other) noexcept
-    : ctx_(other.ctx_), aead_(other.aead_), dir_(other.dir_) {
+    : ctx_(other.ctx_), aead_(other.aead_), dir_(other.dir_), key_(std::move(other.key_)) {
     other.ctx_ = nullptr;
 }
 
@@ -453,6 +492,7 @@ auto CipherCtx::operator=(CipherCtx&& other) noexcept -> CipherCtx& {
         ctx_ = other.ctx_;
         aead_ = other.aead_;
         dir_ = other.dir_;
+        key_ = std::move(other.key_);
         other.ctx_ = nullptr;
     }
     return *this;
@@ -463,6 +503,7 @@ auto CipherCtx::reset() -> void {
         EVP_CIPHER_CTX_free(static_cast<EVP_CIPHER_CTX*>(ctx_));
         ctx_ = nullptr;
     }
+    key_.clear();
 }
 
 auto CipherCtx::init(Aead aead, std::span<const uint8_t> key, Direction dir) -> bool {
@@ -490,14 +531,21 @@ auto CipherCtx::init(Aead aead, std::span<const uint8_t> key, Direction dir) -> 
     ctx_ = ctx;
     aead_ = aead;
     dir_ = dir;
+    key_.assign(key.begin(), key.end());
     return true;
 }
 
 auto CipherCtx::seal_inplace(std::span<const uint8_t> nonce, std::span<const uint8_t> aad,
                              std::span<uint8_t> body, std::span<uint8_t> tag_out) -> bool {
-    if (ctx_ == nullptr || dir_ != Direction::Encrypt) return false;
+    if (ctx_ == nullptr || dir_ != Direction::Encrypt || key_.empty()) return false;
     const std::size_t tag_len = aead_tag_length(aead_);
     if (tag_out.size() != tag_len) return false;
+#if defined(SPAZNET_TLS_WOLFSSL)
+    // wolfSSL's EVP AEAD contexts do not reliably support IV-only reinit
+    // or multi-shot SET_IVLEN on a live CTX; use the one-shot helper which
+    // allocates a fresh context per packet.
+    return aead_seal_inplace(aead_, {key_.data(), key_.size()}, nonce, aad, body, tag_out);
+#else
     auto* ctx = static_cast<EVP_CIPHER_CTX*>(ctx_);
     // Reset only the IV; cipher + key are already bound.
     if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, nullptr, nonce.data()) != 1) {
@@ -526,13 +574,17 @@ auto CipherCtx::seal_inplace(std::span<const uint8_t> nonce, std::span<const uin
         return false;
     }
     return true;
+#endif
 }
 
 auto CipherCtx::open_inplace(std::span<const uint8_t> nonce, std::span<const uint8_t> aad,
                              std::span<uint8_t> body, std::span<const uint8_t> tag_in) -> bool {
-    if (ctx_ == nullptr || dir_ != Direction::Decrypt) return false;
+    if (ctx_ == nullptr || dir_ != Direction::Decrypt || key_.empty()) return false;
     const std::size_t tag_len = aead_tag_length(aead_);
     if (tag_in.size() != tag_len) return false;
+#if defined(SPAZNET_TLS_WOLFSSL)
+    return aead_open_inplace(aead_, {key_.data(), key_.size()}, nonce, aad, body, tag_in);
+#else
     auto* ctx = static_cast<EVP_CIPHER_CTX*>(ctx_);
     if (EVP_DecryptInit_ex(ctx, nullptr, nullptr, nullptr, nonce.data()) != 1) {
         return false;
@@ -560,6 +612,7 @@ auto CipherCtx::open_inplace(std::span<const uint8_t> nonce, std::span<const uin
         return false;
     }
     return true;
+#endif
 }
 
 auto header_protection_mask(Aead aead, std::span<const uint8_t> hp_key,

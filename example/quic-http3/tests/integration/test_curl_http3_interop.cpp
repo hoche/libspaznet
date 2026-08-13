@@ -37,14 +37,10 @@
 #define pclose _pclose
 #endif
 
-#include <openssl/bio.h>
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/ssl.h>
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
+#include "quic_test_tls.hpp"
 
 using namespace spaznet;
+using namespace spaznet::quic::test;
 
 namespace {
 
@@ -75,51 +71,11 @@ auto curl_supports_http3() -> bool {
            out.find("http3") != std::string::npos;
 }
 
-// Generate a self-signed P-256 cert + private key as PEM.  No third-party
-// CLI — straight OpenSSL EVP / X509 calls.
-auto make_self_signed() -> std::pair<std::string, std::string> {
-    EVP_PKEY* pkey = EVP_EC_gen("P-256");
-    X509* x = X509_new();
-    ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
-    X509_gmtime_adj(X509_getm_notBefore(x), 0);
-    X509_gmtime_adj(X509_getm_notAfter(x), 3600);
-    X509_set_pubkey(x, pkey);
-    X509_NAME* nm = X509_get_subject_name(x);
-    X509_NAME_add_entry_by_txt(nm, "CN", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>("localhost"), -1, -1, 0);
-    X509_set_issuer_name(x, nm);
-    // SAN: DNS:localhost + IP:127.0.0.1 — curl-on-h3 checks SAN even
-    // with -k for the SNI/destination match in some libcurl builds.
-    X509_EXTENSION* san_ext = X509V3_EXT_conf_nid(
-        nullptr, nullptr, NID_subject_alt_name,
-        const_cast<char*>("DNS:localhost,IP:127.0.0.1"));
-    if (san_ext != nullptr) {
-        X509_add_ext(x, san_ext, -1);
-        X509_EXTENSION_free(san_ext);
-    }
-    X509_sign(x, pkey, EVP_sha256());
-
-    BIO* cb = BIO_new(BIO_s_mem());
-    PEM_write_bio_X509(cb, x);
-    char* cdata = nullptr;
-    long clen = BIO_get_mem_data(cb, &cdata);
-    std::string cpem(cdata, static_cast<std::size_t>(clen));
-    BIO* kb = BIO_new(BIO_s_mem());
-    PEM_write_bio_PrivateKey(kb, pkey, nullptr, nullptr, 0, nullptr, nullptr);
-    char* kdata = nullptr;
-    long klen = BIO_get_mem_data(kb, &kdata);
-    std::string kpem(kdata, static_cast<std::size_t>(klen));
-    BIO_free(cb);
-    BIO_free(kb);
-    X509_free(x);
-    EVP_PKEY_free(pkey);
-    return {cpem, kpem};
-}
-
 // Optional SSLKEYLOGFILE hook so Wireshark can decrypt the traffic
 // for a failed interop run.  Append-only; we never truncate so
 // developers can run several tests against the same file.
-void install_keylog(SSL_CTX* ctx) {
+void install_keylog(quic::TlsSslCtx* ctx) {
+#if defined(SPAZNET_TLS_OPENSSL)
     const char* path = std::getenv("SSLKEYLOGFILE");
     if (path == nullptr || *path == '\0') return;
     static std::string keylog_path; // captured by the lambda
@@ -131,6 +87,9 @@ void install_keylog(SSL_CTX* ctx) {
             f << line << '\n';
         }
     });
+#else
+    (void)ctx;
+#endif
 }
 
 // Bind a UDP socket to 127.0.0.1:0 just to learn the kernel-assigned
@@ -176,7 +135,7 @@ TEST_P(QuicHttp3CurlInterop, RealCurlReceivesResponseBody) {
                         "experimental HTTP/3, or use `nghttp2`'s curl bundle).";
     }
 
-    auto [cert, key] = make_self_signed();
+    auto [cert, key] = make_test_cert_pem("localhost");
     quic::TlsServerConfig tcfg{cert, key, {"h3"}};
     auto tls_ctx = quic::TlsContext::make_server(tcfg);
     ASSERT_NE(tls_ctx, nullptr);

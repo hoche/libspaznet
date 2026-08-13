@@ -10,10 +10,19 @@
 #include <libspaznet/quic/crypto.hpp>
 #include <libspaznet/quic/transport_params.hpp>
 
-// Forward declarations to keep the OpenSSL types out of this header for
-// downstream consumers.
+// Opaque TLS handles — OpenSSL uses ssl_st / ssl_ctx_st; wolfSSL uses
+// WOLFSSL / WOLFSSL_CTX. Keep both out of this public header.
+#if defined(SPAZNET_TLS_WOLFSSL)
+struct WOLFSSL;
+struct WOLFSSL_CTX;
+using TlsSsl = WOLFSSL;
+using TlsSslCtx = WOLFSSL_CTX;
+#else
 struct ssl_st;
 struct ssl_ctx_st;
+using TlsSsl = ssl_st;
+using TlsSslCtx = ssl_ctx_st;
+#endif
 
 namespace spaznet {
 namespace quic {
@@ -51,18 +60,20 @@ class TlsContext {
     auto operator=(TlsContext&&) -> TlsContext& = delete;
     ~TlsContext();
 
-    [[nodiscard]] auto ssl_ctx() const -> ssl_ctx_st* {
+    [[nodiscard]] auto ssl_ctx() const -> TlsSslCtx* {
         return ctx_;
     }
 
   private:
     TlsContext() = default;
-    ssl_ctx_st* ctx_{nullptr};
+    TlsSslCtx* ctx_{nullptr};
+    // ALPN protocols kept alive for the select callback (arg pointer).
+    std::vector<std::vector<uint8_t>> alpn_offered_{};
 };
 
-// Per-connection TLS state machine. Wraps an OpenSSL SSL* configured with
-// SSL_set_quic_tls_cbs, plus the per-PN-space input/output CRYPTO buffers
-// and derived QUIC packet keys.
+// Per-connection TLS state machine. Wraps a backend SSL* (OpenSSL
+// SSL_set_quic_tls_cbs or wolfSSL WOLFSSL_QUIC_METHOD), plus the
+// per-PN-space input/output CRYPTO buffers and derived QUIC packet keys.
 //
 // Lifecycle:
 //   - Construct as server with the original DCID (used to derive Initial
@@ -70,9 +81,8 @@ class TlsContext {
 //   - Set transport parameters.
 //   - On every received CRYPTO frame for a given EncryptionLevel, call
 //     deliver_crypto(level, data).
-//   - After each delivery call advance(): this drains OpenSSL's outbound
-//     handshake bytes into out_crypto(level) and surfaces any newly
-//     derived secrets.
+//   - After each delivery call advance(): this drains outbound handshake
+//     bytes into out_crypto(level) and surfaces any newly derived secrets.
 //   - When state() == Established the handshake is complete and the peer
 //     transport parameters are available via peer_transport_params().
 class TlsConnection {
@@ -122,7 +132,7 @@ class TlsConnection {
     }
 
     // Per-direction traffic secrets indexed by EncryptionLevel. Empty
-    // until OpenSSL hands them to us via the yield_secret callback.
+    // until the TLS backend yields them via its QUIC secret callback.
     [[nodiscard]] auto read_secret(EncryptionLevel level) const -> const std::vector<uint8_t>&;
     [[nodiscard]] auto write_secret(EncryptionLevel level) const -> const std::vector<uint8_t>&;
 
@@ -146,34 +156,45 @@ class TlsConnection {
     // Negotiated ALPN protocol (empty until handshake completes).
     [[nodiscard]] auto negotiated_alpn() const -> std::string;
 
-    // Internal entry points for the OpenSSL dispatch callbacks. Public
-    // only so the static thunks in tls.cpp can reach them.
+    // Internal entry points for TLS-backend callbacks. Public only so
+    // the static thunks in tls.cpp can reach them.
+#if defined(SPAZNET_TLS_OPENSSL)
     auto on_crypto_send(std::span<const uint8_t> data, std::size_t& consumed) -> int;
     auto on_crypto_recv(const uint8_t** buf, std::size_t* bytes_read) -> int;
     auto on_crypto_release(std::size_t bytes_read) -> int;
     auto on_yield_secret(uint32_t prot_level, int direction, std::span<const uint8_t> secret)
         -> int;
+#endif
+#if defined(SPAZNET_TLS_WOLFSSL)
+    auto on_set_encryption_secrets(EncryptionLevel level, const uint8_t* read_secret,
+                                   const uint8_t* write_secret, std::size_t secret_len) -> int;
+    auto on_add_handshake_data(EncryptionLevel level, std::span<const uint8_t> data) -> int;
+#endif
     auto on_got_transport_params(std::span<const uint8_t> params) -> int;
     auto on_alert(uint8_t alert_code) -> int;
 
   private:
     auto set_state_from_handshake_result(int handshake_ret) -> void;
+    auto refresh_negotiated_aead() -> void;
+    auto poll_peer_transport_params() -> void;
 
     std::shared_ptr<TlsContext> ctx_;
-    ssl_st* ssl_{nullptr};
+    TlsSsl* ssl_{nullptr};
     State state_{State::Handshaking};
     uint8_t alert_code_{0};
 
+#if defined(SPAZNET_TLS_OPENSSL)
     // Inbound CRYPTO buffer per level, plus a cursor for crypto_recv_rcd.
     struct LevelIn {
         std::vector<uint8_t> data;
         std::size_t read_cursor{0};
     };
     std::array<LevelIn, 4> in_{};
-    // Outbound CRYPTO buffer per level.
-    std::array<std::vector<uint8_t>, 4> out_{};
     // Current send level (set on the most recent crypto_send call).
     EncryptionLevel send_level_{EncryptionLevel::Initial};
+#endif
+    // Outbound CRYPTO buffer per level.
+    std::array<std::vector<uint8_t>, 4> out_{};
     // Read/Write secrets indexed by EncryptionLevel.
     std::array<std::vector<uint8_t>, 4> read_secret_{};
     std::array<std::vector<uint8_t>, 4> write_secret_{};

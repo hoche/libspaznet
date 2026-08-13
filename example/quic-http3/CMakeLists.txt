@@ -1,8 +1,8 @@
 # example/quic-http3 — full QUIC v1 + HTTP/3 + QPACK stack.
-# Requires OpenSSL 3.5+ (for SSL_set_quic_tls_cbs).  The top-level
-# CMakeLists.txt guards `add_subdirectory(example/quic-http3)` on
-# SPAZNET_BUILD_QUIC + the OpenSSL probe, so by the time we get here
-# both are satisfied.
+# Requires a TLS backend selected by the top-level CMakeLists.txt:
+# OpenSSL 3.5+ (SSL_set_quic_tls_cbs) or wolfSSL with --enable-quic
+# (WOLFSSL_QUIC_METHOD).  SPAZNET_BUILD_QUIC is only ON once that
+# probe succeeds, so spaznet::tls is available here.
 
 add_library(spaznet_quic_http3 STATIC
     src/quic/varint.cpp
@@ -31,7 +31,7 @@ target_include_directories(spaznet_quic_http3
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(spaznet_quic_http3 PUBLIC spaznet OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(spaznet_quic_http3 PUBLIC spaznet spaznet::tls)
 target_compile_definitions(spaznet_quic_http3 PUBLIC SPAZNET_HAS_QUIC)
 
 if(BUILD_TESTING OR TARGET test_unit)
@@ -51,6 +51,8 @@ if(BUILD_TESTING OR TARGET test_unit)
     add_executable(test_quic_http3_unit ${SPAZNET_QH3_UNIT_SOURCES})
     target_link_libraries(test_quic_http3_unit
         PRIVATE spaznet_quic_http3 GTest::gtest GTest::gmock)
+    target_include_directories(test_quic_http3_unit
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     spaznet_apply_test_warnings(test_quic_http3_unit)
     add_test(NAME QuicHttp3UnitTests COMMAND test_quic_http3_unit)
 
@@ -63,12 +65,16 @@ if(BUILD_TESTING OR TARGET test_unit)
         tests/integration/test_curl_http3_interop.cpp)
     target_link_libraries(test_quic_http3_integration
         PRIVATE spaznet_quic_http3 GTest::gtest GTest::gmock)
+    target_include_directories(test_quic_http3_integration
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     spaznet_apply_test_warnings(test_quic_http3_integration)
     add_test(NAME QuicHttp3CurlInterop COMMAND test_quic_http3_integration)
 endif()
 
 add_executable(bench_quic_steady_state tests/performance/bench_quic_steady_state.cpp)
 target_link_libraries(bench_quic_steady_state PRIVATE spaznet_quic_http3)
+target_include_directories(bench_quic_steady_state
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 spaznet_apply_test_warnings(bench_quic_steady_state)
 
 # Fuzz harnesses for every untrusted-byte parser in the stack.

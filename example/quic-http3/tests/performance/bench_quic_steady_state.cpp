@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <span>
 #include <deque>
 #include <map>
 #include <memory>
@@ -28,49 +29,16 @@
 #include <libspaznet/quic/connection.hpp>
 #include <libspaznet/quic/varint.hpp>
 
-#include <openssl/core_dispatch.h>
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/ssl.h>
-#include <openssl/x509.h>
+#include "quic_test_tls.hpp"
 
 using namespace spaznet::quic;
+using namespace spaznet::quic::test;
 using std::chrono::duration;
 using std::chrono::steady_clock;
 
 namespace {
 
 // --- self-signed cert generation (mirrors tests/unit/) --------------------
-
-auto make_self_signed_p256() -> std::pair<std::string, std::string> {
-    EVP_PKEY* pkey = EVP_EC_gen("P-256");
-    X509* x = X509_new();
-    ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
-    X509_gmtime_adj(X509_getm_notBefore(x), 0);
-    X509_gmtime_adj(X509_getm_notAfter(x), 3600);
-    X509_set_pubkey(x, pkey);
-    X509_NAME* nm = X509_get_subject_name(x);
-    X509_NAME_add_entry_by_txt(nm, "CN", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>("bench"), -1, -1, 0);
-    X509_set_issuer_name(x, nm);
-    X509_sign(x, pkey, EVP_sha256());
-
-    BIO* cb = BIO_new(BIO_s_mem());
-    PEM_write_bio_X509(cb, x);
-    char* cdata = nullptr;
-    long clen = BIO_get_mem_data(cb, &cdata);
-    std::string cpem(cdata, static_cast<std::size_t>(clen));
-    BIO* kb = BIO_new(BIO_s_mem());
-    PEM_write_bio_PrivateKey(kb, pkey, nullptr, nullptr, 0, nullptr, nullptr);
-    char* kdata = nullptr;
-    long klen = BIO_get_mem_data(kb, &kdata);
-    std::string kpem(kdata, static_cast<std::size_t>(klen));
-    BIO_free(cb);
-    BIO_free(kb);
-    X509_free(x);
-    EVP_PKEY_free(pkey);
-    return {cpem, kpem};
-}
 
 // --- QUIC client harness (copy of the test_http3_end_to_end harness;
 // the bench is a one-off, deduplication can wait) ------------------------
@@ -81,9 +49,13 @@ struct QuicClient {
     std::vector<uint8_t> dcid;
     std::vector<uint8_t> scid;
     std::array<std::vector<uint8_t>, 4> tls_out;
+#if defined(SPAZNET_TLS_OPENSSL)
     std::array<std::vector<uint8_t>, 4> tls_in;
     std::array<std::size_t, 4> tls_in_cursor{0, 0, 0, 0};
     uint32_t send_level{OSSL_RECORD_PROTECTION_LEVEL_NONE};
+#else
+    std::size_t send_level{0};
+#endif
     std::vector<uint8_t> own_tp_wire;
     std::array<PacketKeys, 4> send_keys{};
     std::array<PacketKeys, 4> recv_keys{};
@@ -109,92 +81,12 @@ struct QuicClient {
     }
 };
 
-int qc_send(SSL*, const unsigned char* buf, size_t len, size_t* consumed, void* arg) {
-    auto* c = static_cast<QuicClient*>(arg);
-    c->tls_out[c->send_level].insert(c->tls_out[c->send_level].end(), buf, buf + len);
-    *consumed = len;
-    return 1;
-}
-int qc_recv(SSL*, const unsigned char** buf, size_t* br, void* arg) {
-    auto* c = static_cast<QuicClient*>(arg);
-    for (std::size_t i = 0; i < 4; ++i) {
-        if (c->tls_in_cursor[i] < c->tls_in[i].size()) {
-            *buf = c->tls_in[i].data() + c->tls_in_cursor[i];
-            *br = c->tls_in[i].size() - c->tls_in_cursor[i];
-            return 1;
-        }
-    }
-    *buf = nullptr;
-    *br = 0;
-    return 1;
-}
-int qc_release(SSL*, size_t br, void* arg) {
-    auto* c = static_cast<QuicClient*>(arg);
-    for (std::size_t i = 0; i < 4; ++i) {
-        if (c->tls_in_cursor[i] < c->tls_in[i].size()) {
-            c->tls_in_cursor[i] += std::min(br, c->tls_in[i].size() - c->tls_in_cursor[i]);
-            return 1;
-        }
-    }
-    return 1;
-}
-int qc_yield(SSL*, uint32_t prot_level, int direction, const unsigned char* secret,
-             size_t secret_len, void* arg) {
-    auto* c = static_cast<QuicClient*>(arg);
-    c->send_level = prot_level;
-    EncryptionLevel level = static_cast<EncryptionLevel>(
-        prot_level == OSSL_RECORD_PROTECTION_LEVEL_NONE       ? 0
-        : prot_level == OSSL_RECORD_PROTECTION_LEVEL_EARLY    ? 1
-        : prot_level == OSSL_RECORD_PROTECTION_LEVEL_HANDSHAKE ? 2
-                                                              : 3);
-    const SSL_CIPHER* cph = SSL_get_current_cipher(c->ssl);
-    if (cph) {
-        c->aead[static_cast<std::size_t>(level)] =
-            aead_from_tls_cipher_id(static_cast<uint16_t>(SSL_CIPHER_get_protocol_id(cph)));
-    }
-    if (direction == 0) {
-        c->recv_keys[static_cast<std::size_t>(level)] = derive_packet_keys(
-            c->aead[static_cast<std::size_t>(level)], {secret, secret_len});
-        c->recv_ready[static_cast<std::size_t>(level)] = true;
-    } else {
-        c->send_keys[static_cast<std::size_t>(level)] = derive_packet_keys(
-            c->aead[static_cast<std::size_t>(level)], {secret, secret_len});
-        c->send_ready[static_cast<std::size_t>(level)] = true;
-    }
-    return 1;
-}
-int qc_got_tp(SSL*, const unsigned char*, size_t, void*) {
-    return 1;
-}
-int qc_alert(SSL*, unsigned char, void*) {
-    return 1;
-}
-
-const OSSL_DISPATCH* qc_dispatch() {
-    static const OSSL_DISPATCH t[] = {
-        {OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_SEND, reinterpret_cast<void (*)()>(qc_send)},
-        {OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RECV_RCD, reinterpret_cast<void (*)()>(qc_recv)},
-        {OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RELEASE_RCD,
-         reinterpret_cast<void (*)()>(qc_release)},
-        {OSSL_FUNC_SSL_QUIC_TLS_YIELD_SECRET, reinterpret_cast<void (*)()>(qc_yield)},
-        {OSSL_FUNC_SSL_QUIC_TLS_GOT_TRANSPORT_PARAMS,
-         reinterpret_cast<void (*)()>(qc_got_tp)},
-        {OSSL_FUNC_SSL_QUIC_TLS_ALERT, reinterpret_cast<void (*)()>(qc_alert)},
-        {0, nullptr}};
-    return t;
-}
-
 auto make_client(std::vector<uint8_t> dcid, std::vector<uint8_t> scid)
     -> std::unique_ptr<QuicClient> {
     auto c = std::make_unique<QuicClient>();
     c->dcid = dcid;
     c->scid = scid;
-    c->ctx = SSL_CTX_new(TLS_client_method());
-    SSL_CTX_set_min_proto_version(c->ctx, TLS1_3_VERSION);
-    SSL_CTX_set_max_proto_version(c->ctx, TLS1_3_VERSION);
-    SSL_CTX_set_verify(c->ctx, SSL_VERIFY_NONE, nullptr);
-    static const unsigned char alpn[] = {2, 'h', '3'};
-    SSL_CTX_set_alpn_protos(c->ctx, alpn, sizeof(alpn));
+    c->ctx = make_client_ssl_ctx();
     c->ssl = SSL_new(c->ctx);
     SSL_set_connect_state(c->ssl);
     SSL_set_tlsext_host_name(c->ssl, "localhost");
@@ -217,8 +109,9 @@ auto make_client(std::vector<uint8_t> dcid, std::vector<uint8_t> scid)
     tp.initial_max_stream_data_bidi_local = 1ULL << 30;
     tp.initial_max_stream_data_uni = 1ULL << 30;
     c->own_tp_wire = encode_transport_params(tp);
-    SSL_set_quic_tls_cbs(c->ssl, qc_dispatch(), c.get());
-    SSL_set_quic_tls_transport_params(c->ssl, c->own_tp_wire.data(), c->own_tp_wire.size());
+    if (!install_packet_client_quic(c.get())) {
+        throw std::runtime_error("install_packet_client_quic failed");
+    }
     return c;
 }
 
@@ -379,8 +272,15 @@ auto receive(QuicClient& c, std::vector<uint8_t> dg) -> void {
                 }
                 std::size_t skip =
                     static_cast<std::size_t>(c.crypto_recv_off[i] - it->first);
-                c.tls_in[i].insert(c.tls_in[i].end(), it->second.begin() + skip,
-                                   it->second.end());
+                std::span<const uint8_t> chunk{it->second.data() + skip,
+                                               it->second.size() - skip};
+                client_feed_crypto(c.ssl, static_cast<EncryptionLevel>(i), chunk,
+#if defined(SPAZNET_TLS_OPENSSL)
+                                   &c.tls_in
+#else
+                                   nullptr
+#endif
+                );
                 c.crypto_recv_off[i] += it->second.size() - skip;
                 c.crypto_recv_chunks[i].erase(it);
             }
@@ -449,7 +349,7 @@ struct BenchResult {
 };
 
 auto run_bench(std::size_t target_packets, std::size_t chunk_size) -> BenchResult {
-    auto [cert, key] = make_self_signed_p256();
+    auto [cert, key] = make_test_cert_pem("bench");
     TlsServerConfig tcfg{cert, key, {"h3"}};
     auto tls_ctx = TlsContext::make_server(tcfg);
 

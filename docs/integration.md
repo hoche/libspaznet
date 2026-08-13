@@ -10,10 +10,11 @@ you want to track upstream or pin to a snapshot.
   AppleClang from Xcode 15+. The library uses `<format>`,
   `<coroutine>`, and `<span>`.
 - **CMake 3.20+**.
-- **OpenSSL 3.5+** — *only* required if you want QUIC + HTTP/3.
-  Without it the rest of the library (UDP, HTTP/1.1, HTTP/2 parser,
-  WebSocket) builds fine; `SPAZNET_BUILD_QUIC` will auto-disable
-  with a warning.
+- **QUIC TLS backend** — *only* required if you want QUIC + HTTP/3.
+  Default: **OpenSSL 3.5+**. Alternate: **wolfSSL** with QUIC
+  (`-DSPAZNET_USE_WOLFSSL=ON`). Without a usable backend the rest of
+  the library (UDP, HTTP/1.1, HTTP/2 parser, WebSocket) builds fine;
+  `SPAZNET_BUILD_QUIC` auto-disables with a warning.
 
 ## Option 1: install + `find_package`
 
@@ -43,9 +44,10 @@ path:
 cmake -B build -DCMAKE_PREFIX_PATH=/opt/spaznet
 ```
 
-The package brings `OpenSSL::SSL` + `OpenSSL::Crypto` in transitively
-when the install was built with QUIC, and `Threads::Threads`
-unconditionally.
+The core `spaznet::spaznet` package brings `Threads::Threads`
+unconditionally and does **not** pull a TLS library. Link
+`spaznet::quic_http3` for QUIC + HTTP/3; that target carries the
+selected TLS backend (OpenSSL or wolfSSL).
 
 ### `find_package` from `vcpkg` / `Conan` / system package manager
 
@@ -76,18 +78,20 @@ Notes:
   time (for its own tests). The download happens on first configure
   even with `EXCLUDE_FROM_ALL`, but the test binaries don't compile.
 
-## The `SPAZNET_BUILD_QUIC` knob
+## The `SPAZNET_BUILD_QUIC` / `SPAZNET_USE_WOLFSSL` knobs
 
-Default `ON`. When `OFF` (or auto-disabled because OpenSSL 3.5+
-wasn't found), the build skips:
+`SPAZNET_BUILD_QUIC` defaults `ON`. When `OFF` (or auto-disabled
+because no usable TLS backend was found), the build skips:
 
-- `src/quic/*`, `src/http3/*`
-- `include/libspaznet/quic/*`, `include/libspaznet/http3/*`
 - The `spaznet::quic_http3` library (`example/quic-http3/`).
 - All QUIC + HTTP/3 tests + benchmarks.
 
+`SPAZNET_USE_WOLFSSL` defaults `OFF` (OpenSSL 3.5). Set `ON` to
+build QUIC against a QUIC-enabled wolfSSL instead — OpenSSL is then
+not required.
+
 The HTTP/1.1, HTTP/2 parser, WebSocket, and UDP paths build with no
-OpenSSL dependency.
+TLS dependency.
 
 To force-disable:
 
@@ -114,7 +118,9 @@ To detect from your own code whether you got the QUIC API:
 `SPAZNET_HAS_QUIC` is defined by the `spaznet::quic_http3` target's
 public interface, so any TU that links it gets the macro.
 
-## OpenSSL location
+## TLS backend location
+
+### OpenSSL 3.5+ (default)
 
 On most Linux distros OpenSSL 3.5+ is too new for stock packages —
 you'll need a custom install. On macOS Homebrew ships
@@ -130,6 +136,31 @@ cmake -B build -DOPENSSL_ROOT_DIR=/opt/openssl-3.5
 
 The CMake check is `find_package(OpenSSL 3.5 QUIET)` — `QUIET` so a
 missing OpenSSL doesn't error; it warns and disables QUIC.
+
+### wolfSSL (alternate)
+
+Stock distro wolfSSL packages usually lack `--enable-quic`. Build
+from source, then point CMake at the prefix:
+
+```bash
+./configure --prefix=$HOME/wolfssl \
+  --enable-quic --enable-opensslextra --enable-opensslall \
+  --enable-session-ticket --enable-alpn --enable-tls13 \
+  --enable-aesgcm --enable-chacha --enable-poly1305 \
+  --enable-hkdf --enable-sha384 --enable-ecc \
+  --enable-supportedcurves --enable-sni \
+  --enable-certgen --enable-keygen --enable-aesctr \
+  --disable-shared --enable-static \
+  CPPFLAGS="-DHAVE_AES_ECB"
+make -j && make install
+
+cmake -B build \
+  -DSPAZNET_USE_WOLFSSL=ON \
+  -DWOLFSSL_ROOT=$HOME/wolfssl
+```
+
+CMake probes for `wolfSSL_set_quic_method` and refuses the wolfSSL
+path (with a warning + QUIC disabled) if QUIC support is missing.
 
 ## Compiler selection
 

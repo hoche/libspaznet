@@ -20,11 +20,10 @@
 
 #include <libspaznet/detail/socket_compat.hpp>
 
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/x509.h>
+#include "quic_test_tls.hpp"
 
 using namespace spaznet::quic;
+using namespace spaznet::quic::test;
 
 namespace {
 
@@ -43,36 +42,6 @@ auto hex(std::string s) -> std::vector<uint8_t> {
         out.push_back(static_cast<uint8_t>((nyb(s[i]) << 4) | nyb(s[i + 1])));
     }
     return out;
-}
-
-auto make_self_signed() -> std::pair<std::string, std::string> {
-    EVP_PKEY* pkey = EVP_EC_gen("P-256");
-    X509* x = X509_new();
-    ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
-    X509_gmtime_adj(X509_getm_notBefore(x), 0);
-    X509_gmtime_adj(X509_getm_notAfter(x), 3600);
-    X509_set_pubkey(x, pkey);
-    X509_NAME* nm = X509_get_subject_name(x);
-    X509_NAME_add_entry_by_txt(nm, "CN", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>("ls-test"), -1, -1, 0);
-    X509_set_issuer_name(x, nm);
-    X509_sign(x, pkey, EVP_sha256());
-
-    BIO* cb = BIO_new(BIO_s_mem());
-    PEM_write_bio_X509(cb, x);
-    char* cdata = nullptr;
-    long clen = BIO_get_mem_data(cb, &cdata);
-    std::string cpem(cdata, static_cast<std::size_t>(clen));
-    BIO* kb = BIO_new(BIO_s_mem());
-    PEM_write_bio_PrivateKey(kb, pkey, nullptr, nullptr, 0, nullptr, nullptr);
-    char* kdata = nullptr;
-    long klen = BIO_get_mem_data(kb, &kdata);
-    std::string kpem(kdata, static_cast<std::size_t>(klen));
-    BIO_free(cb);
-    BIO_free(kb);
-    X509_free(x);
-    EVP_PKEY_free(pkey);
-    return {cpem, kpem};
 }
 
 } // namespace
@@ -135,7 +104,7 @@ TEST(QuicVersionNegotiation, EchoesCidsAndAdvertisesVersions) {
 }
 
 TEST(QuicListener, UnsupportedVersionTriggersVersionNegotiation) {
-    auto [cert, key] = make_self_signed();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig tcfg{cert, key, {"h3"}};
     auto tls_ctx = TlsContext::make_server(tcfg);
     ASSERT_NE(tls_ctx, nullptr);
@@ -232,7 +201,7 @@ auto make_v4_peer(uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint16_t port) -> 
 } // namespace
 
 TEST(QuicRequireRetry, InitialWithoutTokenEmitsRetryAndCreatesNoConnection) {
-    auto [cert, key] = make_self_signed();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig tcfg{cert, key, {"h3"}};
     auto tls_ctx = TlsContext::make_server(tcfg);
     ASSERT_NE(tls_ctx, nullptr);
@@ -265,7 +234,7 @@ TEST(QuicRequireRetry, InitialWithoutTokenEmitsRetryAndCreatesNoConnection) {
 }
 
 TEST(QuicRequireRetry, ValidTokenCreatesValidatedConnection) {
-    auto [cert, key] = make_self_signed();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig tcfg{cert, key, {"h3"}};
     auto tls_ctx = TlsContext::make_server(tcfg);
     ASSERT_NE(tls_ctx, nullptr);
@@ -321,7 +290,7 @@ TEST(QuicRequireRetry, ValidTokenCreatesValidatedConnection) {
 }
 
 TEST(QuicRequireRetry, TokenFromDifferentPeerIsRejected) {
-    auto [cert, key] = make_self_signed();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig tcfg{cert, key, {"h3"}};
     auto tls_ctx = TlsContext::make_server(tcfg);
     ASSERT_NE(tls_ctx, nullptr);

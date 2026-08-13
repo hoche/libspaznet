@@ -1,21 +1,26 @@
 #include <libspaznet/quic/tls.hpp>
+#include <libspaznet/quic/detail/tls_compat.hpp>
 
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
-#include <openssl/bio.h>
-#include <openssl/core_dispatch.h>
-#include <openssl/core_names.h>
-#include <openssl/err.h>
-#include <openssl/pem.h>
-#include <openssl/ssl.h>
-#include <openssl/x509.h>
-
 namespace spaznet {
 namespace quic {
 
 namespace {
+
+#if defined(SPAZNET_TLS_WOLFSSL)
+struct WolfSslInit {
+    WolfSslInit() {
+        wolfSSL_Init();
+    }
+    ~WolfSslInit() {
+        wolfSSL_Cleanup();
+    }
+};
+const WolfSslInit kWolfSslInit;
+#endif
 
 constexpr std::size_t kNumLevels = 4;
 
@@ -23,6 +28,7 @@ auto level_to_index(EncryptionLevel l) -> std::size_t {
     return static_cast<std::size_t>(l);
 }
 
+#if defined(SPAZNET_TLS_OPENSSL)
 auto from_ossl_level(uint32_t ossl) -> EncryptionLevel {
     switch (ossl) {
         case OSSL_RECORD_PROTECTION_LEVEL_NONE:
@@ -101,6 +107,79 @@ auto build_dispatch_table() -> const OSSL_DISPATCH* {
     };
     return table;
 }
+#endif // SPAZNET_TLS_OPENSSL
+
+#if defined(SPAZNET_TLS_WOLFSSL)
+auto from_wolf_level(WOLFSSL_ENCRYPTION_LEVEL level) -> EncryptionLevel {
+    switch (level) {
+        case wolfssl_encryption_initial:
+            return EncryptionLevel::Initial;
+        case wolfssl_encryption_early_data:
+            return EncryptionLevel::EarlyData;
+        case wolfssl_encryption_handshake:
+            return EncryptionLevel::Handshake;
+        case wolfssl_encryption_application:
+        default:
+            return EncryptionLevel::Application;
+    }
+}
+
+auto to_wolf_level(EncryptionLevel level) -> WOLFSSL_ENCRYPTION_LEVEL {
+    switch (level) {
+        case EncryptionLevel::Initial:
+            return wolfssl_encryption_initial;
+        case EncryptionLevel::EarlyData:
+            return wolfssl_encryption_early_data;
+        case EncryptionLevel::Handshake:
+            return wolfssl_encryption_handshake;
+        case EncryptionLevel::Application:
+        default:
+            return wolfssl_encryption_application;
+    }
+}
+
+auto cb_set_encryption_secrets(WOLFSSL* ssl, WOLFSSL_ENCRYPTION_LEVEL level,
+                               const uint8_t* read_secret, const uint8_t* write_secret,
+                               size_t secret_len) -> int {
+    auto* self = static_cast<TlsConnection*>(SSL_get_app_data(ssl));
+    if (self == nullptr) {
+        return 0;
+    }
+    return self->on_set_encryption_secrets(from_wolf_level(level), read_secret, write_secret,
+                                           secret_len);
+}
+
+auto cb_add_handshake_data(WOLFSSL* ssl, WOLFSSL_ENCRYPTION_LEVEL level, const uint8_t* data,
+                           size_t len) -> int {
+    auto* self = static_cast<TlsConnection*>(SSL_get_app_data(ssl));
+    if (self == nullptr) {
+        return 0;
+    }
+    return self->on_add_handshake_data(from_wolf_level(level), {data, len});
+}
+
+auto cb_flush_flight(WOLFSSL* /*ssl*/) -> int {
+    return 1;
+}
+
+auto cb_send_alert(WOLFSSL* ssl, WOLFSSL_ENCRYPTION_LEVEL /*level*/, uint8_t alert) -> int {
+    auto* self = static_cast<TlsConnection*>(SSL_get_app_data(ssl));
+    if (self == nullptr) {
+        return 0;
+    }
+    return self->on_alert(alert);
+}
+
+auto wolf_quic_method() -> const WOLFSSL_QUIC_METHOD* {
+    static const WOLFSSL_QUIC_METHOD method = {
+        cb_set_encryption_secrets,
+        cb_add_handshake_data,
+        cb_flush_flight,
+        cb_send_alert,
+    };
+    return &method;
+}
+#endif // SPAZNET_TLS_WOLFSSL
 
 // ALPN selection callback on the server side. We accept the first peer
 // protocol that we also offer.
@@ -167,20 +246,15 @@ auto TlsContext::make_server(const TlsServerConfig& cfg) -> std::shared_ptr<TlsC
     EVP_PKEY_free(key);
     BIO_free(kbio);
 
-    // ALPN: we stash the offered protocols in a heap-owned vector kept
-    // alive by SSL_CTX_set_ex_data. The CTX owns the deleter.
+    // ALPN: keep offered protocols on TlsContext so the select callback
+    // arg stays valid for the CTX lifetime (avoids SSL_CTX ex_data, which
+    // wolfSSL's OpenSSL-compat layer does not always expose).
     if (!cfg.alpn.empty()) {
-        auto* offered = new std::vector<std::vector<uint8_t>>();
+        out->alpn_offered_.clear();
         for (const auto& p : cfg.alpn) {
-            offered->emplace_back(p.begin(), p.end());
+            out->alpn_offered_.emplace_back(p.begin(), p.end());
         }
-        static int ex_idx = SSL_CTX_get_ex_new_index(
-            0, const_cast<char*>("alpn_offered"), nullptr, nullptr,
-            +[](void*, void* ptr, CRYPTO_EX_DATA*, int, long, void*) {
-                delete static_cast<std::vector<std::vector<uint8_t>>*>(ptr);
-            });
-        SSL_CTX_set_ex_data(ctx, ex_idx, offered);
-        SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, offered);
+        SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, &out->alpn_offered_);
     }
 
     out->ctx_ = ctx;
@@ -204,6 +278,7 @@ TlsConnection::TlsConnection(std::shared_ptr<TlsContext> ctx,
     SSL_set_accept_state(ssl_);
 
     own_tp_wire_ = encode_transport_params(tp);
+#if defined(SPAZNET_TLS_OPENSSL)
     // Install the dispatch table first to put the SSL* in QUIC mode;
     // the transport-params call is only meaningful afterwards.
     if (SSL_set_quic_tls_cbs(ssl_, build_dispatch_table(), this) != 1) {
@@ -214,6 +289,18 @@ TlsConnection::TlsConnection(std::shared_ptr<TlsContext> ctx,
         state_ = State::Failed;
         return;
     }
+#else
+    SSL_set_app_data(ssl_, this);
+    if (SSL_set_quic_method(ssl_, wolf_quic_method()) != WOLFSSL_SUCCESS) {
+        state_ = State::Failed;
+        return;
+    }
+    if (SSL_set_quic_transport_params(ssl_, own_tp_wire_.data(), own_tp_wire_.size()) !=
+        WOLFSSL_SUCCESS) {
+        state_ = State::Failed;
+        return;
+    }
+#endif
     // client_dcid is informational here; the transport derives Initial
     // keys from it. We accept the parameter so future code (e.g. Retry)
     // can stash the OD-CID alongside this object.
@@ -227,8 +314,18 @@ TlsConnection::~TlsConnection() {
 }
 
 auto TlsConnection::deliver_crypto(EncryptionLevel level, std::span<const uint8_t> data) -> void {
+#if defined(SPAZNET_TLS_OPENSSL)
     auto& lvl = in_[level_to_index(level)];
     lvl.data.insert(lvl.data.end(), data.begin(), data.end());
+#else
+    if (ssl_ == nullptr || data.empty()) {
+        return;
+    }
+    if (SSL_provide_quic_data(ssl_, to_wolf_level(level), data.data(), data.size()) !=
+        WOLFSSL_SUCCESS) {
+        state_ = State::Failed;
+    }
+#endif
 }
 
 auto TlsConnection::set_state_from_handshake_result(int rc) -> void {
@@ -237,19 +334,62 @@ auto TlsConnection::set_state_from_handshake_result(int rc) -> void {
         return;
     }
     int err = SSL_get_error(ssl_, rc);
-    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE ||
-        err == SSL_ERROR_WANT_RETRY_VERIFY || err == SSL_ERROR_WANT_CLIENT_HELLO_CB ||
-        err == SSL_ERROR_WANT_X509_LOOKUP) {
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE
+#if defined(SPAZNET_TLS_OPENSSL)
+        || err == SSL_ERROR_WANT_RETRY_VERIFY || err == SSL_ERROR_WANT_CLIENT_HELLO_CB ||
+        err == SSL_ERROR_WANT_X509_LOOKUP
+#endif
+    ) {
         state_ = State::Handshaking;
         return;
     }
-    // Anything else is a fatal handshake failure. Stash the OpenSSL
-    // error code in alert_code_ so the caller can report it; the TLS
-    // alert (if any) was already captured by on_alert.
+    // Anything else is a fatal handshake failure. Stash the TLS error
+    // code in alert_code_ so the caller can report it; the TLS alert
+    // (if any) was already captured by on_alert.
     if (alert_code_ == 0) {
         alert_code_ = static_cast<uint8_t>(err);
     }
     state_ = State::Failed;
+}
+
+auto TlsConnection::refresh_negotiated_aead() -> void {
+    const SSL_CIPHER* c = SSL_get_current_cipher(ssl_);
+    if (c == nullptr) {
+        return;
+    }
+#if defined(SPAZNET_TLS_OPENSSL)
+    negotiated_aead_ =
+        aead_from_tls_cipher_id(static_cast<uint16_t>(SSL_CIPHER_get_protocol_id(c)));
+#else
+    const char* name = SSL_CIPHER_get_name(c);
+    if (name == nullptr) {
+        return;
+    }
+    // wolfSSL uses names like "TLS13-AES128-GCM-SHA256".
+    if (std::strstr(name, "CHACHA") != nullptr) {
+        negotiated_aead_ = Aead::ChaCha20Poly1305;
+    } else if (std::strstr(name, "AES256") != nullptr || std::strstr(name, "AES_256") != nullptr) {
+        negotiated_aead_ = Aead::Aes256Gcm;
+    } else {
+        negotiated_aead_ = Aead::Aes128Gcm;
+    }
+#endif
+}
+
+auto TlsConnection::poll_peer_transport_params() -> void {
+#if defined(SPAZNET_TLS_WOLFSSL)
+    if (have_peer_tp_ || ssl_ == nullptr) {
+        return;
+    }
+    const uint8_t* params = nullptr;
+    std::size_t params_len = 0;
+    SSL_get_peer_quic_transport_params(ssl_, &params, &params_len);
+    if (params != nullptr && params_len > 0) {
+        on_got_transport_params({params, params_len});
+    }
+#else
+    (void)0;
+#endif
 }
 
 auto TlsConnection::advance() -> State {
@@ -258,13 +398,11 @@ auto TlsConnection::advance() -> State {
     }
     int rc = SSL_do_handshake(ssl_);
     set_state_from_handshake_result(rc);
+    poll_peer_transport_params();
 
     if (state_ == State::Established) {
-        const SSL_CIPHER* c = SSL_get_current_cipher(ssl_);
-        if (c != nullptr) {
-            negotiated_aead_ = aead_from_tls_cipher_id(
-                static_cast<uint16_t>(SSL_CIPHER_get_protocol_id(c)));
-        }
+        refresh_negotiated_aead();
+        poll_peer_transport_params();
     }
     return state_;
 }
@@ -297,6 +435,7 @@ auto TlsConnection::negotiated_alpn() const -> std::string {
     return std::string(reinterpret_cast<const char*>(p), len);
 }
 
+#if defined(SPAZNET_TLS_OPENSSL)
 auto TlsConnection::on_crypto_send(std::span<const uint8_t> data, std::size_t& consumed) -> int {
     out_[level_to_index(send_level_)].insert(out_[level_to_index(send_level_)].end(),
                                              data.begin(), data.end());
@@ -343,18 +482,35 @@ auto TlsConnection::on_yield_secret(uint32_t prot_level, int direction,
     } else {
         write_secret_[level_to_index(level)].assign(secret.begin(), secret.end());
     }
-    // From the Handshake level onwards, the AEAD chosen by TLS may now
-    // be known — try to capture it.
-    const SSL_CIPHER* c = SSL_get_current_cipher(ssl_);
-    if (c != nullptr) {
-        negotiated_aead_ =
-            aead_from_tls_cipher_id(static_cast<uint16_t>(SSL_CIPHER_get_protocol_id(c)));
-    }
+    refresh_negotiated_aead();
     // OpenSSL transitions us forward by handing higher-level secrets;
     // the next call to advance() will pick that up.
     send_level_ = level;
     return 1;
 }
+#endif // SPAZNET_TLS_OPENSSL
+
+#if defined(SPAZNET_TLS_WOLFSSL)
+auto TlsConnection::on_set_encryption_secrets(EncryptionLevel level, const uint8_t* read_secret,
+                                              const uint8_t* write_secret, std::size_t secret_len)
+    -> int {
+    if (read_secret != nullptr) {
+        read_secret_[level_to_index(level)].assign(read_secret, read_secret + secret_len);
+    }
+    if (write_secret != nullptr) {
+        write_secret_[level_to_index(level)].assign(write_secret, write_secret + secret_len);
+    }
+    refresh_negotiated_aead();
+    return 1;
+}
+
+auto TlsConnection::on_add_handshake_data(EncryptionLevel level, std::span<const uint8_t> data)
+    -> int {
+    out_[level_to_index(level)].insert(out_[level_to_index(level)].end(), data.begin(),
+                                       data.end());
+    return 1;
+}
+#endif // SPAZNET_TLS_WOLFSSL
 
 auto TlsConnection::on_got_transport_params(std::span<const uint8_t> params) -> int {
     have_peer_tp_ = decode_transport_params(params, peer_tp_);

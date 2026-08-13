@@ -161,6 +161,9 @@ class CipherCtx {
     void* ctx_{nullptr};
     Aead aead_{Aead::Aes128Gcm};
     Direction dir_{Direction::Encrypt};
+    // Retained so wolfSSL (and any backend that cannot do IV-only
+    // reinit) can re-bind key+IV on every seal/open.
+    std::vector<uint8_t> key_{};
 };
 
 // Header-protection mask (RFC 9001 §5.4).

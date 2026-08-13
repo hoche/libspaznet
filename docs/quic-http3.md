@@ -2,9 +2,11 @@
 
 libspaznet ships a from-scratch server-side QUIC v1 (RFC 9000/9001/9002)
 + HTTP/3 (RFC 9114) + QPACK (RFC 9204) stack. TLS 1.3 is driven by
-OpenSSL 3.5+ via the `SSL_set_quic_tls_cbs` callback interface; the
-rest of the transport, recovery, congestion, HTTP/3, and QPACK code is
-in-tree with no other third-party dependencies.
+either OpenSSL 3.5+ (`SSL_set_quic_tls_cbs`, the default) or wolfSSL
+built with `--enable-quic` (`WOLFSSL_QUIC_METHOD`, via
+`-DSPAZNET_USE_WOLFSSL=ON`). The rest of the transport, recovery,
+congestion, HTTP/3, and QPACK code is in-tree with no other
+third-party dependencies.
 
 This page is the user-facing walkthrough. For the security model, see
 [`quic-security.md`](quic-security.md). For what's not implemented yet,
@@ -23,7 +25,7 @@ The pieces, top to bottom:
 | `http3::Http3Server` | `<libspaznet/http3/server.hpp>` | One per active QUIC connection. Speaks HTTP/3 framing, QPACK-decodes headers, dispatches to `HTTP3Handler`. |
 | `quic::Listener` | `<libspaznet/quic/listener.hpp>` | UDP-side dispatcher. Demuxes datagrams by Destination Connection ID, creates new `quic::Connection`s on incoming Initials, emits Version Negotiation / Retry as configured. |
 | `quic::Connection` | `<libspaznet/quic/connection.hpp>` | Per-peer state machine. Three PN spaces (Initial / Handshake / Application), streams, recovery, congestion. |
-| `quic::TlsContext` / `quic::TlsConnection` | `<libspaznet/quic/tls.hpp>` | Thin wrappers over OpenSSL's `SSL_CTX` / `SSL*` configured for QUIC. |
+| `quic::TlsContext` / `quic::TlsConnection` | `<libspaznet/quic/tls.hpp>` | Thin wrappers over the selected TLS backend's `SSL_CTX` / `SSL*` configured for QUIC (OpenSSL 3.5 or wolfSSL). |
 | frame / packet / crypto | `<libspaznet/quic/{frame,packet,crypto,varint}.hpp>` | Wire-format codecs. You don't construct these directly. |
 
 ## Minimal server

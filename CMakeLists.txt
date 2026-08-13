@@ -40,22 +40,89 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
-# The QUIC v1 + HTTP/3 stack is now an example (example/quic-http3)
-# rather than part of the core library.  The option is preserved at
-# the top level because it controls whether that example is built;
-# the OpenSSL 3.5+ probe (required by RFC 9001's
-# SSL_set_quic_tls_cbs interface) auto-disables the example when
-# OpenSSL is missing or too old, so core builds with no OpenSSL
-# dependency.
-option(SPAZNET_BUILD_QUIC "Build example/quic-http3 (requires OpenSSL 3.5+)" ON)
+# The QUIC v1 + HTTP/3 stack is an example (example/quic-http3), not
+# part of the core library.  TLS for that stack is exclusive: OpenSSL
+# 3.5+ (default, SSL_set_quic_tls_cbs) or wolfSSL built with
+# --enable-quic (SPAZNET_USE_WOLFSSL=ON).  Core spaznet never links a
+# TLS library; only spaznet_quic_http3 does.
+option(SPAZNET_BUILD_QUIC "Build example/quic-http3 (requires OpenSSL 3.5+ or wolfSSL+QUIC)" ON)
+option(SPAZNET_USE_WOLFSSL "Use wolfSSL instead of OpenSSL for QUIC TLS" OFF)
+set(SPAZNET_TLS_BACKEND "")
 if(SPAZNET_BUILD_QUIC)
-    find_package(OpenSSL 3.5 QUIET)
-    if(NOT OpenSSL_FOUND)
-        message(WARNING
-            "OpenSSL 3.5+ not found; disabling example/quic-http3 build. "
-            "Pass -DSPAZNET_BUILD_QUIC=OFF to silence this warning, "
-            "or install OpenSSL 3.5+ and set OPENSSL_ROOT_DIR.")
-        set(SPAZNET_BUILD_QUIC OFF CACHE BOOL "" FORCE)
+    if(SPAZNET_USE_WOLFSSL)
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            if(DEFINED WOLFSSL_ROOT)
+                set(ENV{PKG_CONFIG_PATH}
+                    "${WOLFSSL_ROOT}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+            endif()
+            pkg_check_modules(WOLFSSL QUIET wolfssl)
+        endif()
+        if(NOT WOLFSSL_FOUND AND DEFINED WOLFSSL_ROOT)
+            if(EXISTS "${WOLFSSL_ROOT}/include/wolfssl/ssl.h")
+                set(WOLFSSL_FOUND TRUE)
+                set(WOLFSSL_INCLUDE_DIRS "${WOLFSSL_ROOT}/include")
+                set(WOLFSSL_LIBRARY_DIRS "${WOLFSSL_ROOT}/lib")
+                set(WOLFSSL_LIBRARIES wolfssl)
+            endif()
+        endif()
+        if(WOLFSSL_FOUND)
+            include(CheckCXXSourceCompiles)
+            set(_spaznet_wolf_cflags "")
+            foreach(_inc IN LISTS WOLFSSL_INCLUDE_DIRS)
+                string(APPEND _spaznet_wolf_cflags " -I${_inc}")
+            endforeach()
+            foreach(_libdir IN LISTS WOLFSSL_LIBRARY_DIRS)
+                string(APPEND _spaznet_wolf_cflags " -L${_libdir}")
+            endforeach()
+            set(CMAKE_REQUIRED_FLAGS "${_spaznet_wolf_cflags}")
+            set(CMAKE_REQUIRED_LIBRARIES ${WOLFSSL_LIBRARIES})
+            # options.h must precede other wolfSSL headers for a
+            # prefix-built install.
+            check_cxx_source_compiles("
+                #include <wolfssl/options.h>
+                #include <wolfssl/ssl.h>
+                #include <wolfssl/quic.h>
+                int main() {
+                    (void)&wolfSSL_set_quic_method;
+                    return 0;
+                }
+            " SPAZNET_WOLFSSL_HAS_QUIC)
+            unset(CMAKE_REQUIRED_FLAGS)
+            unset(CMAKE_REQUIRED_LIBRARIES)
+            unset(_spaznet_wolf_cflags)
+        endif()
+        if(NOT WOLFSSL_FOUND OR NOT SPAZNET_WOLFSSL_HAS_QUIC)
+            message(WARNING
+                "wolfSSL with QUIC support not found; disabling example/quic-http3. "
+                "Build wolfSSL with --enable-quic --enable-opensslextra and pass "
+                "-DWOLFSSL_ROOT=<prefix>, or set SPAZNET_USE_WOLFSSL=OFF to use OpenSSL 3.5+.")
+            set(SPAZNET_BUILD_QUIC OFF CACHE BOOL "" FORCE)
+        else()
+            set(SPAZNET_TLS_BACKEND "wolfssl")
+            add_library(spaznet_tls INTERFACE)
+            target_include_directories(spaznet_tls INTERFACE ${WOLFSSL_INCLUDE_DIRS})
+            target_link_directories(spaznet_tls INTERFACE ${WOLFSSL_LIBRARY_DIRS})
+            target_link_libraries(spaznet_tls INTERFACE ${WOLFSSL_LIBRARIES})
+            target_compile_definitions(spaznet_tls INTERFACE SPAZNET_TLS_WOLFSSL)
+            add_library(spaznet::tls ALIAS spaznet_tls)
+        endif()
+    else()
+        find_package(OpenSSL 3.5 QUIET)
+        if(NOT OpenSSL_FOUND)
+            message(WARNING
+                "OpenSSL 3.5+ not found; disabling example/quic-http3 build. "
+                "Pass -DSPAZNET_BUILD_QUIC=OFF to silence this warning, "
+                "install OpenSSL 3.5+ and set OPENSSL_ROOT_DIR, "
+                "or use -DSPAZNET_USE_WOLFSSL=ON with a QUIC-enabled wolfSSL.")
+            set(SPAZNET_BUILD_QUIC OFF CACHE BOOL "" FORCE)
+        else()
+            set(SPAZNET_TLS_BACKEND "openssl")
+            add_library(spaznet_tls INTERFACE)
+            target_link_libraries(spaznet_tls INTERFACE OpenSSL::SSL OpenSSL::Crypto)
+            target_compile_definitions(spaznet_tls INTERFACE SPAZNET_TLS_OPENSSL)
+            add_library(spaznet::tls ALIAS spaznet_tls)
+        endif()
     endif()
 endif()
 
@@ -183,10 +250,7 @@ if(SPAZNET_ENABLE_COROUTINES)
     # library itself was built with.
     target_compile_definitions(spaznet PUBLIC SPAZNET_HAS_COROUTINES)
 endif()
-if(SPAZNET_BUILD_QUIC)
-    target_link_libraries(spaznet PUBLIC OpenSSL::SSL OpenSSL::Crypto)
-    target_compile_definitions(spaznet PUBLIC SPAZNET_HAS_QUIC)
-endif()
+# QUIC TLS deps live on spaznet_quic_http3 only (see example/quic-http3).
 
 # Platform-specific compile defs.
 if(USE_EPOLL)
@@ -271,20 +335,13 @@ install(EXPORT spaznetTargets
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/spaznet
 )
 
-# Generate a config file that pulls in spaznetTargets.cmake and re-runs
-# find_package(Threads) (so downstream sees the same pthread linkage),
-# plus OpenSSL when QUIC was built in.
-if(SPAZNET_BUILD_QUIC)
-    set(SPAZNET_FIND_DEPENDENCY_OPENSSL "find_dependency(OpenSSL 3.5)")
-else()
-    set(SPAZNET_FIND_DEPENDENCY_OPENSSL "")
-endif()
+# Core package only needs Threads.  QUIC TLS (OpenSSL / wolfSSL) is
+# pulled in by consumers that link spaznet::quic_http3, not by core.
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/spaznetConfig.cmake.in"
 "@PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
-@SPAZNET_FIND_DEPENDENCY_OPENSSL@
 
 include(\"\${CMAKE_CURRENT_LIST_DIR}/spaznetTargets.cmake\")
 

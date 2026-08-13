@@ -15,64 +15,35 @@
 
 #include <cstring>
 #include <deque>
+#include <map>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
-#include <openssl/core_dispatch.h>
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/ssl.h>
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
+#include "quic_test_tls.hpp"
 
 using namespace spaznet::quic;
+using namespace spaznet::quic::test;
 
 namespace {
 
-auto make_self_signed_p256() -> std::pair<std::string, std::string> {
-    EVP_PKEY* pkey = EVP_EC_gen("P-256");
-    X509* x = X509_new();
-    ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
-    X509_gmtime_adj(X509_getm_notBefore(x), 0);
-    X509_gmtime_adj(X509_getm_notAfter(x), 3600);
-    X509_set_pubkey(x, pkey);
-    X509_NAME* nm = X509_get_subject_name(x);
-    X509_NAME_add_entry_by_txt(nm, "CN", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>("ls-test"), -1, -1, 0);
-    X509_set_issuer_name(x, nm);
-    X509_sign(x, pkey, EVP_sha256());
-
-    BIO* cb = BIO_new(BIO_s_mem());
-    PEM_write_bio_X509(cb, x);
-    char* cdata = nullptr;
-    long clen = BIO_get_mem_data(cb, &cdata);
-    std::string cpem(cdata, static_cast<std::size_t>(clen));
-    BIO* kb = BIO_new(BIO_s_mem());
-    PEM_write_bio_PrivateKey(kb, pkey, nullptr, nullptr, 0, nullptr, nullptr);
-    char* kdata = nullptr;
-    long klen = BIO_get_mem_data(kb, &kdata);
-    std::string kpem(kdata, static_cast<std::size_t>(klen));
-    BIO_free(cb);
-    BIO_free(kb);
-    X509_free(x);
-    EVP_PKEY_free(pkey);
-    return {cpem, kpem};
-}
-
-// In-memory QUIC client: drives an OpenSSL SSL* in client mode through
-// the QUIC TLS callbacks, but also packs/unpacks QUIC packets so the
-// server Connection sees real datagrams. Mirrors the server side.
+// In-memory QUIC client: drives a TLS SSL* in client mode through the
+// backend QUIC callbacks, and packs/unpacks QUIC packets so the server
+// Connection sees real datagrams.
 struct QuicTestClient {
     SSL_CTX* ctx{nullptr};
     SSL* ssl{nullptr};
     std::vector<uint8_t> dcid;     // we (client) chose this for the server
     std::vector<uint8_t> scid;     // peer (server) will use this as its DCID for our packets
-    // Per-level CRYPTO outbox the SSL_set_quic_tls_cbs send callback fills.
     std::array<std::vector<uint8_t>, 4> tls_out;
+#if defined(SPAZNET_TLS_OPENSSL)
     std::array<std::vector<uint8_t>, 4> tls_in;
     std::array<std::size_t, 4> tls_in_cursor{0, 0, 0, 0};
     uint32_t send_level{OSSL_RECORD_PROTECTION_LEVEL_NONE};
+#else
+    std::size_t send_level{0};
+#endif
     std::vector<uint8_t> own_tp_wire;
     bool got_peer_tp{false};
     std::vector<uint8_t> peer_tp_wire;
@@ -107,100 +78,12 @@ struct QuicTestClient {
     }
 };
 
-static int qtc_send(SSL*, const unsigned char* buf, size_t buf_len, size_t* consumed,
-                    void* arg) {
-    auto* c = static_cast<QuicTestClient*>(arg);
-    c->tls_out[c->send_level].insert(c->tls_out[c->send_level].end(), buf, buf + buf_len);
-    *consumed = buf_len;
-    return 1;
-}
-static int qtc_recv(SSL*, const unsigned char** buf, size_t* br, void* arg) {
-    auto* c = static_cast<QuicTestClient*>(arg);
-    for (std::size_t i = 0; i < 4; ++i) {
-        if (c->tls_in_cursor[i] < c->tls_in[i].size()) {
-            *buf = c->tls_in[i].data() + c->tls_in_cursor[i];
-            *br = c->tls_in[i].size() - c->tls_in_cursor[i];
-            return 1;
-        }
-    }
-    *buf = nullptr;
-    *br = 0;
-    return 1;
-}
-static int qtc_release(SSL*, size_t br, void* arg) {
-    auto* c = static_cast<QuicTestClient*>(arg);
-    for (std::size_t i = 0; i < 4; ++i) {
-        if (c->tls_in_cursor[i] < c->tls_in[i].size()) {
-            c->tls_in_cursor[i] += std::min(br, c->tls_in[i].size() - c->tls_in_cursor[i]);
-            return 1;
-        }
-    }
-    return 1;
-}
-static int qtc_yield(SSL*, uint32_t prot_level, int direction, const unsigned char* secret,
-                     size_t secret_len, void* arg) {
-    auto* c = static_cast<QuicTestClient*>(arg);
-    c->send_level = prot_level;
-    EncryptionLevel level = static_cast<EncryptionLevel>(
-        prot_level == OSSL_RECORD_PROTECTION_LEVEL_NONE       ? 0
-        : prot_level == OSSL_RECORD_PROTECTION_LEVEL_EARLY    ? 1
-        : prot_level == OSSL_RECORD_PROTECTION_LEVEL_HANDSHAKE ? 2
-                                                              : 3);
-    const SSL_CIPHER* cph = SSL_get_current_cipher(c->ssl);
-    if (cph) {
-        c->aead[static_cast<std::size_t>(level)] =
-            aead_from_tls_cipher_id(static_cast<uint16_t>(SSL_CIPHER_get_protocol_id(cph)));
-    }
-    // direction 0 == read (we, the client, will use this to decrypt server pkts);
-    // direction 1 == write (client encrypts to server).
-    if (direction == 0) {
-        c->recv_keys[static_cast<std::size_t>(level)] = derive_packet_keys(
-            c->aead[static_cast<std::size_t>(level)], {secret, secret_len});
-        c->recv_ready[static_cast<std::size_t>(level)] = true;
-        c->recv_secret[static_cast<std::size_t>(level)].assign(secret, secret + secret_len);
-    } else {
-        c->send_keys[static_cast<std::size_t>(level)] = derive_packet_keys(
-            c->aead[static_cast<std::size_t>(level)], {secret, secret_len});
-        c->send_ready[static_cast<std::size_t>(level)] = true;
-        c->send_secret[static_cast<std::size_t>(level)].assign(secret, secret + secret_len);
-    }
-    return 1;
-}
-static int qtc_got_tp(SSL*, const unsigned char* params, size_t params_len, void* arg) {
-    auto* c = static_cast<QuicTestClient*>(arg);
-    c->peer_tp_wire.assign(params, params + params_len);
-    c->got_peer_tp = true;
-    return 1;
-}
-static int qtc_alert(SSL*, unsigned char, void*) {
-    return 1;
-}
-
-static const OSSL_DISPATCH* qtc_dispatch() {
-    static const OSSL_DISPATCH t[] = {
-        {OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_SEND, reinterpret_cast<void (*)()>(qtc_send)},
-        {OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RECV_RCD, reinterpret_cast<void (*)()>(qtc_recv)},
-        {OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_RELEASE_RCD,
-         reinterpret_cast<void (*)()>(qtc_release)},
-        {OSSL_FUNC_SSL_QUIC_TLS_YIELD_SECRET, reinterpret_cast<void (*)()>(qtc_yield)},
-        {OSSL_FUNC_SSL_QUIC_TLS_GOT_TRANSPORT_PARAMS,
-         reinterpret_cast<void (*)()>(qtc_got_tp)},
-        {OSSL_FUNC_SSL_QUIC_TLS_ALERT, reinterpret_cast<void (*)()>(qtc_alert)},
-        {0, nullptr}};
-    return t;
-}
-
 auto make_client(std::vector<uint8_t> dcid, std::vector<uint8_t> scid)
     -> std::unique_ptr<QuicTestClient> {
     auto c = std::make_unique<QuicTestClient>();
     c->dcid = dcid;
     c->scid = scid;
-    c->ctx = SSL_CTX_new(TLS_client_method());
-    SSL_CTX_set_min_proto_version(c->ctx, TLS1_3_VERSION);
-    SSL_CTX_set_max_proto_version(c->ctx, TLS1_3_VERSION);
-    SSL_CTX_set_verify(c->ctx, SSL_VERIFY_NONE, nullptr);
-    static const unsigned char alpn[] = {2, 'h', '3'};
-    SSL_CTX_set_alpn_protos(c->ctx, alpn, sizeof(alpn));
+    c->ctx = make_client_ssl_ctx();
     c->ssl = SSL_new(c->ctx);
     SSL_set_connect_state(c->ssl);
     SSL_set_tlsext_host_name(c->ssl, "localhost");
@@ -224,8 +107,9 @@ auto make_client(std::vector<uint8_t> dcid, std::vector<uint8_t> scid)
     tp.initial_max_stream_data_bidi_local = 1 << 16;
     tp.initial_max_stream_data_uni = 1 << 16;
     c->own_tp_wire = encode_transport_params(tp);
-    SSL_set_quic_tls_cbs(c->ssl, qtc_dispatch(), c.get());
-    SSL_set_quic_tls_transport_params(c->ssl, c->own_tp_wire.data(), c->own_tp_wire.size());
+    if (!install_packet_client_quic(c.get())) {
+        throw std::runtime_error("install_packet_client_quic failed");
+    }
     return c;
 }
 
@@ -411,8 +295,15 @@ auto client_receive(QuicTestClient& c, std::vector<uint8_t> dg) -> void {
                 }
                 std::size_t skip =
                     static_cast<std::size_t>(c.crypto_recv_off[i] - it->first);
-                c.tls_in[i].insert(c.tls_in[i].end(), it->second.begin() + skip,
-                                   it->second.end());
+                std::span<const uint8_t> chunk{it->second.data() + skip,
+                                               it->second.size() - skip};
+                client_feed_crypto(c.ssl, static_cast<EncryptionLevel>(i), chunk,
+#if defined(SPAZNET_TLS_OPENSSL)
+                                   &c.tls_in
+#else
+                                   nullptr
+#endif
+                );
                 c.crypto_recv_off[i] += it->second.size() - skip;
                 c.crypto_recv_chunks[i].erase(it);
             }
@@ -456,6 +347,7 @@ auto client_receive(QuicTestClient& c, std::vector<uint8_t> dg) -> void {
             return;
         }
     }
+    client_poll_peer_tp(c.ssl, c.peer_tp_wire, c.got_peer_tp);
 }
 
 // ---- Shared scaffolding for the flow-control / stream-limit tests ----
@@ -473,6 +365,7 @@ auto drive_to_established(Connection& server, QuicTestClient& client,
                 return;
             }
         }
+        client_poll_peer_tp(client.ssl, client.peer_tp_wire, client.got_peer_tp);
         client_emit(client);
         while (!client.outbox.empty()) {
             auto dg = std::move(client.outbox.front());
@@ -589,7 +482,7 @@ auto collect_server_1rtt_frames(QuicTestClient& client,
 } // namespace
 
 TEST(QuicConnection, EndToEndHandshakeViaProtectedDatagrams) {
-    auto [cert, key] = make_self_signed_p256();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig cfg{cert, key, {"h3"}};
     auto ctx = TlsContext::make_server(cfg);
     ASSERT_NE(ctx, nullptr);
@@ -624,6 +517,7 @@ TEST(QuicConnection, EndToEndHandshakeViaProtectedDatagrams) {
                 FAIL() << "client SSL_do_handshake err=" << err;
             }
         }
+        client_poll_peer_tp(client->ssl, client->peer_tp_wire, client->got_peer_tp);
 
         // Client → wire.
         client_emit(*client);
@@ -673,7 +567,7 @@ TEST(QuicConnection, EndToEndHandshakeViaProtectedDatagrams) {
 // pto_timeout, and verify that the next on_timer() re-emits the same
 // payload as a probe.
 TEST(QuicConnection, PtoRetransmitsDroppedStream) {
-    auto [cert, key] = make_self_signed_p256();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig cfg{cert, key, {"h3"}};
     auto ctx = TlsContext::make_server(cfg);
     ASSERT_NE(ctx, nullptr);
@@ -717,6 +611,7 @@ TEST(QuicConnection, PtoRetransmitsDroppedStream) {
                 FAIL() << "client SSL_do_handshake err=" << err;
             }
         }
+        client_poll_peer_tp(client->ssl, client->peer_tp_wire, client->got_peer_tp);
         client_emit(*client);
         while (!client->outbox.empty()) {
             auto dg = std::move(client->outbox.front());
@@ -788,7 +683,7 @@ TEST(QuicConnection, PtoRetransmitsDroppedStream) {
 // RFC 9000 §10.2 — initiate_close emits a CONNECTION_CLOSE frame on
 // the next build_and_send pass and flips state_ to Closing.
 TEST(QuicConnection, InitiateCloseEmitsConnectionCloseFrame) {
-    auto [cert, key] = make_self_signed_p256();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig cfg{cert, key, {"h3"}};
     auto ctx = TlsContext::make_server(cfg);
     ASSERT_NE(ctx, nullptr);
@@ -827,6 +722,7 @@ TEST(QuicConnection, InitiateCloseEmitsConnectionCloseFrame) {
                 FAIL() << "client SSL_do_handshake err=" << err;
             }
         }
+        client_poll_peer_tp(client->ssl, client->peer_tp_wire, client->got_peer_tp);
         client_emit(*client);
         while (!client->outbox.empty()) {
             auto dg = std::move(client->outbox.front());
@@ -873,7 +769,7 @@ TEST(QuicConnection, InitiateCloseEmitsConnectionCloseFrame) {
 // carrying a PATH_CHALLENGE frame, and confirms the next server
 // datagram contains a PATH_RESPONSE with the matching 8-byte data.
 TEST(QuicConnection, RespondsToPathChallenge) {
-    auto [cert, key] = make_self_signed_p256();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig cfg{cert, key, {"h3"}};
     auto ctx = TlsContext::make_server(cfg);
     ASSERT_NE(ctx, nullptr);
@@ -910,6 +806,7 @@ TEST(QuicConnection, RespondsToPathChallenge) {
                 FAIL() << "client SSL_do_handshake err=" << err;
             }
         }
+        client_poll_peer_tp(client->ssl, client->peer_tp_wire, client->got_peer_tp);
         client_emit(*client);
         while (!client->outbox.empty()) {
             auto dg = std::move(client->outbox.front());
@@ -1038,7 +935,7 @@ TEST(QuicConnection, RespondsToPathChallenge) {
 // RFC 9000 §10.1 — idle timeout flips the connection to Draining
 // without sending CONNECTION_CLOSE.
 TEST(QuicConnection, IdleTimeoutFlipsToDraining) {
-    auto [cert, key] = make_self_signed_p256();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig cfg{cert, key, {"h3"}};
     auto ctx = TlsContext::make_server(cfg);
     ASSERT_NE(ctx, nullptr);
@@ -1099,7 +996,7 @@ auto handshake_pair(std::vector<uint8_t> cdcid, std::vector<uint8_t> cscid,
     hp->server_scid = std::move(sscid);
     hp->clock_now = std::chrono::steady_clock::now();
 
-    auto [cert, key] = make_self_signed_p256();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig cfg{cert, key, {"h3"}};
     auto ctx = TlsContext::make_server(cfg);
     if (!ctx) return nullptr;
@@ -1366,7 +1263,7 @@ TEST(QuicConnection, ServerInitiatedKeyUpdate) {
 // source MUST NOT redirect our outbound traffic.  This is the
 // security fix for the open hole called out in docs/quic-security.md.
 TEST(QuicListener, FreezesPathPostHandshake) {
-    auto [cert, key] = make_self_signed_p256();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig tcfg{cert, key, {"h3"}};
     auto tls_ctx = TlsContext::make_server(tcfg);
     ASSERT_NE(tls_ctx, nullptr);
@@ -1426,6 +1323,7 @@ TEST(QuicListener, FreezesPathPostHandshake) {
                 FAIL() << "client SSL_do_handshake err=" << err;
             }
         }
+        client_poll_peer_tp(client->ssl, client->peer_tp_wire, client->got_peer_tp);
         client_emit(*client);
         while (!client->outbox.empty()) {
             auto dg = std::move(client->outbox.front());
@@ -1516,7 +1414,7 @@ TEST(QuicListener, FreezesPathPostHandshake) {
 // RFC 9000 §4.6 — a peer STREAM frame for a stream index beyond the
 // advertised MAX_STREAMS closes the connection with STREAM_LIMIT_ERROR.
 TEST(QuicConnection, RejectsStreamBeyondMaxStreams) {
-    auto [cert, key] = make_self_signed_p256();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig cfg{cert, key, {"h3"}};
     auto ctx = TlsContext::make_server(cfg);
     ASSERT_NE(ctx, nullptr);
@@ -1581,7 +1479,7 @@ TEST(QuicConnection, RejectsStreamBeyondMaxStreams) {
 // RFC 9000 §4.1 — STREAM data exceeding the connection-level receive
 // limit closes the connection with FLOW_CONTROL_ERROR.
 TEST(QuicConnection, EnforcesConnectionMaxData) {
-    auto [cert, key] = make_self_signed_p256();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig cfg{cert, key, {"h3"}};
     auto ctx = TlsContext::make_server(cfg);
     ASSERT_NE(ctx, nullptr);
@@ -1646,7 +1544,7 @@ TEST(QuicConnection, EnforcesConnectionMaxData) {
 // RFC 9000 §4.1 — as the application consumes received bytes, the server
 // advertises a larger connection window via a MAX_DATA frame.
 TEST(QuicConnection, EmitsMaxDataAfterConsume) {
-    auto [cert, key] = make_self_signed_p256();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig cfg{cert, key, {"h3"}};
     auto ctx = TlsContext::make_server(cfg);
     ASSERT_NE(ctx, nullptr);
@@ -1719,7 +1617,7 @@ TEST(QuicConnection, EmitsMaxDataAfterConsume) {
 // in-order read cursor is rejected with CRYPTO_BUFFER_EXCEEDED rather
 // than buffered, closing an unauthenticated pre-handshake memory DoS.
 TEST(QuicConnection, RejectsOversizedCryptoOffset) {
-    auto [cert, key] = make_self_signed_p256();
+    auto [cert, key] = make_test_cert_pem("ls-test");
     TlsServerConfig cfg{cert, key, {"h3"}};
     auto ctx = TlsContext::make_server(cfg);
     ASSERT_NE(ctx, nullptr);

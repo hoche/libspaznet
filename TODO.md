@@ -8,7 +8,7 @@
 - TLS addition. Already in QUIC, of course, but needs to be added to the
 other protocols. HTTP/1.x should support both separate socket listeners
 and ALPN. Websockets should support both ws as wss.
-- Support wolfSSL as an alternate to OpenSSL.
+- [x] Support wolfSSL as an alternate to OpenSSL (`-DSPAZNET_USE_WOLFSSL=ON`).
 - QUIC Demo. There is none at this point.
 - QUIC Improvements
   - 0-RTT / session resumption (RFC 9001 §4.6) — not

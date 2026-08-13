@@ -6,6 +6,26 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
+## 2026-08-13 — wolfSSL as alternate QUIC TLS backend
+
+QUIC + HTTP/3 can build against wolfSSL instead of OpenSSL 3.5.
+
+### Added
+- `SPAZNET_USE_WOLFSSL` CMake option (default `OFF`). When `ON`,
+  configures against a QUIC-enabled wolfSSL (`WOLFSSL_ROOT` /
+  pkg-config) and defines `SPAZNET_TLS_WOLFSSL`.
+- Dual-backend `TlsConnection` / packet crypto in
+  `example/quic-http3` (OpenSSL `SSL_set_quic_tls_cbs` vs wolfSSL
+  `WOLFSSL_QUIC_METHOD` + `provide_quic_data`; HKDF via
+  `wolfSSL_quic_hkdf_*`).
+- Docs for building wolfSSL with the flags QUIC needs.
+
+### Changed
+- Core `spaznet` no longer `PUBLIC`-links OpenSSL when QUIC is on;
+  TLS deps live only on `spaznet::quic_http3` / `spaznet::tls`.
+- Installed `spaznetConfig.cmake` no longer `find_dependency`s
+  OpenSSL for the core package.
+
 ## 2026-08-13 — Reactor multi-loop: accept-and-shard via `ServerConfig`
 
 Implements the N-loop design in `docs/reactor-threading.md`. Reactor
