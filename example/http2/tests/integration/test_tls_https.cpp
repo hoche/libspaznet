@@ -20,6 +20,7 @@ TEST(Http2TlsSkipped, NoTlsInThisBuild) {
 #include <chrono>
 #include <cstdio>
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 
@@ -70,10 +71,11 @@ auto curl_http2_available() -> bool {
 
 auto curl_get_h2(const std::string& url) -> std::string {
     // -k: accept self-signed; --http2: negotiate ALPN h2.
-    std::string cmd = "curl -sk --http2 --max-time 5 " + url + " 2>/dev/null";
 #if defined(_WIN32)
+    std::string cmd = "curl -sk --http2 --max-time 5 \"" + url + "\" 2>NUL";
     FILE* pipe = _popen(cmd.c_str(), "r");
 #else
+    std::string cmd = "curl -sk --http2 --max-time 5 '" + url + "' 2>/dev/null";
     FILE* pipe = popen(cmd.c_str(), "r");
 #endif
     if (pipe == nullptr) {
@@ -92,12 +94,25 @@ auto curl_get_h2(const std::string& url) -> std::string {
     return out;
 }
 
+auto listen_tls_on_random_port(spaznet::Server& server, spaznet::TlsConfig cfg) -> uint16_t {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> dist(20000, 65000);
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        const auto port = static_cast<uint16_t>(dist(gen));
+        try {
+            server.listen_tls(port, cfg);
+            return port;
+        } catch (...) {
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 class Http2TlsTest : public ::testing::TestWithParam<DispatcherKind> {
   protected:
-    static constexpr uint16_t kPort = 18444;
-
     void SetUp() override {
         auto [cert, key] = spaznet::detail::make_self_signed_pem("localhost");
         spaznet::TlsConfig cfg;
@@ -107,9 +122,10 @@ class Http2TlsTest : public ::testing::TestWithParam<DispatcherKind> {
 
         server_ = std::make_unique<spaznet::Server>(2);
         install_dispatcher(*server_, std::make_unique<TlsHello>(), GetParam());
-        server_->listen_tls(kPort, std::move(cfg));
+        port_ = listen_tls_on_random_port(*server_, std::move(cfg));
+        ASSERT_NE(port_, 0u);
         thread_ = std::thread([this]() { server_->run(); });
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
     void TearDown() override {
@@ -123,13 +139,14 @@ class Http2TlsTest : public ::testing::TestWithParam<DispatcherKind> {
 
     std::unique_ptr<spaznet::Server> server_;
     std::thread thread_;
+    uint16_t port_{0};
 };
 
 TEST_P(Http2TlsTest, CurlHttpsHttp2Get) {
     if (!curl_http2_available()) {
         GTEST_SKIP() << "curl with HTTP2 support not available";
     }
-    auto body = curl_get_h2("https://127.0.0.1:" + std::to_string(kPort) + "/");
+    auto body = curl_get_h2("https://127.0.0.1:" + std::to_string(port_) + "/");
     EXPECT_EQ(body, "h2-tls-ok");
 }
 

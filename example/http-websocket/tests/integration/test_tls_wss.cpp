@@ -27,6 +27,7 @@ TEST(WsTlsSkipped, NoTlsInThisBuild) {
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -99,6 +100,9 @@ struct SslClient {
     }
 
     auto connect_tls(uint16_t port) -> bool {
+#ifdef _WIN32
+        spaznet::detail::ensure_winsock();
+#endif
         fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) {
             return false;
@@ -224,7 +228,21 @@ auto read_unmasked_text_payload(SslClient& c) -> std::string {
 
 class WsTlsTest : public ::testing::TestWithParam<DispatcherKind> {
   protected:
-    static constexpr uint16_t kPort = 18445;
+    static auto listen_tls_on_random_port(spaznet::Server& server, spaznet::TlsConfig cfg)
+        -> uint16_t {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<int> dist(20000, 65000);
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            const auto port = static_cast<uint16_t>(dist(gen));
+            try {
+                server.listen_tls(port, cfg);
+                return port;
+            } catch (...) {
+            }
+        }
+        return 0;
+    }
 
     void SetUp() override {
         auto [cert, key] = spaznet::detail::make_self_signed_pem("localhost");
@@ -244,9 +262,10 @@ class WsTlsTest : public ::testing::TestWithParam<DispatcherKind> {
                 nullptr, std::make_unique<EchoWS>()));
         }
 #endif
-        server_->listen_tls(kPort, std::move(cfg));
+        port_ = listen_tls_on_random_port(*server_, std::move(cfg));
+        ASSERT_NE(port_, 0u);
         thread_ = std::thread([this]() { server_->run(); });
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
     void TearDown() override {
@@ -260,11 +279,12 @@ class WsTlsTest : public ::testing::TestWithParam<DispatcherKind> {
 
     std::unique_ptr<spaznet::Server> server_;
     std::thread thread_;
+    uint16_t port_{0};
 };
 
 TEST_P(WsTlsTest, HandshakeAndEcho) {
     SslClient client;
-    ASSERT_TRUE(client.connect_tls(kPort));
+    ASSERT_TRUE(client.connect_tls(port_));
 
     const std::string key = "dGhlIHNhbXBsZSBub25jZQ==";
     auto req = handshake_request(key);
@@ -272,9 +292,9 @@ TEST_P(WsTlsTest, HandshakeAndEcho) {
 
     std::string resp_str;
     char buf[256]{};
-    for (int i = 0; i < 32 && resp_str.find("\r\n\r\n") == std::string::npos; ++i) {
+    for (int i = 0; i < 64 && resp_str.find("\r\n\r\n") == std::string::npos; ++i) {
         int r = client.read_some(buf, sizeof(buf));
-        ASSERT_GT(r, 0);
+        ASSERT_GT(r, 0) << "SSL_read failed during WS handshake";
         resp_str.append(buf, buf + r);
     }
     EXPECT_NE(resp_str.find("101 Switching Protocols"), std::string::npos);

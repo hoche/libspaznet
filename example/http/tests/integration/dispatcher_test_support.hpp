@@ -18,11 +18,15 @@
 #include <libspaznet/http/dispatcher.hpp>
 #include <libspaznet/http/handler.hpp>
 #include <libspaznet/server.hpp>
+#ifdef SPAZNET_HAS_TLS
+#include <libspaznet/tls_config.hpp>
+#endif
 
 #include <cstdint>
 #include <memory>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace spaznet::http::testing_support {
@@ -87,5 +91,27 @@ inline auto listen_on_random_port(::spaznet::Server& server) -> uint16_t {
     }
     return 0;
 }
+
+#ifdef SPAZNET_HAS_TLS
+// Same retry strategy as listen_on_random_port for TLS listeners.
+inline auto listen_tls_on_random_port(::spaznet::Server& server, ::spaznet::TlsConfig cfg)
+    -> uint16_t {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> dist(20000, 65000);
+
+    constexpr int kMaxAttempts = 200;
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        const auto port = static_cast<uint16_t>(dist(gen));
+        try {
+            server.listen_tls(port, cfg);
+            return port;
+        } catch (...) {
+            // EADDRINUSE or transient bind failure; retry.
+        }
+    }
+    return 0;
+}
+#endif
 
 } // namespace spaznet::http::testing_support

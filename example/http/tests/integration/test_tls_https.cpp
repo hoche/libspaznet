@@ -29,6 +29,7 @@ using spaznet::http::testing_support::AllDispatcherKinds;
 using spaznet::http::testing_support::DispatcherKind;
 using spaznet::http::testing_support::DispatcherKindName;
 using spaznet::http::testing_support::install_dispatcher;
+using spaznet::http::testing_support::listen_tls_on_random_port;
 
 namespace {
 
@@ -70,10 +71,13 @@ auto curl_available() -> bool {
 
 auto curl_get(const std::string& url) -> std::string {
     // -k: accept self-signed; --http1.1: force ALPN http/1.1 path.
-    std::string cmd = "curl -sk --http1.1 --max-time 5 " + url + " 2>/dev/null";
+    // Redirect stderr with a shell-appropriate null device — `2>/dev/null`
+    // is not valid under cmd.exe (_popen on Windows) and yields an empty body.
 #if defined(_WIN32)
+    std::string cmd = "curl -sk --http1.1 --max-time 5 \"" + url + "\" 2>NUL";
     FILE* pipe = _popen(cmd.c_str(), "r");
 #else
+    std::string cmd = "curl -sk --http1.1 --max-time 5 '" + url + "' 2>/dev/null";
     FILE* pipe = popen(cmd.c_str(), "r");
 #endif
     if (pipe == nullptr) {
@@ -96,8 +100,6 @@ auto curl_get(const std::string& url) -> std::string {
 
 class HttpTlsTest : public ::testing::TestWithParam<DispatcherKind> {
   protected:
-    static constexpr uint16_t kPort = 18443;
-
     void SetUp() override {
         auto [cert, key] = spaznet::detail::make_self_signed_pem("localhost");
         spaznet::TlsConfig cfg;
@@ -107,9 +109,10 @@ class HttpTlsTest : public ::testing::TestWithParam<DispatcherKind> {
 
         server_ = std::make_unique<spaznet::Server>(2);
         install_dispatcher(*server_, std::make_unique<TlsHello>(), GetParam());
-        server_->listen_tls(kPort, std::move(cfg));
+        port_ = listen_tls_on_random_port(*server_, std::move(cfg));
+        ASSERT_NE(port_, 0u);
         thread_ = std::thread([this]() { server_->run(); });
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
     void TearDown() override {
@@ -123,13 +126,14 @@ class HttpTlsTest : public ::testing::TestWithParam<DispatcherKind> {
 
     std::unique_ptr<spaznet::Server> server_;
     std::thread thread_;
+    uint16_t port_{0};
 };
 
 TEST_P(HttpTlsTest, CurlHttpsGet) {
     if (!curl_available()) {
         GTEST_SKIP() << "curl not available";
     }
-    auto body = curl_get("https://127.0.0.1:" + std::to_string(kPort) + "/");
+    auto body = curl_get("https://127.0.0.1:" + std::to_string(port_) + "/");
     EXPECT_EQ(body, "tls-ok");
 }
 
