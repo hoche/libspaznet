@@ -75,9 +75,16 @@ inline auto last_socket_error() -> int {
 
 inline auto is_retryable_socket_error(int err) -> bool {
 #ifdef _WIN32
-    return err == WSAEWOULDBLOCK || err == WSAEINTR || err == WSAEINPROGRESS;
+    // WSAENOBUFS: non-blocking send can report this when the socket
+    // buffer is full (same "try again later" meaning as WSAEWOULDBLOCK).
+    return err == WSAEWOULDBLOCK || err == WSAEINTR || err == WSAEINPROGRESS ||
+           err == WSAENOBUFS;
 #else
-    return err == EAGAIN || err == EWOULDBLOCK || err == EINTR;
+    // ENOBUFS: Darwin/BSD unix and UDP sockets often return this instead
+    // of EAGAIN when the send buffer is full; treat it as WouldBlock so
+    // OutputBuffer/BufferedConnection re-arm write interest rather than
+    // failing the connection.
+    return err == EAGAIN || err == EWOULDBLOCK || err == EINTR || err == ENOBUFS;
 #endif
 }
 

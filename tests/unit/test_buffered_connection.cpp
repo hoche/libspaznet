@@ -90,6 +90,15 @@ template <typename Pred> auto wait_until(Pred pred, std::chrono::milliseconds ti
     return pred();
 }
 
+// Shrink both the writer's send buffer and the peer's receive buffer so a
+// large write is forced to WouldBlock. SO_SNDBUF alone is unreliable:
+// Darwin and Windows often clamp or ignore small values, and a large peer
+// RCVBUF lets the kernel accept megabytes before backpressuring.
+void shrink_pipe_buffers(int write_fd, int read_fd, int bytes = 4096) {
+    detail::setsockopt_int(write_fd, SOL_SOCKET, SO_SNDBUF, bytes);
+    detail::setsockopt_int(read_fd, SOL_SOCKET, SO_RCVBUF, bytes);
+}
+
 // BufferedConnection has no internal locking: write()/close()/
 // close_after_flush()/pending_write_bytes()/closed() all assume the
 // caller is on the same thread that drives this connection's
@@ -233,22 +242,21 @@ TEST(OutputBufferTest, PartialFlushLeavesRemainderPendingUntilDrained) {
     ASSERT_GE(pair.a, 0);
     ASSERT_GE(pair.b, 0);
 
-    // Shrink the send buffer so a payload larger than it forces a partial
-    // (WouldBlock) write without needing megabytes of data.
-    int small_buf = 4096;
-    detail::setsockopt_int(pair.a, SOL_SOCKET, SO_SNDBUF, small_buf);
+    // Shrink both ends so a payload larger than the pipe forces a partial
+    // (WouldBlock) write without needing tens of megabytes of data.
+    shrink_pipe_buffers(pair.a, pair.b);
 
     OutputBuffer out;
-    std::vector<uint8_t> payload(1 << 20, 'z'); // 1 MiB, comfortably larger than the send buffer
+    std::vector<uint8_t> payload(1 << 20, 'z'); // 1 MiB, comfortably larger than the pipe
     out.append(payload);
 
     auto first = out.try_flush(pair.a);
-    // Either it all fit (unlikely with a shrunk buffer and no reader
+    // Either it all fit (unlikely with a shrunk pipe and no reader
     // draining) or it didn't; either way pending() must reflect reality.
     if (first == OutputBuffer::Result::Flushed) {
         EXPECT_TRUE(out.empty());
     } else {
-        ASSERT_EQ(first, OutputBuffer::Result::WouldBlock);
+        ASSERT_EQ(first, OutputBuffer::Result::WouldBlock) << "errno=" << detail::last_socket_error();
         EXPECT_GT(out.pending(), 0u);
     }
 
@@ -258,14 +266,17 @@ TEST(OutputBufferTest, PartialFlushLeavesRemainderPendingUntilDrained) {
     std::size_t total_received = 0;
     std::array<char, 65536> recv_buf{};
     bool flushed = (first == OutputBuffer::Result::Flushed);
+    bool saw_error = false;
     ASSERT_TRUE(wait_until(
         [&]() {
             if (!flushed) {
                 auto r = out.try_flush(pair.a);
                 if (r == OutputBuffer::Result::Flushed) {
                     flushed = true;
+                } else if (r == OutputBuffer::Result::Error) {
+                    saw_error = true;
+                    return true;
                 }
-                EXPECT_NE(r, OutputBuffer::Result::Error);
             }
             for (;;) {
                 ssize_t n = detail::socket_recv(pair.b, recv_buf.data(), recv_buf.size(), 0);
@@ -276,7 +287,8 @@ TEST(OutputBufferTest, PartialFlushLeavesRemainderPendingUntilDrained) {
             }
             return flushed && total_received == payload.size();
         },
-        3000ms));
+        5000ms));
+    ASSERT_FALSE(saw_error) << "try_flush hard-failed with errno=" << detail::last_socket_error();
 
     EXPECT_EQ(total_received, payload.size());
     detail::close_socket_fd(pair.a);
@@ -313,8 +325,7 @@ TEST_F(BufferedConnectionTest, LargeWriteTogglesWriteInterestThenDrains) {
     SocketPair pair;
     ASSERT_GE(pair.a, 0);
     ASSERT_GE(pair.b, 0);
-    int small_buf = 4096;
-    detail::setsockopt_int(pair.a, SOL_SOCKET, SO_SNDBUF, small_buf);
+    shrink_pipe_buffers(pair.a, pair.b);
 
     auto conn = std::make_shared<BufferedConnection>(*context, pair.a);
     pair.a = -1;
@@ -353,8 +364,7 @@ TEST_F(BufferedConnectionTest, BytesBufferedStatDrainsToZeroOnceFlushed) {
     SocketPair pair;
     ASSERT_GE(pair.a, 0);
     ASSERT_GE(pair.b, 0);
-    int small_buf = 4096;
-    detail::setsockopt_int(pair.a, SOL_SOCKET, SO_SNDBUF, small_buf);
+    shrink_pipe_buffers(pair.a, pair.b);
 
     auto conn = std::make_shared<BufferedConnection>(*context, pair.a);
     pair.a = -1;
@@ -382,16 +392,24 @@ TEST_F(BufferedConnectionTest, BytesBufferedStatDroppedOnCloseWithPendingData) {
     SocketPair pair;
     ASSERT_GE(pair.a, 0);
     ASSERT_GE(pair.b, 0);
-    int small_buf = 4096;
-    detail::setsockopt_int(pair.a, SOL_SOCKET, SO_SNDBUF, small_buf);
+    shrink_pipe_buffers(pair.a, pair.b);
 
     auto conn = std::make_shared<BufferedConnection>(*context, pair.a);
     pair.a = -1;
     conn->start();
 
-    std::vector<uint8_t> payload(1 << 20, 'z'); // 1 MiB; peer never reads, so this stays queued
-    on_io_thread(*context, [&]() { conn->write(payload); });
-    ASSERT_GT(context->get_statistics().bytes_buffered, 0u);
+    // Peer never reads. Keep writing until OutputBuffer still holds bytes
+    // (kernel pipe full). A single 1 MiB write is usually enough once both
+    // ends are shrunk, but Windows/Darwin can still accept more than the
+    // requested SO_*BUF, so loop.
+    std::vector<uint8_t> payload(1 << 20, 'z');
+    std::size_t pending = 0;
+    for (int i = 0; i < 64 && pending == 0; ++i) {
+        on_io_thread(*context, [&]() { conn->write(payload); });
+        pending = on_io_thread(*context, [&]() { return conn->pending_write_bytes(); });
+    }
+    ASSERT_GT(pending, 0u) << "could not create send backpressure on this platform";
+    ASSERT_EQ(context->get_statistics().bytes_buffered, pending);
 
     on_io_thread(*context, [&]() { conn->close(); });
     EXPECT_EQ(context->get_statistics().bytes_buffered, 0u);
@@ -414,18 +432,24 @@ TEST_F(BufferedConnectionTest, CloseAfterFlushWaitsForPendingWriteToDrainFirst) 
     SocketPair pair;
     ASSERT_GE(pair.a, 0);
     ASSERT_GE(pair.b, 0);
-    int small_buf = 4096;
-    detail::setsockopt_int(pair.a, SOL_SOCKET, SO_SNDBUF, small_buf);
+    shrink_pipe_buffers(pair.a, pair.b);
 
     auto conn = std::make_shared<BufferedConnection>(*context, pair.a);
     pair.a = -1;
     conn->start();
 
-    std::vector<uint8_t> payload(1 << 20, 'q'); // 1 MiB; peer will drain it below
-    on_io_thread(*context, [&]() {
-        conn->write(payload);
-        conn->close_after_flush();
-    });
+    // Fill until something is still queued, then arm close_after_flush.
+    // Peer drains below; until then the connection must stay open.
+    std::vector<uint8_t> payload(1 << 20, 'q');
+    std::size_t bytes_written = 0;
+    std::size_t pending = 0;
+    for (int i = 0; i < 64 && pending == 0; ++i) {
+        on_io_thread(*context, [&]() { conn->write(payload); });
+        bytes_written += payload.size();
+        pending = on_io_thread(*context, [&]() { return conn->pending_write_bytes(); });
+    }
+    ASSERT_GT(pending, 0u) << "could not create send backpressure on this platform";
+    on_io_thread(*context, [&]() { conn->close_after_flush(); });
     // Must not have closed yet — bytes are still queued and the peer
     // hasn't read anything.
     EXPECT_FALSE(on_io_thread(*context, [&]() { return conn->closed(); }));
@@ -455,7 +479,7 @@ TEST_F(BufferedConnectionTest, CloseAfterFlushWaitsForPendingWriteToDrainFirst) 
         },
         5000ms));
 
-    EXPECT_EQ(total_received, payload.size())
+    EXPECT_EQ(total_received, bytes_written)
         << "close_after_flush() must not truncate data queued before it was called";
     EXPECT_TRUE(on_io_thread(*context, [&]() { return conn->closed(); }));
 }
