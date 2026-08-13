@@ -140,9 +140,9 @@
 
   <!-- Caption -->
   <text class="label" x="490" y="680" style="font-size:12px; fill:#666">
-    A single IOContext owns the event loop, worker pool, and platform-I/O demultiplexer. Coroutines
+    One IOContext owns the event loop, worker pool, and platform-I/O demultiplexer (Server(N) / loops=1).
   </text>
   <text class="label" x="490" y="698" style="font-size:12px; fill:#666">
-    suspended on I/O or timers are resumed by the main loop and dispatched to workers via round-robin queues.
+    Coroutines migrate via worker queues; reactor IoHandlers stay on the run() thread. For N reactor loops see threading-reactor-loops.svg.
   </text>
 </svg>

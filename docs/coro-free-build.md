@@ -227,8 +227,9 @@ A new reactor dispatcher's completion path should too — see
 the full rationale, including why this replaced a per-connection
 `recursive_mutex` in HTTP/2 rather than living alongside one. That
 model is one loop per `IOContext`; `Server(N)`'s worker threads do not
-scale reactor I/O. The design that would is N independent loops —
-see [`reactor-threading.md`](reactor-threading.md).
+scale reactor I/O. Use `Server(ServerConfig{.loops = N})` for N
+independent loops with accept-and-shard — see
+[`reactor-threading.md`](reactor-threading.md).
 
 ## Verifying a change under both configurations
 

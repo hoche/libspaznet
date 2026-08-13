@@ -13,7 +13,11 @@
 #include <libspaznet/detail/socket_compat.hpp>
 #include <libspaznet/reactor/buffered_connection.hpp>
 #include <libspaznet/server.hpp>
+#include <mutex>
+#include <string>
 #include <thread>
+#include <unordered_set>
+#include <vector>
 
 #ifdef _WIN32
 #define close_socket closesocket
@@ -205,4 +209,79 @@ TEST_F(ServerReactorTest, FactoryDecliningConnectionDoesNotLeakOrHang) {
 
     close_socket(sock);
     EXPECT_EQ(server->get_statistics().active_connections, 0u);
+}
+
+// Accept-and-shard: with loops > 1, each accepted connection is pinned to
+// one of N independent IOContexts. Concurrent echoes must still work, and
+// stop() must drain connections on every loop.
+TEST_F(ServerReactorTest, MultiLoopAcceptAndShardEchoesAndStops) {
+    constexpr std::size_t kLoops = 4;
+    constexpr int kClients = 8;
+    server = std::make_unique<Server>(ServerConfig{.loops = kLoops, .workers_per_loop = 0});
+    EXPECT_EQ(server->loop_count(), kLoops);
+
+    std::mutex seen_mu;
+    std::unordered_set<IOContext*> seen_contexts;
+    server->set_connection_factory(
+        [&](int fd, IOContext& ctx,
+            std::function<void()> on_closed) -> std::shared_ptr<IoHandler> {
+            {
+                std::lock_guard<std::mutex> lock(seen_mu);
+                seen_contexts.insert(&ctx);
+            }
+            auto conn = std::make_shared<BufferedConnection>(ctx, fd);
+            conn->set_on_data([weak = std::weak_ptr<BufferedConnection>(conn)]() {
+                auto c = weak.lock();
+                if (!c) {
+                    return;
+                }
+                std::vector<uint8_t> echoed(c->input().data().begin(), c->input().data().end());
+                c->input().consume(echoed.size());
+                c->write(std::move(echoed));
+            });
+            conn->set_on_closed(std::move(on_closed));
+            conn->start();
+            return conn;
+        });
+
+    server->listen_tcp(19904);
+    server_thread = std::thread([this]() { server->run(); });
+    std::this_thread::sleep_for(100ms);
+
+    std::vector<int> socks;
+    socks.reserve(kClients);
+    for (int i = 0; i < kClients; ++i) {
+        int sock = connect_to(19904);
+        ASSERT_GE(sock, 0);
+        socks.push_back(sock);
+    }
+    ASSERT_TRUE(wait_until(
+        [&] { return server->get_statistics().active_connections == static_cast<std::size_t>(kClients); }));
+
+    for (int i = 0; i < kClients; ++i) {
+        std::string msg = "p" + std::to_string(i);
+        ASSERT_EQ(detail::socket_send(socks[static_cast<std::size_t>(i)], msg.data(), msg.size(), 0),
+                  static_cast<ssize_t>(msg.size()));
+        std::array<char, 16> buf{};
+        ssize_t n = detail::socket_recv(socks[static_cast<std::size_t>(i)], buf.data(), buf.size(), 0);
+        ASSERT_EQ(n, static_cast<ssize_t>(msg.size()));
+        EXPECT_EQ(std::string(buf.data(), static_cast<std::size_t>(n)), msg);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(seen_mu);
+        // Round-robin across 8 accepts onto 4 loops should touch more than one
+        // context; ideally all four, but at least prove sharding happened.
+        EXPECT_GT(seen_contexts.size(), 1u);
+    }
+
+    server->stop();
+    EXPECT_EQ(server->get_statistics().active_connections, 0u);
+
+    for (int sock : socks) {
+        std::array<char, 16> buf{};
+        ssize_t n = detail::socket_recv(sock, buf.data(), buf.size(), 0);
+        EXPECT_LE(n, 0);
+        close_socket(sock);
+    }
 }

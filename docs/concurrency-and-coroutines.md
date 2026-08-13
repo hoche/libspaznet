@@ -137,9 +137,8 @@ caller per `IOContext`. `num_threads_` workers add parallelism for
 CPU-bound coroutine `Task`s and `post()`ed callbacks that don't touch
 `BufferedConnection` state directly, not for the I/O readiness loop.
 Sharding across N independent loops, each with its own connections
-pinned to it, would need a different (bigger) change than this one; see
-[`reactor-threading.md`](reactor-threading.md) for the analysis and the
-design that would actually scale reactor I/O across cores.
+pinned at accept, is available via `Server(ServerConfig{.loops = N})`
+(accept-and-shard). See [`reactor-threading.md`](reactor-threading.md).
 
 ## TaskQueue Internal Structure
 

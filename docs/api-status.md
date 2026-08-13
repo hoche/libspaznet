@@ -13,7 +13,7 @@ PlatformIO.
 
 | Subsystem | Public type / entry point | Status | Notes |
 |---|---|---|---|
-| Core | `spaznet::Server` | **Stable** | Public API. `set_connection_handler(ConnectionHandler)` + `set_datagram_handler(DatagramHandler)` are the dispatch hooks; the example libraries provide `make_dispatcher(...)` factories. |
+| Core | `spaznet::Server` / `spaznet::ServerConfig` | **Stable** | Public API. `Server(N)` = 1 loop + N coroutine workers; `Server(ServerConfig{.loops=N})` = N independent loops with TCP accept-and-shard for reactor connections (UDP stays on loop 0). `set_connection_handler` / `set_datagram_handler` (coroutine) and `set_connection_factory` / `set_sync_datagram_handler` (reactor) are the dispatch hooks; the example libraries provide `make_dispatcher(...)` / `make_reactor_dispatcher(...)` factories. See `docs/reactor-threading.md`. |
 | Core | `spaznet::Socket` | **Stable** | Move-only. `async_read` / `async_write` / `close`. Not safe to share across coroutines on different threads. |
 | Core | `spaznet::Datagram` | **Stable** | Plain struct: bytes + peer addr + raw sockaddr_storage + listen fd. Passed to `DatagramHandler` callbacks. |
 | Core | `spaznet::ConnectionHandler` / `spaznet::DatagramHandler` | **Stable** | `std::function<Task(Socket)>` / `std::function<Task(Datagram)>` typedefs. |

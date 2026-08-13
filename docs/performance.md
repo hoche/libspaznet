@@ -60,6 +60,22 @@ Pure accept/teardown rate. Throughput is nearly flat across thread
 counts — accept-path contention, not framework headroom. For this
 workload, **`Server(0)` is the right choice**.
 
+### HTTP/1.1 reactor multi-loop (bench_thread_modes, 2026-08-13)
+
+Same `BenchHandler` as the coroutine path; reactor uses
+`Server(ServerConfig{.loops = N})` (accept-and-shard). Full tables:
+[`../thread_mode_report.md`](../thread_mode_report.md).
+
+| body (req/resp) | Reactor @ loops=1 | Reactor best | Coroutine best |
+|---|---:|---:|---:|
+| 64 KiB / 64 KiB | ~13k rps | ~67k @ loops=32 | ~90k @ workers=8 |
+| 64 KiB / 256 KiB | ~4.0k rps | ~45k @ loops=16 | ~58k @ workers=16 |
+
+Before accept-and-shard, reactor large-body rps was flat across
+`Server(N)` workers (~13k / ~3.9k). Extra **loops** are what move the
+dial for reactor I/O; extra workers still only help coroutines. See
+[`reactor-threading.md`](reactor-threading.md).
+
 ## Headline numbers — Mac M1 (Apple Silicon, 14 cores, 2026-05-30)
 
 macOS loopback is much harsher on multi-stream than Linux (the kernel
@@ -192,24 +208,28 @@ In order of how much they move the dial:
   HTTP/WebSocket paths are unchanged; QUIC code links in but doesn't
   run.
 - **`SPAZNET_ENABLE_COROUTINES=ON` vs `OFF`.** `thread_mode_report.md`
-  (root of the repo) benchmarks the `coroutine` (`Task`/`co_await`)
-  and `reactor` (plain callbacks) dispatchers side by side against the
-  identical `BenchHandler` over the identical wire protocol; the two
-  columns track each other within normal run-to-run noise at every
-  thread count. Coroutine frame allocation shows up in profiles (see
-  above) but isn't the dominant cost. See `docs/coro-free-build.md`
-  for what's actually gated by the flag.
+  (root of the repo) benchmarks the `coroutine` (`Task`/`co_await` on
+  `Server(N)` workers) and `reactor` (callbacks on
+  `ServerConfig{loops=N}` accept-and-shard) dispatchers side by side
+  against the identical `BenchHandler`. Large-body reactor rows should
+  now rise with `loops` the way coroutine rows rise with workers; see
+  [`reactor-threading.md`](reactor-threading.md). Coroutine frame
+  allocation shows up in profiles (see above) but isn't the dominant
+  cost. See `docs/coro-free-build.md` for what's actually gated by the
+  flag.
 - **clang-tidy / cppcheck warnings.** These don't generate code.
 
 ## Related
 
-- [`threading.md`](threading.md) — picking `N` for your workload
-- [`reactor-threading.md`](reactor-threading.md) — why reactor
-  throughput is flat across `N`, and the multi-loop design that
-  would change that
+- [`threading.md`](threading.md) — picking workers vs loops for your
+  workload
+- [`reactor-threading.md`](reactor-threading.md) — accept-and-shard
+  multi-loop reactor I/O scaling (`ServerConfig{.loops = N}`)
 - [`mutex-vs-atomics.md`](mutex-vs-atomics.md) — why the hot path is
   almost lock-free
 - [`quic-profile-2026-05-29.md`](quic-profile-2026-05-29.md) —
   callgrind output snapshot, post-rewrite
 - [`concurrency-and-coroutines.md`](concurrency-and-coroutines.md) —
   what `co_await` actually compiles to
+- [`../thread_mode_report.md`](../thread_mode_report.md) — latest
+  coroutine-vs-reactor sweep (workers vs loops)

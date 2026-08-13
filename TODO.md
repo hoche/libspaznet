@@ -4,7 +4,7 @@
 - [x] Fix Windows IOCP backend (readiness demux; `-DSPAZNET_FORCE_POLL=ON` fallback)
 - [x] Add non-coroutine reactor model
 
-- Fix reactor model's threading system: N independent event loops for reactor I/O scaling. `Server(N)` still means one loop plus N coroutine workers; reactor `on_readable` / `on_writable` never leave the `run()` thread, so extra workers do not raise reactor rps. Analysis and proposed accept-and-shard design: `docs/reactor-threading.md`.
+- [x] Fix reactor model's threading system: N independent event loops via `ServerConfig{.loops = N}` and accept-and-shard. `Server(N)` keeps its coroutine meaning (1 loop + N workers); reactor TCP connections round-robin onto the loops. UDP stays on loop 0. See `docs/reactor-threading.md`.
 - TLS addition. Already in QUIC, of course, but needs to be added to the
 other protocols. HTTP/1.x should support both separate socket listeners
 and ALPN. Websockets should support both ws as wss.
@@ -47,6 +47,21 @@ and ALPN. Websockets should support both ws as wss.
   - HTTP Client
   - HTTP/2 Client
   - Websocket Client
+
+## Progress Summary - 2026-08-13
+
+- [x] **Reactor multi-loop accept-and-shard** — `ServerConfig{loops,N}` /
+  `Server(ServerConfig)`; `Server` owns N `IOContext`s; TCP accept on
+  loop 0 round-robins client fds onto loops; UDP stays on loop 0.
+  `Server(N)` keeps its coroutine meaning (1 loop + N workers).
+  Docs: `docs/reactor-threading.md` (now marked implemented), new SVG
+  `docs/svgs/threading-reactor-loops.svg`, updated
+  `threading-single.svg` / `threading-multi.svg` /
+  `architecture-overview.svg`.
+- [x] **`thread_mode_report.md` regenerated** — reactor large-body rps
+  now scales with `loops` (64 KiB/64 KiB ~13k → ~67k @ 32; 64 KiB/256
+  KiB ~4k → ~45k @ 16) instead of sitting flat. Full suite green with
+  coroutines ON and OFF.
 
 ## Progress Summary - 2026-08-12
 
@@ -113,13 +128,11 @@ over `DispatcherKind {Coroutine, Reactor}`.
 ### Benchmarks and docs
 
 - [x] `**thread_mode_report.md` regenerated** (f90e91f) — coroutine vs
-  reactor rows per thread count. Reactor large-body rps is flat
-  across `N` (one I/O thread); coroutine scales ~6–13× on 64 KiB+
-  bodies. iperf section is kernel-ceiling only (no dispatcher split).
-- [x] `**docs/reactor-threading.md**` — why `Server(N)` cannot scale
-  reactor I/O, and the N-loop accept-and-shard design that would.
-  Linked from `threading.md`, `concurrency-and-coroutines.md`,
-  `coro-free-build.md`, `performance.md`, and the README table.
+  reactor rows per thread count (pre-multi-loop snapshot: reactor
+  large-body flat across workers). Superseded by the 2026-08-13
+  regenerate after accept-and-shard.
+- [x] `**docs/reactor-threading.md**` — analysis that became the
+  accept-and-shard implementation (see 2026-08-13 summary).
 
 ## Progress Summary - 2026-07-18
 

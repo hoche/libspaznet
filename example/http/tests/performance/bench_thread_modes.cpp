@@ -677,7 +677,7 @@ static void print_markdown_report(const std::vector<HttpResult>& http,
     std::cout << "\n";
     std::cout << "## Thread-mode performance report\n\n";
     std::cout << "- **Host nproc**: " << nproc() << "\n";
-    std::cout << "- **Thread counts**: ";
+    std::cout << "- **N values swept**: ";
     for (std::size_t i = 0; i < thread_counts.size(); ++i) {
         if (i) {
             std::cout << ", ";
@@ -687,14 +687,28 @@ static void print_markdown_report(const std::vector<HttpResult>& http,
     std::cout << "\n";
     std::cout << "- **HTTP duration per case**: " << http_duration_s << "s\n";
     std::cout << "- **HTTP client threads**: " << client_threads << "\n";
-    std::cout << "- **iperf duration per case**: " << iperf_seconds << "s\n\n";
+    std::cout << "- **iperf duration per case**: " << iperf_seconds << "s\n";
+#ifdef SPAZNET_HAS_COROUTINES
+    std::cout << "- **Build**: coroutines-enabled (`-DSPAZNET_ENABLE_COROUTINES=ON`); both "
+                 "`coroutine` and `reactor` arms ran\n\n";
+#else
+    std::cout << "- **Build**: coroutines-disabled (`-DSPAZNET_ENABLE_COROUTINES=OFF`); "
+                 "`reactor` arm only\n\n";
+#endif
 
     std::cout << "### HTTP (libspaznet) — throughput + latency\n\n";
     std::cout << "Both dispatcher columns hit the exact same BenchHandler over the exact same "
                  "wire protocol (see docs/http.md's \"Two dispatchers, one handler\" note); "
-                 "`coroutine` uses Task/co_await + Socket::async_read/write, `reactor` uses "
-                 "plain callbacks + BufferedConnection (see the threading milestone note in "
-                 "the reactor-port plan and docs/concurrency-and-coroutines.md).\n\n";
+                 "`coroutine` uses Task/co_await + Socket::async_read/write on `Server(N)` "
+                 "(1 loop + N workers), `reactor` uses plain callbacks + BufferedConnection "
+                 "on `Server(ServerConfig{loops=N})` (N independent loops, accept-and-shard; "
+                 "see docs/reactor-threading.md). The **threads** column is workers for "
+                 "`coroutine` and loops for `reactor` (N=0 is the single-loop / non-threaded "
+                 "baseline).\n\n";
+    std::cout << "A handful of rows can show one-off low outliers from loopback "
+                 "port-reuse/TIME_WAIT when cycling thousands of short-lived connections — "
+                 "not a systematic dispatcher regression. iperf sections measure the kernel "
+                 "TCP/UDP ceiling only (no libspaznet dispatcher).\n\n";
     // Group results by (req,resp) for easier per-thread comparisons; each
     // such table interleaves both dispatchers, sorted by (dispatcher,
     // threads), so a row-by-row scan at a fixed thread count compares them
@@ -823,26 +837,36 @@ int main(int argc, char** argv) {
 #else
     std::vector<DispatcherKind> dispatcher_kinds = {DispatcherKind::Reactor};
 #endif
+    // Coroutine: Server(N) = 1 loop + N workers (historical meaning).
+    // Reactor:   ServerConfig{loops=N, workers_per_loop=0} — accept-and-shard
+    // onto N independent IOContexts (see docs/reactor-threading.md). The
+    // report's "threads" column is workers for coroutine and loops for
+    // reactor; N=0 means the single-threaded / single-loop baseline.
     for (std::size_t threads : thread_counts) {
         for (DispatcherKind kind : dispatcher_kinds) {
-            Server server(threads);
+            std::unique_ptr<Server> server;
 #ifdef SPAZNET_HAS_COROUTINES
             if (kind == DispatcherKind::Coroutine) {
-                server.set_connection_handler(
+                server = std::make_unique<Server>(threads);
+                server->set_connection_handler(
                     spaznet::http::make_dispatcher(std::make_unique<BenchHandler>()));
             } else
 #endif
             {
-                server.set_connection_factory(
+                server = std::make_unique<Server>(ServerConfig{
+                    .loops = threads == 0 ? 1 : threads,
+                    .workers_per_loop = 0,
+                });
+                server->set_connection_factory(
                     spaznet::http::make_reactor_dispatcher(std::make_unique<BenchHandler>()));
             }
-            uint16_t port = listen_on_random_port(server);
+            uint16_t port = listen_on_random_port(*server);
             if (port == 0) {
                 std::cerr << "Failed to bind server for threads=" << threads
                           << " dispatcher=" << to_string(kind) << "\n";
                 continue;
             }
-            std::thread server_thread([&]() { server.run(); });
+            std::thread server_thread([&]() { server->run(); });
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
             for (const auto& c : http_cases) {
@@ -850,7 +874,7 @@ int main(int argc, char** argv) {
                 http_results.push_back(r);
             }
 
-            server.stop();
+            server->stop();
             server_thread.join();
         }
     }

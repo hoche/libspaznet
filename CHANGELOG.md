@@ -6,6 +6,42 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
+## 2026-08-13 — Reactor multi-loop: accept-and-shard via `ServerConfig`
+
+Implements the N-loop design in `docs/reactor-threading.md`. Reactor
+TCP I/O can now scale across cores without sharing connection state
+across threads.
+
+### Added
+- `spaznet::ServerConfig { loops, workers_per_loop }` and
+  `Server(ServerConfig)`.
+- `Server::loop_count()`.
+- Accept-and-shard: listen fd on loop 0; each accepted reactor TCP
+  connection is pinned to a round-robin target `IOContext` and never
+  registered on the accept loop.
+- Integration test `ServerReactorTest.MultiLoopAcceptAndShardEchoesAndStops`.
+
+### Changed
+- `Server` owns `vector<unique_ptr<IOContext>>` instead of one context.
+  `run()` starts loops `1..N-1` on their own threads then blocks in
+  loop 0; `stop()` posts `IoHandler::shutdown()` to each owning loop
+  via `post_to_io_thread`, then stops every context.
+- `get_statistics()` aggregates across all loops.
+- `Server(N)` keeps its historical meaning (1 loop + N coroutine
+  workers). Reactor callers that want scaling must pass
+  `ServerConfig{.loops = N, .workers_per_loop = 0}`.
+- UDP / QUIC remain on loop 0 (cannot shard one datagram socket by
+  connection the way TCP fds can).
+- `bench_thread_modes` constructs reactor servers with `loops = N`
+  (the report's **threads** column is workers for coroutine, loops for
+  reactor).
+- Docs: `reactor-threading.md` marked implemented; README / `threading.md`
+  / `api-status.md` / `TODO.md` / `performance.md` updated with measured
+  multi-loop numbers. New SVG `docs/svgs/threading-reactor-loops.svg`;
+  refreshed `threading-single.svg`, `threading-multi.svg`, and the
+  architecture-overview caption. `thread_mode_report.md` regenerated
+  (reactor 64 KiB bodies now scale with `loops`).
+
 ## 2026-08-12 — Coroutine-free build: `-DSPAZNET_ENABLE_COROUTINES=OFF` builds everything
 
 Eleventh and final milestone of the reactor port (see the `coro-free-build`

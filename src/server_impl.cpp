@@ -225,10 +225,41 @@ void Socket::close() {
 
 // Server implementation
 Server::Server(std::size_t num_threads)
-    : io_context_(std::make_unique<IOContext>(num_threads)), running_(false) {}
+    : Server(ServerConfig{.loops = 1, .workers_per_loop = num_threads}) {}
+
+Server::Server(ServerConfig config) : running_(false) {
+    const std::size_t loops = std::max<std::size_t>(1, config.loops);
+    io_contexts_.reserve(loops);
+    for (std::size_t i = 0; i < loops; ++i) {
+        io_contexts_.push_back(std::make_unique<IOContext>(config.workers_per_loop));
+    }
+}
 
 Server::~Server() {
     stop();
+}
+
+auto Server::pick_accept_loop() -> IOContext& {
+    if (io_contexts_.size() == 1) {
+        return *io_contexts_.front();
+    }
+    const std::size_t idx =
+        next_accept_loop_.fetch_add(1, std::memory_order_relaxed) % io_contexts_.size();
+    return *io_contexts_[idx];
+}
+
+auto Server::get_statistics() const -> Statistics {
+    Statistics agg;
+    for (const auto& ctx : io_contexts_) {
+        const Statistics s = ctx->get_statistics();
+        agg.active_requests += s.active_requests;
+        agg.total_coroutines_created += s.total_coroutines_created;
+        agg.active_coroutines += s.active_coroutines;
+        agg.total_memory_bytes += s.total_memory_bytes;
+        agg.active_connections += s.active_connections;
+        agg.bytes_buffered += s.bytes_buffered;
+    }
+    return agg;
 }
 
 #ifdef SPAZNET_HAS_COROUTINES
@@ -249,12 +280,14 @@ void Server::set_sync_datagram_handler(SyncDatagramHandler handler) {
     sync_datagram_handler_ = std::move(handler);
 }
 
-void Server::finish_reactor_connection(int fd) {
+void Server::finish_reactor_connection(int fd, IOContext* ctx) {
     {
         std::lock_guard<std::mutex> lock(reactor_conns_mutex_);
         reactor_connections_.erase(fd);
     }
-    io_context_->decrement_active_connections();
+    if (ctx != nullptr) {
+        ctx->decrement_active_connections();
+    }
 }
 
 // Persistent reactor handler for a listening TCP socket: on_readable()
@@ -275,7 +308,8 @@ class Server::ListenHandler : public IoHandler,
 
     void on_readable() override {
         if (server_.accept_ready(fd_)) {
-            server_.io_context_->set_io_handler(fd_, PlatformIO::EVENT_READ, shared_from_this());
+            server_.primary_context().set_io_handler(fd_, PlatformIO::EVENT_READ,
+                                                     shared_from_this());
         }
     }
     void on_writable() override {}
@@ -293,7 +327,8 @@ class Server::DatagramReadHandler : public IoHandler,
 
     void on_readable() override {
         if (server_.datagram_ready(fd_)) {
-            server_.io_context_->set_io_handler(fd_, PlatformIO::EVENT_READ, shared_from_this());
+            server_.primary_context().set_io_handler(fd_, PlatformIO::EVENT_READ,
+                                                     shared_from_this());
         }
     }
     void on_writable() override {}
@@ -359,8 +394,8 @@ void Server::listen_tcp(uint16_t port) {
     // Register a persistent reactor handler on the IOContext (works in
     // both threaded and non-threaded modes, no coroutine involved) — see
     // ListenHandler below and accept_ready()'s comment in server.hpp.
-    io_context_->set_io_handler(listen_fd, PlatformIO::EVENT_READ,
-                                std::make_shared<ListenHandler>(*this, listen_fd));
+    primary_context().set_io_handler(listen_fd, PlatformIO::EVENT_READ,
+                                     std::make_shared<ListenHandler>(*this, listen_fd));
 }
 
 void Server::listen_udp(uint16_t port) {
@@ -404,8 +439,10 @@ void Server::listen_udp(uint16_t port) {
         std::lock_guard<std::mutex> lock(listen_fds_mutex_);
         listen_fds_.push_back(udp_fd);
     }
-    io_context_->set_io_handler(udp_fd, PlatformIO::EVENT_READ,
-                                std::make_shared<DatagramReadHandler>(*this, udp_fd));
+    // UDP stays on loop 0 until a later SO_REUSEPORT / CID-hash design —
+    // one datagram socket cannot be sharded by connection the way TCP fds can.
+    primary_context().set_io_handler(udp_fd, PlatformIO::EVENT_READ,
+                                     std::make_shared<DatagramReadHandler>(*this, udp_fd));
 }
 
 bool Server::datagram_ready(int udp_fd) {
@@ -476,7 +513,7 @@ bool Server::datagram_ready(int udp_fd) {
             dg.peer_len = addr_len;
             dg.fd = udp_fd;
             try {
-                io_context_->schedule(datagram_handler_(std::move(dg)));
+                primary_context().schedule(datagram_handler_(std::move(dg)));
             } catch (...) {
             }
         }
@@ -506,16 +543,20 @@ bool Server::accept_ready(int listen_fd) {
 
         // Reactor path takes precedence over the coroutine-based
         // connection_handler_ (see ConnectionFactory's docs above).
+        // Accept-and-shard: the listen fd stays on loop 0; the client fd is
+        // handed to a target loop and never registered on the accept loop.
         if (connection_factory_) {
             int fd = client_fd; // captured by value below; client_fd is reused next loop iteration
-            auto on_closed = [this, fd]() { finish_reactor_connection(fd); };
-            auto handler = connection_factory_(client_fd, *io_context_, std::move(on_closed));
+            IOContext* target = &pick_accept_loop();
+            auto on_closed = [this, fd, target]() { finish_reactor_connection(fd, target); };
+            auto handler = connection_factory_(client_fd, *target, std::move(on_closed));
             if (handler) {
                 {
                     std::lock_guard<std::mutex> lock(reactor_conns_mutex_);
-                    reactor_connections_[client_fd] = std::move(handler);
+                    reactor_connections_[client_fd] =
+                        ReactorConn{std::move(handler), target};
                 }
-                io_context_->increment_active_connections();
+                target->increment_active_connections();
             } else {
                 // Factory declined the connection outright (e.g. some
                 // limit); nothing registered it for events, so close it
@@ -526,9 +567,10 @@ bool Server::accept_ready(int listen_fd) {
         }
 
 #ifdef SPAZNET_HAS_COROUTINES
-        // Create socket and handle connection
-        Socket socket(client_fd, io_context_.get());
-        io_context_->schedule(handle_connection(std::move(socket)));
+        // Coroutine connections stay on loop 0 so Server(N) keeps its
+        // historical "workers on one loop" meaning.
+        Socket socket(client_fd, &primary_context());
+        primary_context().schedule(handle_connection(std::move(socket)));
 #else
         // No connection_factory_ installed and no coroutine runtime to
         // fall back to — nothing can drive this connection, so drop it
@@ -551,7 +593,7 @@ bool Server::accept_ready(int listen_fd) {
         }
     }
     if (should_close) {
-        io_context_->remove_io(listen_fd);
+        primary_context().remove_io(listen_fd);
         close_socket(listen_fd);
     }
     return false;
@@ -578,7 +620,7 @@ Task Server::handle_connection(Socket socket) {
                 // Statistics::active_connections) so get_statistics() is
                 // accurate whether this Server uses the coroutine path,
                 // the reactor path, or — during migration — both.
-                server->io_context_->increment_active_connections();
+                server->primary_context().increment_active_connections();
             }
             ~ConnGuard() {
                 {
@@ -586,7 +628,7 @@ Task Server::handle_connection(Socket socket) {
                     server->active_client_fds_.erase(fd);
                 }
                 server->active_connections_.fetch_sub(1, std::memory_order_acq_rel);
-                server->io_context_->decrement_active_connections();
+                server->primary_context().decrement_active_connections();
             }
             ConnGuard(const ConnGuard&) = delete;
             ConnGuard& operator=(const ConnGuard&) = delete;
@@ -607,7 +649,22 @@ Task Server::handle_connection(Socket socket) {
 #endif // SPAZNET_HAS_COROUTINES
 
 void Server::run() {
-    io_context_->run();
+    // Start loops 1..N-1 on their own threads, then block in loop 0.
+    // Accept stays on loop 0; reactor connections may already be registered
+    // on secondary loops by the time those threads enter run() — set_io_handler
+    // before wait() is fine (interest is recorded, events fire once wait runs).
+    loop_threads_.clear();
+    loop_threads_.reserve(io_contexts_.size() > 0 ? io_contexts_.size() - 1 : 0);
+    for (std::size_t i = 1; i < io_contexts_.size(); ++i) {
+        loop_threads_.emplace_back([this, i]() { io_contexts_[i]->run(); });
+    }
+    primary_context().run();
+    for (auto& t : loop_threads_) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+    loop_threads_.clear();
 }
 
 void Server::stop() {
@@ -616,7 +673,7 @@ void Server::stop() {
 
     // Step 2: close listening sockets so accept coroutines unwind. We do
     // this BEFORE asking the IOContext to stop so the event loop can keep
-    // processing the unwinds.
+    // processing the unwinds. Listen/UDP fds live only on loop 0.
     std::vector<int> fds;
     {
         std::lock_guard<std::mutex> lock(listen_fds_mutex_);
@@ -626,7 +683,7 @@ void Server::stop() {
         if (fd < 0) {
             continue;
         }
-        io_context_->remove_io(fd);
+        primary_context().remove_io(fd);
         close_socket(fd);
     }
 
@@ -655,38 +712,51 @@ void Server::stop() {
     // just hand each one's shared_ptr to IoHandler::shutdown() (which, for
     // BufferedConnection, closes the fd and fires its on_closed hook,
     // which in turn calls finish_reactor_connection() below). Routed
-    // through IOContext::post_to_io_thread() (not the round-robining
-    // post()) so this is GUARANTEED to run on the IO thread instead of
-    // racing this thread (stop() may be called from any thread) — or a
-    // worker thread, which plain post() could otherwise hand it to — against
-    // in-flight on_readable()/on_writable() calls for the same connections.
-    // This is the same affinity guarantee every reactor dispatcher's own
-    // ResponseWriter completion now relies on; see
-    // docs/concurrency-and-coroutines.md's threading section.
+    // through each owning loop's IOContext::post_to_io_thread() (not the
+    // round-robining post()) so this is GUARANTEED to run on that
+    // connection's IO thread instead of racing this thread (stop() may be
+    // called from any thread) — or a worker thread, which plain post()
+    // could otherwise hand it to — against in-flight
+    // on_readable()/on_writable() calls for the same connections.
     //
-    // `done` is heap-allocated (not captured by reference) because if
-    // run() was never called, or the loop has already exited,
-    // post_to_io_thread() never executes this and the bounded wait below
-    // simply times out; the lambda — and the connections it would have
-    // shut down — leak, on the same "don't deadlock stop()" basis the
-    // coroutine drain below accepts.
+    // Done flags are heap-allocated because if run() was never called, or
+    // a loop has already exited, post_to_io_thread() never executes and
+    // the bounded wait below simply times out; the lambda — and the
+    // connections it would have shut down — leak, on the same "don't
+    // deadlock stop()" basis the coroutine drain below accepts.
     {
-        auto done = std::make_shared<std::atomic<bool>>(false);
-        io_context_->post_to_io_thread([this, done]() {
-            std::unordered_map<int, std::shared_ptr<IoHandler>> conns;
-            {
-                std::lock_guard<std::mutex> lock(reactor_conns_mutex_);
-                conns.swap(reactor_connections_);
+        std::unordered_map<int, ReactorConn> conns;
+        {
+            std::lock_guard<std::mutex> lock(reactor_conns_mutex_);
+            conns.swap(reactor_connections_);
+        }
+        std::unordered_map<IOContext*, std::vector<std::shared_ptr<IoHandler>>> by_ctx;
+        by_ctx.reserve(io_contexts_.size());
+        for (auto& [fd, entry] : conns) {
+            (void)fd;
+            if (entry.ctx != nullptr && entry.handler) {
+                by_ctx[entry.ctx].push_back(std::move(entry.handler));
             }
-            for (auto& [fd, handler] : conns) {
-                handler->shutdown();
-            }
-            done->store(true, std::memory_order_release);
-        });
+        }
+        std::vector<std::shared_ptr<std::atomic<bool>>> dones;
+        dones.reserve(by_ctx.size());
+        for (auto& [ctx, handlers] : by_ctx) {
+            auto done = std::make_shared<std::atomic<bool>>(false);
+            dones.push_back(done);
+            ctx->post_to_io_thread(
+                [handlers = std::move(handlers), done]() mutable {
+                    for (auto& handler : handlers) {
+                        handler->shutdown();
+                    }
+                    done->store(true, std::memory_order_release);
+                });
+        }
         const auto reactor_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-        while (!done->load(std::memory_order_acquire) &&
-               std::chrono::steady_clock::now() < reactor_deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        for (const auto& done : dones) {
+            while (!done->load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < reactor_deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
         }
     }
 
@@ -703,11 +773,14 @@ void Server::stop() {
     }
 #endif // SPAZNET_HAS_COROUTINES
 
-    // Step 5: signal the IOContext loop to exit. After this returns,
-    // worker threads (joined inside IOContext::run) will terminate. Any
-    // coroutines still suspended past the drain deadline will leak — we
-    // accept that over a deadlocked shutdown.
-    io_context_->stop();
+    // Step 5: signal every IOContext loop to exit. After primary run()
+    // returns, Server::run() joins the secondary loop threads. Worker
+    // threads inside each IOContext are joined by that context's run().
+    // Any coroutines still suspended past the drain deadline will leak —
+    // we accept that over a deadlocked shutdown.
+    for (auto& ctx : io_contexts_) {
+        ctx->stop();
+    }
 }
 
 // NOLINTEND(

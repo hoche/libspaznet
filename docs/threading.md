@@ -1,45 +1,57 @@
 # Threading model and tuning
 
-`Server` takes a single integer at construction:
+`Server` exposes two axes of parallelism via `ServerConfig`:
 
 ```cpp
-spaznet::Server server(N);
+struct ServerConfig {
+    std::size_t loops = 1;            // independent IOContext instances
+    std::size_t workers_per_loop = 0; // coroutine worker threads per loop
+};
+
+spaznet::Server server(N);                              // == {loops=1, workers_per_loop=N}
+spaznet::Server reactor(ServerConfig{.loops = N});      // N loops, accept-and-shard
 ```
 
-`N == 0` is **single-thread mode**. `N >= 1` spawns N IO worker threads.
+- `Server(0)` / `ServerConfig{1, 0}` — **single loop**, no workers
+- `Server(N)` / `ServerConfig{1, N}` — **one loop + N coroutine workers**
+- `Server(ServerConfig{.loops = N})` — **N loops** for reactor TCP I/O
+
 This page covers what that means in practice and how to pick a value.
+For the reactor multi-loop design see [`reactor-threading.md`](reactor-threading.md).
 
-## Single-thread mode (`Server(0)`)
+## Single-loop mode (`Server(0)`)
 
-![Single-thread layout](svgs/threading-single.svg)
+![Single-loop layout](svgs/threading-single.svg)
 
-The thread that calls `Server::run()` owns the IOContext loop *and*
-runs every coroutine. Coroutines never migrate; resume is always
-inline on the calling thread.
+The thread that calls `Server::run()` owns the one `IOContext` loop and
+runs every coroutine resume and every reactor `IoHandler` callback
+inline. Nothing migrates; there are no worker threads.
 
 Properties:
 
 - No cross-thread synchronization on the hot path. Reads and writes to
   any data structure your handler owns are race-free.
 - Latency is excellent (no scheduling delay).
-- Throughput is bounded by what one core can do. Past that point you
-  need multi-thread mode or a second server process.
+- Throughput is bounded by what one core can do. Past that point
+  coroutines want workers (`Server(N)`); reactors want loops
+  (`ServerConfig{.loops = N}`).
 
-Use single-thread mode when:
+Use single-loop mode when:
 
 - The workload is latency-sensitive and modest in total throughput.
 - You'd otherwise need locks in your handler.
 - The connect-storm or short-RPC workload (see below) makes
-  multi-thread mode regress.
+  multi-thread / multi-loop mode regress.
 
-## Multi-thread mode (`Server(N)`)
+## Coroutine multi-thread mode (`Server(N)`)
 
-![Multi-thread layout](svgs/threading-multi.svg)
+![Coroutine multi-thread layout](svgs/threading-multi.svg)
 
 One shared `IOContext` runs the event loop (epoll/kqueue). When a
 coroutine becomes runnable, IOContext picks an idle worker and hands it
 the resume. Workers each pop from the shared task queue and run the
-coroutine until its next `co_await`.
+coroutine until its next `co_await`. Reactor `on_readable` /
+`on_writable` still run only on the `run()` thread of that one loop.
 
 Properties:
 
@@ -115,36 +127,47 @@ The only thread-affinity guarantee is that **between any two
 
 ## Pinning a connection to a thread
 
-Not supported directly. The IOContext's task queue is shared across
-all workers; there's no per-connection thread routing. If you need
-strict CPU-affinity (e.g. for a connection-per-NUMA-node setup), run
-multiple `Server` instances on different ports and pin each via the
-OS (`taskset`, `pthread_setaffinity_np`, `numactl`).
+**Reactor connections** are pinned at accept: each lands on one loop
+under `ServerConfig{.loops = N}` and never moves. That is the library
+threading model for reactor I/O affinity.
 
-## The reactor dispatchers are the exception
+**Coroutine connections** still share one loop's worker pool; there is
+no per-connection worker routing. If you need strict CPU-affinity for
+coroutines (e.g. connection-per-NUMA-node), run multiple `Server`
+instances on different ports and pin each via the OS (`taskset`,
+`pthread_setaffinity_np`, `numactl`).
 
-Everything above describes the coroutine dispatchers
+## Reactor multi-loop mode (`ServerConfig{.loops = N}`)
+
+![Reactor multi-loop layout](svgs/threading-reactor-loops.svg)
+
+Everything above about workers describes the coroutine dispatchers
 (`make_dispatcher(...)`). The coroutine-free reactor counterparts
 (`make_reactor_dispatcher(...)`, see `docs/http.md` / `docs/websocket.md`)
-run inside the exact same `Server(N)`/`IOContext`, but their connection
-state (`Http1Connection`, `Http2Connection`, `WsConnection`, ...) is
-ordinary member data, not a coroutine frame, so it can't tolerate the "no
-thread affinity" model above. In practice it doesn't need to: only the
-thread that calls `Server::run()` (i.e. `IOContext::run()`) ever calls
-`PlatformIO::wait()` or dispatches `on_readable()`/`on_writable()` —
-worker threads only drain `post()`ed callbacks and coroutine resumes, so a
-reactor connection's own I/O handling was already implicitly
-single-threaded. The one gap was code that reaches into a reactor
-connection from *outside* that dispatch (a `ResponseWriter` completed on a
-background thread, or one connection sending to another); those call
-`IOContext::post_to_io_thread(...)` to land back on the `run()` thread
-specifically, rather than `post()`'s round-robin across every worker. See
-`concurrency-and-coroutines.md`'s "Reactor Threading Model" section for
-the full picture, including why this is not the same as "pinning a
-connection to a thread" in the multi-loop sense above — there is still
-only one loop (and one `run()` thread) per `IOContext`. For why that
-single loop is the reactor throughput ceiling, and the N-loop design
-that would raise it, see [`reactor-threading.md`](reactor-threading.md).
+keep connection state (`Http1Connection`, `Http2Connection`,
+`WsConnection`, ...) as ordinary member data, not a coroutine frame, so
+they can't migrate across threads the way a `Task` can.
+
+Each reactor connection is pinned to one `IOContext` at accept. Only that
+loop's `run()` thread ever calls its `on_readable()`/`on_writable()`.
+Code that reaches into a connection from outside that dispatch (a
+`ResponseWriter` completed on a background thread, or one connection
+sending to another) uses `IOContext::post_to_io_thread(...)` on **that
+connection's** context. See `concurrency-and-coroutines.md`'s "Reactor
+Threading Model".
+
+To use more than one core for reactor I/O, construct the server with
+multiple loops — not workers:
+
+```cpp
+Server server(ServerConfig{.loops = 4, .workers_per_loop = 0});
+server.set_connection_factory(http::make_reactor_dispatcher(...));
+```
+
+TCP accept stays on loop 0 and round-robins client fds onto the loops
+(accept-and-shard). UDP stays on loop 0. `Server(N)` alone still means
+"1 loop + N coroutine workers" and does **not** raise reactor I/O
+throughput. Full design: [`reactor-threading.md`](reactor-threading.md).
 
 ## Stop / drain semantics
 
@@ -153,10 +176,14 @@ within a handler — though you'd want to schedule it to avoid stopping
 mid-coroutine). It:
 
 1. Sets a stop flag so accept loops exit.
-2. Closes all listening sockets.
-3. Shuts down active client sockets so suspended `recv`/`send` returns.
-4. Waits up to 1 second for in-flight coroutines to drain.
-5. Stops the IOContext loop. Workers join when `Server::run()` returns.
+2. Closes all listening sockets (on loop 0).
+3. Shuts down active coroutine client sockets so suspended `recv`/`send`
+   returns.
+4. Posts `IoHandler::shutdown()` for every remaining reactor connection
+   to its owning loop via `post_to_io_thread` (bounded wait).
+5. Waits up to 1 second for in-flight coroutines to drain.
+6. Stops every `IOContext`; `Server::run()` then joins secondary loop
+   threads (and each context joins its own workers).
 
 Coroutines still suspended after the 1-second drain leak — the design
 trade-off is "stop deterministically vs guarantee zero leaks". If you
@@ -184,6 +211,5 @@ calling `stop`.
 - [mutex-vs-atomics.md](mutex-vs-atomics.md) — what's locked vs
   atomic in the library itself
 - [performance.md](performance.md) — broader benchmark numbers
-- [reactor-threading.md](reactor-threading.md) — why reactor
-  dispatchers ignore `N`, and the multi-loop design that would
-  actually scale them
+- [reactor-threading.md](reactor-threading.md) — accept-and-shard
+  multi-loop design for reactor I/O scaling

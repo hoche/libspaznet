@@ -1,30 +1,30 @@
-# Reactor threading: why `Server(N)` does not scale, and what would
+# Reactor threading: N independent loops (accept-and-shard)
 
-Snapshot 2026-08-12. This is an analysis of the current reactor
-execution model and the threading change that would actually raise
-throughput. Nothing described under "Recommended change" is
-implemented yet.
+Snapshot 2026-08-13. The multi-loop accept-and-shard design described
+here is **implemented**. Historical numbers that motivated the change
+are retained below for context.
 
-For how `Server(N)` works *today* (coroutine workers, one loop), see
+For how `Server(N)` works for coroutines (workers on one loop), see
 [`threading.md`](threading.md). For the affinity primitive the reactor
-dispatchers already rely on, see
+dispatchers rely on, see
 [`concurrency-and-coroutines.md`](concurrency-and-coroutines.md)'s
-"Reactor Threading Model". Numbers below are from
+"Reactor Threading Model". Pre-change numbers below are from
 [`thread_mode_report.md`](../thread_mode_report.md) on meep (Linux
 x86_64, 32 cores).
 
-## The current model is correct for safety and wrong for throughput
+## Why the old model could not scale
 
-`Server(N)` still means **one event loop**. `IOContext::run()` is the
-only thread that calls `PlatformIO::wait()` and
-`on_readable()`/`on_writable()`. The `N` workers only drain
-`thread_queues_` (coroutine resumes) and `callback_queues_`
-(`post()`). Reactor connections never use either.
+Before this change, `Server(N)` still meant **one event loop**.
+`IOContext::run()` was the only thread that called `PlatformIO::wait()`
+and `on_readable()`/`on_writable()`. The `N` workers only drained
+`thread_queues_` (coroutine resumes) and `callback_queues_` (`post()`).
+Reactor connections never used either.
 
-That is why the reactor rows in `thread_mode_report.md` are flat:
-`Server(0)` and `Server(512)` do the same work on one core. Coroutines
-scale on large bodies because the frame can migrate and the
-memcpy/syscall volume spreads across workers:
+That is why the reactor rows in the pre-change
+`thread_mode_report.md` were flat: `Server(0)` and `Server(512)` did
+the same work on one core. Coroutines scaled on large bodies because
+the frame can migrate and the memcpy/syscall volume spreads across
+workers:
 
 | Case | Best coroutine rps | Reactor rps (any N) | Gap |
 |---|---:|---:|---|
@@ -32,35 +32,19 @@ memcpy/syscall volume spreads across workers:
 | 64 KiB / 64 KiB | ~74k @ 16 | ~13k | ~6× |
 | 64 KiB / 256 KiB | ~50k @ 16 | ~3.9k | ~13× |
 
-The missing piece is not "smarter workers on the existing loop." It is
-**N independent loops, each owning its own connections.**
-
 Do **not** make workers invoke `on_readable()` on shared connections.
-That is the model the HTTP/2 reactor dispatcher just escaped (its
-former `recursive_mutex`). Connection state has to stay
-single-threaded; the way to use more cores is more loops, not more
-threads on one loop.
+That is the model the HTTP/2 reactor dispatcher escaped (its former
+`recursive_mutex`). Connection state has to stay single-threaded; the
+way to use more cores is more loops, not more threads on one loop.
 
-A handful of low reactor outliers at `threads=16` in that same report
-are a different phenomenon: the bench opens a new TCP connection per
-request, so accumulated loopback churn can stall the single I/O
-thread. Because that thread is the only one that can make reactor
-progress, a stall shows up as near-zero rps with `errors=0` and
-normal-looking percentiles (the timer starts after `connect()`). It is
-not evidence that 16 is a special thread count. See the caveat in
-`thread_mode_report.md`.
+## What shipped: N loops with accept-and-shard
 
-## Options
+![Reactor multi-loop layout](svgs/threading-reactor-loops.svg)
 
 ```mermaid
 flowchart LR
-  subgraph today [Today: 1 loop plus unused workers]
-    L0["run thread: epoll plus on_readable"]
-    W["workers 0..N-1: empty queues"]
-    L0 -.-> W
-  end
-  subgraph multi [Better: N loops, 0 workers each]
-    A["accept on loop 0 or SO_REUSEPORT"]
+  subgraph multi [N loops, 0 workers each]
+    A["accept on loop 0"]
     L1["loop 1: its connections"]
     L2["loop 2: its connections"]
     Ln["loop N: its connections"]
@@ -70,56 +54,33 @@ flowchart LR
   end
 ```
 
-### 1. Stop spawning unused workers (small)
-
-In a reactor-only `Server(N)`, those threads park on a CV forever.
-Skipping them saves RAM and context switches and makes `N` stop being
-a lie. It does not raise rps.
-
-### 2. Offload handler CPU, keep I/O on the loop (narrow)
-
-`handle_request` runs on the I/O thread today. A slow handler could
-`post()` the work and complete via `post_to_io_thread()`. Useful for
-JSON, crypto, or a database call. Useless for `bench_thread_modes`,
-where `BenchHandler` is trivial and the large-body cost is
-`recv`/`send`/memcpy inside `BufferedConnection` — still on the I/O
-thread.
-
-### 3. N event loops with connection pinning (the real fix)
-
-Each loop is today's `IOContext` with `num_threads_ = 0`: its own
+Each loop is an `IOContext` with `workers_per_loop = 0`: its own
 `PlatformIO`, fd table, timers, reap list, and `post_to_io_thread`
 queue. A connection is created on one loop and never moves.
-Dispatchers do not change; they already assume "one IO thread per
-`IOContext`."
+Dispatchers did not need signature changes; they already assume "one
+IO thread per `IOContext`."
 
-Two ways to get new sockets onto those loops:
+Accept-and-shard (what is implemented):
 
-| | Accept-and-shard | `SO_REUSEPORT` |
-|---|---|---|
-| How | One listen fd; accept thread round-robins client fds onto loops | Each loop binds the same port; kernel distributes accepts |
-| Portability | All backends (epoll/kqueue/poll/IOCP) | Linux/BSD; Windows is a different knob |
-| Accept scaling | Still one `accept()` loop — connect-storm stays a known limit | Accepts scale with loops |
-| Complexity | Fd handoff: never register the client fd on the accept loop | Extra listen sockets, `SO_REUSEPORT` plus fallback |
-| Cross-connection send | Already fine: `Connection::send()` posts to **that** connection's `IOContext` | Same |
+- One listen fd, registered on **loop 0**
+- `accept_ready` round-robins each client fd onto a target loop
+- `connection_factory_(fd, *target_ctx, on_closed)` registers the
+  handler on **that** context — the client fd is never registered on
+  the accept loop
+- `Server::run()` starts loops `1..N-1` on their own threads, then
+  blocks in `io_contexts_[0]->run()`
+- `Server::stop()` posts `IoHandler::shutdown()` to each owning loop
+  via `post_to_io_thread`, then stops every context and joins
 
-**Recommendation:** accept-and-shard first. It matches the current
-`Server(port)` API, stays portable, and is enough to close the
-large-body gap. Add `SO_REUSEPORT` later if connect-storm / tiny-RPC
-accept rate becomes the next ceiling.
+UDP / QUIC stay on loop 0. One datagram socket cannot be sharded by
+connection the way TCP fds can; a later `SO_REUSEPORT` / CID-hash
+design can address that.
 
-### 4. N `Server` processes (already documented)
+`SO_REUSEPORT` (not yet): each loop binds the same port; kernel
+distributes accepts. Useful if connect-storm / tiny-RPC accept rate
+becomes the next ceiling after accept-and-shard.
 
-Works today via separate ports or app-level `SO_REUSEPORT`. Fine as an
-ops workaround; it is not a library threading model. See
-[`threading.md`](threading.md)'s "Pinning a connection to a thread."
-
-## What `Server(N)` should mean
-
-Today `N` means coroutine workers. For reactors that is the wrong
-axis.
-
-A clean split:
+## `ServerConfig` — what `N` means now
 
 ```cpp
 struct ServerConfig {
@@ -128,40 +89,15 @@ struct ServerConfig {
 };
 ```
 
-- Reactor-only: `loops = N`, `workers_per_loop = 0`
-- Coroutine-only: `loops = 1`, `workers_per_loop = N` (current behavior)
-- Mixed process: possible but not the first milestone
+| Shape | Construction | Meaning |
+|---|---|---|
+| Coroutine-only | `Server(N)` or `ServerConfig{1, N}` | 1 loop, N workers (historical) |
+| Reactor-only | `Server(ServerConfig{N, 0})` | N loops, 0 workers, accept-and-shard |
+| Mixed | `ServerConfig{L, W}` with both > 0 | Allowed; reactor TCP shards across L loops, coroutine connections stay on loop 0 |
 
-`Server(N)` can keep its current meaning for coroutines and grow an
-overload / config object so reactor callers are not silently ignored.
-
-## What has to change in the library
-
-Almost none of it is in the protocol dispatchers.
-
-- **`Server` owns `vector<unique_ptr<IOContext>>`**, not one.
-  `run()` starts `loops-1` threads each calling
-  `io_contexts_[i]->run()`, then blocks in
-  `io_contexts_[0]->run()`.
-- **`ListenHandler` / `accept_ready`** pick a target loop
-  (round-robin or least `active_connections`), call
-  `connection_factory_(fd, *target_ctx, on_closed)`, and register
-  the handler on **that** context. The listen fd stays on loop 0.
-- **`ConnectionFactory` already takes `IOContext&`** — factories
-  need no signature change.
-- **`post_to_io_thread` stays as-is**, per context. WebSocket
-  broadcast already goes through the target connection's context;
-  that becomes real multi-core rather than a no-op hop on one
-  thread.
-- **`Server::stop()`** must stop every loop, then join.
-- **UDP / QUIC** do not fall out for free. One datagram socket
-  cannot be sharded by connection the way TCP fds can. Leave them
-  on loop 0 until a later `SO_REUSEPORT` / CID-hash design. The
-  HTTP/WS/H2 gap is the one the numbers show.
-- **Windows IOCP** can wait from many threads on one port; still
-  prefer N loops over "workers call `on_readable` on shared
-  state," so the affinity invariant stays the same on every
-  backend.
+`Server(N)` deliberately keeps its coroutine meaning so existing callers
+are not silently reinterpreted. Reactor callers that want scaling must
+pass `ServerConfig`.
 
 ## What not to do
 
@@ -173,28 +109,34 @@ Almost none of it is in the protocol dispatchers.
 - Reinterpreting `Server(N)` as loops without a config split —
   coroutine and reactor want opposite shapes.
 
-## Expected payoff
+## Measured payoff (2026-08-13, meep, 32 cores)
 
-After accept-and-shard, reactor large-body rows should start tracking
-coroutine rows as `loops` rises, instead of sitting on the `Server(0)`
-line. Tiny-body / connect-per-request will move less until keep-alive
-and/or `SO_REUSEPORT` address accept-path contention — that is a
-different bottleneck than "reactor can't use extra cores."
+From [`../thread_mode_report.md`](../thread_mode_report.md) after
+accept-and-shard. Reactor **threads** column = `loops`.
 
-## Suggested first milestone
+| Case | Reactor @ loops=1 | Reactor best | Coroutine best |
+|---|---:|---:|---:|
+| 64 KiB / 64 KiB | ~13k rps | ~67k @ 32 | ~90k @ 8 |
+| 64 KiB / 256 KiB | ~4.0k rps | ~45k @ 16 | ~58k @ 16 |
 
-If this is built: `Server` owns N `IOContext`s, TCP accept shards onto
-them, `bench_thread_modes` reports reactor rps vs `loops`, UDP/QUIC
-stay on loop 0, no dispatcher rewrites.
+Large-body reactor rows now climb with `loops` instead of sitting on
+the old flat `Server(0)` line. Tiny-body / connect-per-request still
+shows occasional near-zero outliers (accept-path / TIME_WAIT on the
+single listen fd) — a different bottleneck than "reactor can't use
+extra cores." `SO_REUSEPORT` remains the follow-up if that becomes the
+ceiling.
+
+`bench_thread_modes` reports reactor rps against `loops` (the
+**threads** column for the reactor dispatcher) and coroutine rps
+against workers.
 
 ## Related
 
-- [`threading.md`](threading.md) — current `Server(N)` model and
-  tuning
+- [`threading.md`](threading.md) — `Server(N)` / `ServerConfig` tuning
 - [`concurrency-and-coroutines.md`](concurrency-and-coroutines.md) —
   why reactor state cannot migrate, and `post_to_io_thread`
 - [`coro-free-build.md`](coro-free-build.md) — reactor authoring
   rules
 - [`performance.md`](performance.md) — headline numbers
 - [`../thread_mode_report.md`](../thread_mode_report.md) — coroutine
-  vs reactor sweep this analysis is based on
+  vs reactor sweep this analysis was based on

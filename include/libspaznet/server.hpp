@@ -116,11 +116,13 @@ using DatagramHandler = std::function<Task(Datagram)>;
 #endif // SPAZNET_HAS_COROUTINES
 
 // Reactor-side per-connection callback: invoked once for each accepted TCP
-// connection with the fd (already set non-blocking), the IOContext it was
-// accepted on, and an on_closed callback. The factory mints and returns
-// whatever IoHandler drives that connection's state machine — typically a
-// BufferedConnection or a protocol dispatcher wrapping one — and registers
-// its own read/write interest before returning (see
+// connection with the fd (already set non-blocking), the IOContext it is
+// pinned to for its lifetime (any of Server's loops under accept-and-shard;
+// never move the connection to a different IOContext afterward), and an
+// on_closed callback. The factory mints and returns whatever IoHandler
+// drives that connection's state machine — typically a BufferedConnection
+// or a protocol dispatcher wrapping one — and registers its own read/write
+// interest on that same IOContext before returning (see
 // BufferedConnection::start()). It must arrange for on_closed to be
 // invoked exactly once, whenever that connection is done with itself (the
 // same contract as BufferedConnection::set_on_closed) — typically by
@@ -150,10 +152,31 @@ using ConnectionFactory =
 // set_datagram_handler() for datagrams delivered afterward.
 using SyncDatagramHandler = std::function<void(Datagram)>;
 
+// Splits the two axes that `Server(N)` used to conflate. Coroutines want
+// workers on one loop; reactors want N independent loops with connections
+// pinned at accept (see docs/reactor-threading.md).
+//
+//   Reactor-only:   loops = N, workers_per_loop = 0
+//   Coroutine-only: loops = 1, workers_per_loop = N   (== Server(N) today)
+//
+// Mixed shapes (loops > 1 and workers_per_loop > 0) are allowed but not
+// the first-class target: TCP accept still shards reactor connections
+// across loops; coroutine connections stay on loop 0.
+struct ServerConfig {
+    std::size_t loops = 1;            // independent IOContext instances (>= 1)
+    std::size_t workers_per_loop = 0; // coroutine worker threads per loop
+};
+
 // Server class
 class Server {
   private:
-    std::unique_ptr<IOContext> io_context_;
+    // Loop 0 owns listen/UDP fds. Additional loops only run accepted TCP
+    // reactor connections (accept-and-shard). Coroutine Socket paths always
+    // use loop 0 so Server(N) keeps its historical workers-on-one-loop
+    // meaning.
+    std::vector<std::unique_ptr<IOContext>> io_contexts_;
+    std::vector<std::thread> loop_threads_;
+    std::atomic<std::size_t> next_accept_loop_{0};
 #ifdef SPAZNET_HAS_COROUTINES
     ConnectionHandler connection_handler_;
     DatagramHandler datagram_handler_;
@@ -180,9 +203,25 @@ class Server {
     // point the factory returns it until the connection reports itself
     // closed (erased from here by finish_reactor_connection, invoked as an
     // on_closed-style hook) or until stop() shuts every remaining one down.
+    // `ctx` is the loop the connection was pinned to at accept — stop()
+    // must invoke IoHandler::shutdown() on that loop's IO thread.
+    struct ReactorConn {
+        std::shared_ptr<IoHandler> handler;
+        IOContext* ctx = nullptr;
+    };
     std::mutex reactor_conns_mutex_;
-    std::unordered_map<int, std::shared_ptr<IoHandler>> reactor_connections_;
+    std::unordered_map<int, ReactorConn> reactor_connections_;
     std::atomic<bool> running_;
+
+    [[nodiscard]] auto primary_context() -> IOContext& {
+        return *io_contexts_.front();
+    }
+    [[nodiscard]] auto primary_context() const -> const IOContext& {
+        return *io_contexts_.front();
+    }
+    // Round-robin pick among all loops for a newly accepted reactor TCP
+    // connection. Listen/UDP stay on primary_context().
+    [[nodiscard]] auto pick_accept_loop() -> IOContext&;
 
 #ifdef SPAZNET_HAS_COROUTINES
     Task handle_connection(Socket socket);
@@ -203,16 +242,21 @@ class Server {
     class ListenHandler;
     class DatagramReadHandler;
     // Drops fd from reactor_connections_ (called once the connection is
-    // done with itself) and updates the shared active-connection count.
-    // Safe to call from any thread; safe to call from inside the very
-    // IoHandler callback that's finishing, since it only erases this
-    // Server's map entry — the object itself stays alive for the rest of
-    // that callback via the shared_ptr the caller already holds.
-    void finish_reactor_connection(int fd);
+    // done with itself) and updates the active-connection count on the
+    // loop that owned it. Safe to call from any thread; safe to call from
+    // inside the very IoHandler callback that's finishing, since it only
+    // erases this Server's map entry — the object itself stays alive for
+    // the rest of that callback via the shared_ptr the caller already holds.
+    void finish_reactor_connection(int fd, IOContext* ctx);
 
   public:
-    // `num_threads` is the number of IO worker threads to spawn (0 = non-threaded default).
+    // Historical constructor: one event loop with `num_threads` coroutine
+    // worker threads (0 = non-threaded). Equivalent to
+    // Server(ServerConfig{.loops = 1, .workers_per_loop = num_threads}).
+    // Reactor I/O still runs only on that one loop — use ServerConfig with
+    // loops > 1 to scale reactor connections across cores.
     Server(std::size_t num_threads = 0);
+    explicit Server(ServerConfig config);
     ~Server();
 
     // Start listening on a port (schedules the listen task)
@@ -255,9 +299,12 @@ class Server {
     // Stop the server
     void stop();
 
-    // Get current statistics (lock-free read)
-    [[nodiscard]] auto get_statistics() const -> Statistics {
-        return io_context_->get_statistics();
+    // Aggregated, lock-free read across every loop's IOContext.
+    [[nodiscard]] auto get_statistics() const -> Statistics;
+
+    // Number of independent event loops this Server owns (>= 1).
+    [[nodiscard]] auto loop_count() const -> std::size_t {
+        return io_contexts_.size();
     }
 };
 
