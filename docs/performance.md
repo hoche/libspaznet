@@ -163,8 +163,9 @@ cmake --build build -j
 ./build/bench_websocket --seconds 3                         > ws.md
 ./build/bench_connect_storm --seconds 3                     > storm.md
 
-# libspaznet's HTTP-only sweep across thread counts
-cd ../libspaznet/build && ./bench_thread_modes > thread_modes.md
+# libspaznet's HTTP-only sweep across thread counts (both dispatchers when
+# built with -DSPAZNET_ENABLE_COROUTINES=ON; reactor-only otherwise)
+cd ../libspaznet/build && ./bench_thread_modes > thread_mode_report.md
 ```
 
 ## What affects the numbers
@@ -190,6 +191,14 @@ In order of how much they move the dial:
 - **Whether you build with `SPAZNET_BUILD_QUIC=ON` vs `OFF`.** The
   HTTP/WebSocket paths are unchanged; QUIC code links in but doesn't
   run.
+- **`SPAZNET_ENABLE_COROUTINES=ON` vs `OFF`.** `thread_mode_report.md`
+  (root of the repo) benchmarks the `coroutine` (`Task`/`co_await`)
+  and `reactor` (plain callbacks) dispatchers side by side against the
+  identical `BenchHandler` over the identical wire protocol; the two
+  columns track each other within normal run-to-run noise at every
+  thread count. Coroutine frame allocation shows up in profiles (see
+  above) but isn't the dominant cost. See `docs/coro-free-build.md`
+  for what's actually gated by the flag.
 - **clang-tidy / cppcheck warnings.** These don't generate code.
 
 ## Related
