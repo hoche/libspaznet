@@ -5,8 +5,8 @@
 - [x] Add non-coroutine reactor model
 
 - [x] Fix reactor model's threading system: N independent event loops via `ServerConfig{.loops = N}` and accept-and-shard. `Server(N)` keeps its coroutine meaning (1 loop + N workers); reactor TCP connections round-robin onto the loops. UDP stays on loop 0. See `docs/reactor-threading.md`.
-- [x] TLS-over-TCP for HTTP/1.1 and HTTP/2 (`listen_tls`, per-protocol
-  ALPN). WebSocket/`wss` still open (see below).
+- [x] TLS-over-TCP for HTTP/1.1, HTTP/2, and WebSocket (`listen_tls`,
+  per-protocol ALPN; wss uses `http/1.1`).
 - [x] Support wolfSSL as an alternate to OpenSSL (`-DSPAZNET_USE_WOLFSSL=ON`).
 - QUIC Demo. There is none at this point.
 - QUIC Improvements
@@ -591,15 +591,12 @@ Ordered by priority.
   `SSL_read`/`SSL_write`-driven path that isn't there yet, but the
   SSL_CTX construction (cert/key loading, ALPN) is reusable.
 
-- [x] **TLS-over-TCP for HTTP / HTTP/2 (https)** — shipped
+- [x] **TLS-over-TCP for HTTP / HTTP/2 / WebSocket (https / wss)** — shipped
   - `SPAZNET_ENABLE_TLS` / `SPAZNET_HAS_TLS` (OpenSSL 1.1.1+),
   `TlsConfig` + `Server::listen_tls`, TLS under `Socket` /
   `BufferedConnection` (`SSL_read`/`SSL_write`). Per-protocol ALPN
-  (`http/1.1` vs `h2`); no cross-protocol mux. Demos: `--tls` on
-  `http_hello` / `http2_hello`. Independent of QUIC TLS.
-- [ ] **WebSocket over TLS (wss)** — LATER
-  - Same TCP-TLS machinery; wire `example/http-websocket` once the
-  upgrade sniff runs after the TLS handshake (already true if the
-  listen socket is `listen_tls` with a suitable ALPN — decide
-  `http/1.1` vs a dedicated wss ALPN policy).
+  (`http/1.1` vs `h2`); no cross-protocol mux. WSS uses
+  `alpn={"http/1.1"}` (upgrade after handshake). Demos: `--tls` on
+  `http_hello` / `http2_hello` / `ws_echo` / `ws_chat`. Independent
+  of QUIC TLS.
 

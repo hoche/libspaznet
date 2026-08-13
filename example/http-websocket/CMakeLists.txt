@@ -35,6 +35,7 @@ if(BUILD_TESTING OR TARGET test_unit)
     set(SPAZNET_WS_INTEGRATION_SOURCES
         ${PROJECT_SOURCE_DIR}/tests/test_main.cpp
         tests/integration/test_websocket_server.cpp
+        tests/integration/test_tls_wss.cpp
     )
     add_executable(test_ws_integration ${SPAZNET_WS_INTEGRATION_SOURCES})
     target_link_libraries(test_ws_integration PRIVATE spaznet_http_websocket GTest::gtest GTest::gmock)

@@ -323,7 +323,6 @@ how the two execution models differ under the hood.
 
 ### What's not in `example/http2`
 
-- WebSocket over TLS (`wss`) — TLS-over-TCP is in for HTTP/HTTP2; WSS is still open.
 - HPACK dynamic table (intentional — see above).
 - PUSH_PROMISE / server push (disabled via SETTINGS).
 - Trailers, priority frames (priority frames are silently dropped

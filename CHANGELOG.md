@@ -6,9 +6,9 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
-## 2026-08-13 — TLS-over-TCP for HTTP/1.1 and HTTP/2
+## 2026-08-13 — TLS-over-TCP for HTTP/1.1, HTTP/2, and WebSocket
 
-Optional HTTPS via OpenSSL on accepted TCP connections. Dispatchers
+Optional HTTPS/WSS via OpenSSL on accepted TCP connections. Dispatchers
 unchanged — TLS sits under `Socket` / `BufferedConnection`.
 
 ### Added
@@ -18,12 +18,13 @@ unchanged — TLS sits under `Socket` / `BufferedConnection`.
   per-listener ALPN (`http/1.1` or `h2`).
 - Internal `detail::TlsStream` / `TlsContext` shared by the coroutine
   and reactor I/O paths; best-effort `SSL_shutdown` on close.
-- `http_hello --tls` / `http2_hello --tls` (self-signed demo on 8443).
-- Integration tests (`test_tls_https.cpp`) for both dispatchers.
+- `http_hello --tls` / `http2_hello --tls` / `ws_echo --tls` /
+  `ws_chat --tls` (self-signed demo on 8443).
+- Integration tests for HTTPS and WSS (both dispatchers).
 
 ### Notes
 - Independent of QUIC's OpenSSL 3.5+ / wolfSSL backend.
-- WebSocket/`wss` not wired in this milestone.
+- WSS uses ALPN `http/1.1`; the upgrade sniff runs after TLS.
 
 ## 2026-08-13 — wolfSSL as alternate QUIC TLS backend
 

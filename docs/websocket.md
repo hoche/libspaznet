@@ -106,6 +106,29 @@ indistinguishable. `example/http-websocket/demo/echo.cpp` and
 `test_websocket_server.cpp` runs its whole suite (including the RFC
 6455 malformed-frame compliance cases) against both.
 
+### WSS (WebSocket over TLS)
+
+When the core is built with `SPAZNET_ENABLE_TLS` (`SPAZNET_HAS_TLS`),
+call `Server::listen_tls` with `alpn = {"http/1.1"}` — the same ALPN
+as HTTPS for HTTP/1.1. TLS terminates under `Socket` /
+`BufferedConnection` before the upgrade sniff, so neither dispatcher
+needs WebSocket-specific TLS code.
+
+```cpp
+#include <libspaznet/tls_config.hpp>
+
+spaznet::TlsConfig cfg;
+cfg.cert_pem = /* PEM */;
+cfg.key_pem = /* PEM */;
+cfg.alpn = {"http/1.1"};
+server.listen_tls(8443, std::move(cfg));
+server.listen_tcp(8080);  // optional cleartext ws://
+```
+
+Demos: `ws_echo --tls` / `ws_chat --tls` listen on 8443
+(`wscat -c wss://127.0.0.1:8443/ --no-check`). The chat page already
+picks `wss:` when loaded over `https:`.
+
 One notable difference in shape, not behavior: `reactor::Connection` is
 a small copyable value (a `weak_ptr` plus the connection's fd), unlike
 the coroutine `Connection`, which is deliberately non-copyable because

@@ -2,8 +2,11 @@
 // requests on the same port).
 //
 //   $ ./ws_chat [--reactor]
-//   # then open http://localhost:8080/ in two or more browser tabs, or:
+//   $ ./ws_chat --tls           # also listen_tls on 8443 (ALPN http/1.1)
+//   # then open http://localhost:8080/ (or https://localhost:8443/ with --tls)
+//   # in two or more browser tabs, or:
 //   $ wscat -c ws://localhost:8080/
+//   $ wscat -c wss://localhost:8443/ --no-check
 //   > hello
 //   < * user5 joined (2 online)
 //   < user5: hello
@@ -51,6 +54,11 @@
 #include <libspaznet/websocket/handler.hpp>
 #include <libspaznet/websocket/reactor_handler.hpp>
 #include <libspaznet/websocket/send.hpp>
+#ifdef SPAZNET_HAS_TLS
+#include <libspaznet/detail/tls_self_signed.hpp>
+#include <libspaznet/tls_config.hpp>
+#include <iostream>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -388,9 +396,13 @@ int main(int argc, char** argv) {
 #else
     bool use_reactor = true; // Coroutine dispatcher isn't built in this configuration.
 #endif
+    bool use_tls = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--reactor") == 0) {
             use_reactor = true;
+        }
+        if (std::strcmp(argv[i], "--tls") == 0) {
+            use_tls = true;
         }
     }
 
@@ -406,5 +418,18 @@ int main(int argc, char** argv) {
     }
 #endif
     server.listen_tcp(8080);
+#ifdef SPAZNET_HAS_TLS
+    if (use_tls) {
+        auto [cert, key] = spaznet::detail::make_self_signed_pem("localhost");
+        spaznet::TlsConfig cfg;
+        cfg.cert_pem = std::move(cert);
+        cfg.key_pem = std::move(key);
+        cfg.alpn = {"http/1.1"};
+        server.listen_tls(8443, std::move(cfg));
+        std::cerr << "TLS listening on https://127.0.0.1:8443/ (self-signed; page uses wss)\n";
+    }
+#else
+    (void)use_tls;
+#endif
     server.run();
 }
