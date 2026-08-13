@@ -94,10 +94,15 @@ template <typename Pred> auto wait_until(Pred pred, std::chrono::milliseconds ti
 // large write is forced to WouldBlock. SO_SNDBUF alone is unreliable:
 // Darwin and Windows often clamp or ignore small values, and a large peer
 // RCVBUF lets the kernel accept megabytes before backpressuring.
-void shrink_pipe_buffers(int write_fd, int read_fd, int bytes = 4096) {
+void shrink_pipe_buffers(int write_fd, int read_fd, int bytes = 2048) {
     detail::setsockopt_int(write_fd, SOL_SOCKET, SO_SNDBUF, bytes);
     detail::setsockopt_int(read_fd, SOL_SOCKET, SO_RCVBUF, bytes);
 }
+
+// Large enough to exceed a shrunk pipe, small enough to drain quickly on
+// loaded CI runners (1 MiB + 5s was flaking on macOS ARM64 under load).
+constexpr std::size_t kBackpressurePayload = 256 * 1024;
+constexpr auto kBackpressureTimeout = 15000ms;
 
 // BufferedConnection has no internal locking: write()/close()/
 // close_after_flush()/pending_write_bytes()/closed() all assume the
@@ -247,7 +252,7 @@ TEST(OutputBufferTest, PartialFlushLeavesRemainderPendingUntilDrained) {
     shrink_pipe_buffers(pair.a, pair.b);
 
     OutputBuffer out;
-    std::vector<uint8_t> payload(1 << 20, 'z'); // 1 MiB, comfortably larger than the pipe
+    std::vector<uint8_t> payload(kBackpressurePayload, 'z');
     out.append(payload);
 
     auto first = out.try_flush(pair.a);
@@ -287,7 +292,7 @@ TEST(OutputBufferTest, PartialFlushLeavesRemainderPendingUntilDrained) {
             }
             return flushed && total_received == payload.size();
         },
-        5000ms));
+        kBackpressureTimeout));
     ASSERT_FALSE(saw_error) << "try_flush hard-failed with errno=" << detail::last_socket_error();
 
     EXPECT_EQ(total_received, payload.size());
@@ -331,12 +336,18 @@ TEST_F(BufferedConnectionTest, LargeWriteTogglesWriteInterestThenDrains) {
     pair.a = -1;
     conn->start();
 
-    std::vector<uint8_t> payload(1 << 20, 'y'); // 1 MiB
-    on_io_thread(*context, [&]() { conn->write(payload); });
-
-    // Immediately after the call, if the whole payload didn't fit in one
-    // optimistic write, write interest must be armed (pending > 0).
-    bool needed_interest = on_io_thread(*context, [&]() { return conn->pending_write_bytes(); }) > 0;
+    std::vector<uint8_t> payload(kBackpressurePayload, 'y');
+    // Keep writing until the kernel pipe backpressures (pending > 0) or we
+    // have pushed several payloads — Darwin sometimes absorbs one chunk
+    // despite SO_*BUF shrinks.
+    std::size_t bytes_written = 0;
+    for (int i = 0; i < 64; ++i) {
+        on_io_thread(*context, [&]() { conn->write(payload); });
+        bytes_written += payload.size();
+        if (on_io_thread(*context, [&]() { return conn->pending_write_bytes(); }) > 0) {
+            break;
+        }
+    }
 
     std::size_t total_received = 0;
     std::array<char, 65536> recv_buf{};
@@ -349,15 +360,13 @@ TEST_F(BufferedConnectionTest, LargeWriteTogglesWriteInterestThenDrains) {
                 }
                 total_received += static_cast<std::size_t>(n);
             }
-            return total_received == payload.size();
+            return total_received == bytes_written &&
+                   on_io_thread(*context, [&]() { return conn->pending_write_bytes(); }) == 0;
         },
-        5000ms));
+        kBackpressureTimeout));
 
-    EXPECT_EQ(total_received, payload.size());
-    // Once fully drained, the connection must have dropped write interest
-    // (checked indirectly: no more bytes pending).
+    EXPECT_EQ(total_received, bytes_written);
     EXPECT_EQ(on_io_thread(*context, [&]() { return conn->pending_write_bytes(); }), 0u);
-    (void)needed_interest; // documents intent even if the OS accepted it all at once
 }
 
 TEST_F(BufferedConnectionTest, BytesBufferedStatDrainsToZeroOnceFlushed) {
@@ -370,8 +379,13 @@ TEST_F(BufferedConnectionTest, BytesBufferedStatDrainsToZeroOnceFlushed) {
     pair.a = -1;
     conn->start();
 
-    std::vector<uint8_t> payload(1 << 20, 'z'); // 1 MiB
-    on_io_thread(*context, [&]() { conn->write(payload); });
+    std::vector<uint8_t> payload(kBackpressurePayload, 'z');
+    for (int i = 0; i < 64; ++i) {
+        on_io_thread(*context, [&]() { conn->write(payload); });
+        if (on_io_thread(*context, [&]() { return conn->pending_write_bytes(); }) > 0) {
+            break;
+        }
+    }
     EXPECT_EQ(context->get_statistics().bytes_buffered,
               on_io_thread(*context, [&]() { return conn->pending_write_bytes(); }));
 
@@ -383,7 +397,7 @@ TEST_F(BufferedConnectionTest, BytesBufferedStatDrainsToZeroOnceFlushed) {
             }
             return on_io_thread(*context, [&]() { return conn->pending_write_bytes(); }) == 0;
         },
-        5000ms));
+        kBackpressureTimeout));
 
     EXPECT_EQ(context->get_statistics().bytes_buffered, 0u);
 }
@@ -402,7 +416,7 @@ TEST_F(BufferedConnectionTest, BytesBufferedStatDroppedOnCloseWithPendingData) {
     // (kernel pipe full). A single 1 MiB write is usually enough once both
     // ends are shrunk, but Windows/Darwin can still accept more than the
     // requested SO_*BUF, so loop.
-    std::vector<uint8_t> payload(1 << 20, 'z');
+    std::vector<uint8_t> payload(kBackpressurePayload, 'z');
     std::size_t pending = 0;
     for (int i = 0; i < 64 && pending == 0; ++i) {
         on_io_thread(*context, [&]() { conn->write(payload); });
@@ -440,7 +454,7 @@ TEST_F(BufferedConnectionTest, CloseAfterFlushWaitsForPendingWriteToDrainFirst) 
 
     // Fill until something is still queued, then arm close_after_flush.
     // Peer drains below; until then the connection must stay open.
-    std::vector<uint8_t> payload(1 << 20, 'q');
+    std::vector<uint8_t> payload(kBackpressurePayload, 'q');
     std::size_t bytes_written = 0;
     std::size_t pending = 0;
     for (int i = 0; i < 64 && pending == 0; ++i) {
@@ -477,7 +491,7 @@ TEST_F(BufferedConnectionTest, CloseAfterFlushWaitsForPendingWriteToDrainFirst) 
             }
             return was_closed;
         },
-        5000ms));
+        kBackpressureTimeout));
 
     EXPECT_EQ(total_received, bytes_written)
         << "close_after_flush() must not truncate data queued before it was called";
