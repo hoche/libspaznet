@@ -303,8 +303,10 @@ TEST_P(WsTlsTest, HandshakeAndEcho) {
     auto frame = make_masked_text_frame("wss-ok", 0x01020304);
     ASSERT_TRUE(client.write_all(frame.data(), frame.size()));
 
-    std::string echoed = read_unmasked_text_payload(client);
-    EXPECT_EQ(echoed, "wss-ok");
+    ASSERT_NO_THROW({
+        std::string echoed = read_unmasked_text_payload(client);
+        EXPECT_EQ(echoed, "wss-ok");
+    });
 }
 
 INSTANTIATE_TEST_SUITE_P(Dispatchers, WsTlsTest, ::testing::ValuesIn(AllDispatcherKinds()),

@@ -72,6 +72,10 @@ auto TlsContext::create(const TlsConfig& cfg) -> std::shared_ptr<TlsContext> {
 
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    // TLS 1.3 NewSessionTicket is emitted during a later SSL_read and yields
+    // WANT_WRITE with an empty app OutputBuffer. That path is easy to mishandle
+    // on non-blocking Windows/IOCP; we don't resume TCP-TLS sessions anyway.
+    SSL_CTX_set_num_tickets(ctx, 0);
 
     BIO* cbio = BIO_new_mem_buf(cfg.cert_pem.data(), static_cast<int>(cfg.cert_pem.size()));
     if (cbio == nullptr) {
@@ -185,10 +189,11 @@ auto TlsStream::map_ssl_error(int ssl_ret) const -> TlsIoResult {
             return {TlsIoResult::Kind::Closed, 0};
         }
         // Windows (and some BIO setups) report EWOULDBLOCK/EAGAIN as
-        // SSL_ERROR_SYSCALL instead of WANT_READ/WANT_WRITE. Treat those as
-        // retryable so the reactor/coroutine wait path re-arms interest.
+        // SSL_ERROR_SYSCALL instead of WANT_READ/WANT_WRITE. WSAGetLastError
+        // can also be 0 while SSL_want still says READING/WRITING — treat
+        // both as retryable so the wait path re-arms interest.
         const int sock_err = detail::last_socket_error();
-        if (detail::is_retryable_socket_error(sock_err)) {
+        if (detail::is_retryable_socket_error(sock_err) || sock_err == 0) {
             const int want = SSL_want(ssl);
             if (want == SSL_WRITING) {
                 return {TlsIoResult::Kind::WantWrite, 0};
@@ -203,6 +208,7 @@ auto TlsStream::handshake() -> TlsIoResult {
     if (handshake_done_) {
         return {TlsIoResult::Kind::Ok, 0};
     }
+    ERR_clear_error();
     auto* ssl = static_cast<SSL*>(ssl_);
     int r = SSL_accept(ssl);
     if (r == 1) {
@@ -219,13 +225,11 @@ auto TlsStream::read(void* buf, std::size_t len) -> TlsIoResult {
     if (len == 0) {
         return {TlsIoResult::Kind::Ok, 0};
     }
+    ERR_clear_error();
     auto* ssl = static_cast<SSL*>(ssl_);
     int r = SSL_read(ssl, buf, static_cast<int>(len));
     if (r > 0) {
         return {TlsIoResult::Kind::Ok, static_cast<std::size_t>(r)};
-    }
-    if (r == 0) {
-        return map_ssl_error(r);
     }
     return map_ssl_error(r);
 }
@@ -237,6 +241,7 @@ auto TlsStream::write(const void* buf, std::size_t len) -> TlsIoResult {
     if (len == 0) {
         return {TlsIoResult::Kind::Ok, 0};
     }
+    ERR_clear_error();
     auto* ssl = static_cast<SSL*>(ssl_);
     int r = SSL_write(ssl, buf, static_cast<int>(len));
     if (r > 0) {

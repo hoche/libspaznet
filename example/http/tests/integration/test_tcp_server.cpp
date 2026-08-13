@@ -124,14 +124,20 @@ TEST_P(TCPServerTest, MultiplePorts) {
     ASSERT_NE(port2, 0u);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    // Both ports should be listening
+    // Full request/response on both ports — same rationale as ListenOnPort:
+    // bare connect()+close() races reactor accept under CI/QEMU.
     int client1 = connect_to_server(port1);
     int client2 = connect_to_server(port2);
-
-    if (client1 >= 0)
-        close_socket(client1);
-    if (client2 >= 0)
-        close_socket(client2);
+    ASSERT_GE(client1, 0);
+    ASSERT_GE(client2, 0);
+    const std::string req = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    ASSERT_EQ(send(client1, req.data(), req.size(), 0), static_cast<ssize_t>(req.size()));
+    ASSERT_EQ(send(client2, req.data(), req.size(), 0), static_cast<ssize_t>(req.size()));
+    char buf[512]{};
+    EXPECT_GT(recv(client1, buf, sizeof(buf) - 1, 0), 0);
+    EXPECT_GT(recv(client2, buf, sizeof(buf) - 1, 0), 0);
+    close_socket(client1);
+    close_socket(client2);
 }
 
 TEST_P(TCPServerTest, ServerShutdown) {

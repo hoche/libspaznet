@@ -258,6 +258,16 @@ void BufferedConnection::on_writable() {
             return;
         }
         write_interest_armed_ = false;
+#ifdef SPAZNET_HAS_TLS
+        // SSL_read may have armed write interest with nothing in output_
+        // (NewSessionTicket / KeyUpdate). An empty flush is not progress —
+        // retry the read path so SSL_read runs again after the socket is
+        // writable.
+        if (tls_) {
+            on_readable();
+            return;
+        }
+#endif
         ctx_.set_io_handler(fd_, PlatformIO::EVENT_READ, shared_from_this());
         return;
     }
