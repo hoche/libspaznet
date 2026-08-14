@@ -6,7 +6,8 @@
 
 - [x] Fix reactor model's threading system: N independent event loops via `ServerConfig{.loops = N}` and accept-and-shard. `Server(N)` keeps its coroutine meaning (1 loop + N workers); reactor TCP connections round-robin onto the loops. UDP stays on loop 0. See `docs/reactor-threading.md`.
 - [x] TLS-over-TCP for HTTP/1.1, HTTP/2, and WebSocket (`listen_tls`,
-  per-protocol ALPN; wss uses `http/1.1`).
+  per-protocol ALPN; wss uses `http/1.1`). Memory-BIO `TlsStream` +
+  Windows IOCP re-associate after handshake; CI green all platforms.
 - [x] Support wolfSSL as an alternate to OpenSSL (`-DSPAZNET_USE_WOLFSSL=ON`).
 - QUIC Demo. There is none at this point.
 - QUIC Improvements
@@ -49,6 +50,17 @@
 
 ## Progress Summary - 2026-08-13
 
+- [x] **TLS-over-TCP (HTTPS / WSS)** — `SPAZNET_ENABLE_TLS`,
+  `TlsConfig` / `Server::listen_tls`, ALPN per listener. Memory-BIO
+  `TlsStream` (OpenSSL never touches the socket; we pump ciphertext)
+  under `Socket` / `BufferedConnection`. Demos `--tls`; integration
+  tests both dispatchers. Independent of QUIC TLS.
+- [x] **Windows WSS / IOCP green** — (1) memory BIOs + per-stream TLS
+  mutex (HTTP/2 concurrent reader/writer); (2) IOCP
+  `CreateIoCompletionPort` re-associate after handshake `remove_io`
+  (`ERROR_INVALID_PARAMETER` = already associated); (3) reactor
+  drains TLS before arming a read probe. CI green: Linux x64,
+  macOS ARM64, Windows, Linux ARM64 (`d9cf42c`).
 - [x] **Reactor multi-loop accept-and-shard** — `ServerConfig{loops,N}` /
   `Server(ServerConfig)`; `Server` owns N `IOContext`s; TCP accept on
   loop 0 round-robins client fds onto loops; UDP stays on loop 0.
@@ -61,6 +73,7 @@
   now scales with `loops` (64 KiB/64 KiB ~13k → ~67k @ 32; 64 KiB/256
   KiB ~4k → ~45k @ 16) instead of sitting flat. Full suite green with
   coroutines ON and OFF.
+- [x] **wolfSSL alternate QUIC TLS** — `-DSPAZNET_USE_WOLFSSL=ON`.
 
 ## Progress Summary - 2026-08-12
 
@@ -318,8 +331,10 @@ items from the same re-audit, none critical:
   sockets use WSAEventSelect(FD_ACCEPT). CancelIoEx / UnregisterWait
   on modify/remove; aborted completions dropped. Default Windows
   builds use IOCP; `-DSPAZNET_FORCE_POLL=ON` keeps the portable
-  poll fallback. Buffer-based IOCP inside Socket remains a future
-  architecture project.
+  poll fallback. TCP TLS uses memory BIOs + sync recv/send on top of
+  readiness probes (not buffer-based overlapped WSARecv inside
+  Socket); re-associate after `remove_fd` is handled. Buffer-based
+  IOCP inside Socket remains a future architecture project.
 
 - [x] parse_chunked_body should accept trailer headers — landed
   2026-05-31 in example/http/src/handler.cpp; trailers are
@@ -586,17 +601,17 @@ Ordered by priority.
 - [x] Add support for TLS (QUIC path)
   - Shipped as part of the QUIC rewrite (commit 3da5cbb). The
   `TlsContext` / `TlsConnection` wrappers around OpenSSL 3.5+ live
-  in `include/libspaznet/quic/tls.hpp`. They're QUIC-specific
-  today — using them for vanilla TLS-over-TCP would need a thin
-  `SSL_read`/`SSL_write`-driven path that isn't there yet, but the
-  SSL_CTX construction (cert/key loading, ALPN) is reusable.
+  in `include/libspaznet/quic/tls.hpp`. QUIC-specific (callbacks /
+  wolfSSL alternate); TCP TLS is a separate stack (below).
 
 - [x] **TLS-over-TCP for HTTP / HTTP/2 / WebSocket (https / wss)** — shipped
   - `SPAZNET_ENABLE_TLS` / `SPAZNET_HAS_TLS` (OpenSSL 1.1.1+),
-  `TlsConfig` + `Server::listen_tls`, TLS under `Socket` /
-  `BufferedConnection` (`SSL_read`/`SSL_write`). Per-protocol ALPN
-  (`http/1.1` vs `h2`); no cross-protocol mux. WSS uses
-  `alpn={"http/1.1"}` (upgrade after handshake). Demos: `--tls` on
-  `http_hello` / `http2_hello` / `ws_echo` / `ws_chat`. Independent
-  of QUIC TLS.
+  `TlsConfig` + `Server::listen_tls`. Internal `detail::TlsStream`
+  uses memory BIOs + explicit `recv`/`send` (safe with IOCP
+  readiness probes); per-stream mutex for concurrent HTTP/2
+  reader/writer. Under `Socket` / `BufferedConnection`. Per-protocol
+  ALPN (`http/1.1` vs `h2`); WSS uses `alpn={"http/1.1"}`. Demos:
+  `--tls` on `http_hello` / `http2_hello` / `ws_echo` / `ws_chat`.
+  Windows: IOCP re-associate after handshake `remove_io` so
+  post-101 reads arm correctly. Independent of QUIC TLS.
 
