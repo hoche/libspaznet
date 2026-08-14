@@ -140,6 +140,13 @@ Sharding across N independent loops, each with its own connections
 pinned at accept, is available via `Server(ServerConfig{.loops = N})`
 (accept-and-shard). See [`reactor-threading.md`](reactor-threading.md).
 
+TCP TLS follows the same affinity rule: reactor `BufferedConnection`
+drives a memory-BIO `TlsStream` only from the IO thread, so it leaves
+`io_mu_` off. Coroutine connections that share one `SSL*` across
+tasks (`Socket::attach_tls`) call `enable_serialized_io()`. Accept→
+factory TLS handoff is `thread_local` on the accept thread — no global
+stash map. Lock inventory: `README.md` *Concurrency Primitives*.
+
 ## TaskQueue Internal Structure
 
 ![TaskQueue internal structure](svgs/taskqueue-structure.svg)

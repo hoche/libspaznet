@@ -93,8 +93,10 @@ minimal example.
 
 ### What it bought you
 
-- Core builds with **no OpenSSL dependency** (gated only by
-  `SPAZNET_BUILD_QUIC` on `example/quic-http3`).
+- Core builds with **no OpenSSL dependency** for the protocol
+  libraries (QUIC gated by `SPAZNET_BUILD_QUIC` on
+  `example/quic-http3`). Optional TCP TLS (`SPAZNET_ENABLE_TLS` /
+  `listen_tls`) landed later on core — see `docs/integration.md`.
 - HTTP/2 dispatch is now **actually wired up** —
   `set_http2_handler` used to be a no-op (the parser existed but
   the connection coroutine never invoked it); `spaznet::http2::make_dispatcher`

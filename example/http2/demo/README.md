@@ -1,19 +1,25 @@
 # HTTP/2 demos
 
 Two small servers built on `spaznet::http2::make_dispatcher`, both
-serving h2c (prior-knowledge cleartext HTTP/2) on the same port (8080).
+serving h2c (prior-knowledge cleartext HTTP/2) on port 8080. When the
+core is built with `SPAZNET_HAS_TLS`, `hello` also accepts `--tls` for
+ALPN `h2` on 8443 (self-signed).
 
 ## `hello.cpp` — minimal server
 
 ```bash
 ./http2_hello
 curl --http2-prior-knowledge http://localhost:8080/
+
+./http2_hello --tls
+curl -k --http2 https://127.0.0.1:8443/
 ```
 
 A single route that always returns `200 OK` with a fixed body. This is
 the "hello world" of the `Handler` interface — enough to show how a
 handler is wired into `Server::set_connection_handler`, but nothing
-about what HTTP/2 actually adds over HTTP/1.1.
+about what HTTP/2 actually adds over HTTP/1.1. `--tls` uses
+`Server::listen_tls` with `alpn={"h2"}`; the dispatcher is unchanged.
 
 ## `showcase.cpp` — stream multiplexing showcase
 

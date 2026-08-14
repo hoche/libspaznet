@@ -98,6 +98,14 @@ HTTP/2 TLS listener advertises `h2`. There is no ALPN mux that routes
 both protocols on one port. `example/http/demo/hello.cpp --tls` listens
 on 8443 with a self-signed cert (`curl -k https://127.0.0.1:8443/`).
 
+Implementation notes (see also `docs/integration.md`):
+
+- Memory-BIO `TlsStream` + explicit `recv`/`send` (IOCP-safe; OpenSSL
+  does not touch the socket fd).
+- Reactor path: no TLS mutex (IO-thread affinity). Coroutine
+  `Socket::attach_tls` enables serialization for shared `SSL*`.
+- Independent of QUIC's OpenSSL 3.5+ / wolfSSL requirement.
+
 ### `HTTPRequest`
 
 The handler receives a fully-parsed request:
@@ -266,9 +274,11 @@ curl --http2-prior-knowledge -s -i http://127.0.0.1:8080/
 For h2-over-TLS, use `Server::listen_tls` with `alpn = {"h2"}` (requires
 `SPAZNET_HAS_TLS`). Same dual-dispatcher story as cleartext h2c —
 `example/http2/demo/hello.cpp --tls` listens on 8443
-(`curl -k --http2 https://127.0.0.1:8443/`). The QUIC stack
-(`example/quic-http3`) remains a separate UDP path with its own TLS
-backend (OpenSSL 3.5+ or wolfSSL).
+(`curl -k --http2 https://127.0.0.1:8443/`). Coroutine HTTP/2 shares
+one `SSL*` across reader/writer tasks, so `Socket::attach_tls` enables
+`TlsStream` serialization; the reactor dispatcher does not. The QUIC
+stack (`example/quic-http3`) remains a separate UDP path with its own
+TLS backend (OpenSSL 3.5+ or wolfSSL).
 
 ### Two dispatchers, one handler
 

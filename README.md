@@ -13,13 +13,14 @@ A high-performance, cross-platform network server library written in C++20 that 
   - **Coroutines** (`make_dispatcher(...)`) — `Task`/`co_await`, the original model. Connection state lives implicitly in the coroutine frame, which can migrate freely between worker threads.
   - **Reactor** (`make_reactor_dispatcher(...)`) — plain callbacks over an explicit state machine (`BufferedConnection` + phase enum), no `<coroutine>` dependency, no coroutine-frame allocation. Works with `-DSPAZNET_ENABLE_COROUTINES=OFF`.
   - Both hit the identical protocol codec and the identical handler object where the handler shape allows it (HTTP/1.1, HTTP/2, UDP, QUIC/HTTP3); only the execution model differs. See *Execution Models* below.
-- **Thread-safe:** Single-threaded by default, or multi-threaded with a small fixed set of mutexes (see *Concurrency Primitives* below and `docs/mutex-vs-atomics.md`)
+- **Thread-safe:** Single-threaded by default, or multi-threaded with a small fixed set of mutexes (see *Concurrency Primitives* below and `docs/mutex-vs-atomics.md`). Reactor TLS I/O takes no per-connection mutex (IO-thread affinity); coroutine TLS serializes only when needed.
+- **Optional TCP TLS (HTTPS / WSS):** `Server::listen_tls` + `TlsConfig` when OpenSSL 1.1.1+ is found (`SPAZNET_ENABLE_TLS`, default ON). Memory-BIO `TlsStream` under `Socket` / `BufferedConnection`; per-listener ALPN (`http/1.1` or `h2`). Independent of QUIC's OpenSSL 3.5+ / wolfSSL stack. See `docs/integration.md`.
 - **Protocol support:**
   - UDP
-  - HTTP/1.1
-  - HTTP/2
+  - HTTP/1.1 (plain and HTTPS)
+  - HTTP/2 (h2c and TLS `h2`)
   - QUIC & HTTP/3 (partial)
-  - WebSockets
+  - WebSockets (plain and WSS)
 
 
 
@@ -307,11 +308,11 @@ under `example/*/demo/` (see each directory's `README.md` for details):
 
 | Protocol        | Binary           | Description                                                               |
 | --------------- | ---------------- | ------------------------------------------------------------------------- |
-| **HTTP/1.x**    | `http_hello`     | Minimal `HTTPHandler` that always returns a fixed body                    |
+| **HTTP/1.x**    | `http_hello`     | Minimal `HTTPHandler`; `--tls` for HTTPS on 8443                          |
 |                 | `http_showcase`  | HTTP/1.0 vs 1.1 differences (keep-alive, chunked framing, request bodies) |
-| **WebSocket**   | `ws_echo`        | Minimal echo; also serves plain HTTP on the same port                     |
-|                 | `ws_chat`        | Multi-client broadcast chat with a browser HTML+JS page                   |
-| **HTTP/2**      | `http2_hello`    | Minimal h2c (prior-knowledge) hello world                                 |
+| **WebSocket**   | `ws_echo`        | Minimal echo; plain HTTP on the same port; `--tls` for WSS                |
+|                 | `ws_chat`        | Multi-client broadcast chat with a browser HTML+JS page; `--tls` for WSS  |
+| **HTTP/2**      | `http2_hello`    | Minimal h2c (prior-knowledge); `--tls` for ALPN `h2`                      |
 |                 | `http2_showcase` | Stream multiplexing via `/slow?ms=N`, plus HPACK/DATA routes              |
 | **QUIC-HTTP/3** | ---              | None yet                                                                  |
 | **UDP**         | `udp_echo`       | Minimal datagram echo                                                     |
@@ -321,10 +322,13 @@ under `example/*/demo/` (see each directory's `README.md` for details):
 
 ```bash
 ./build/example/http/http_hello
+./build/example/http/http_hello --tls          # HTTPS (self-signed) on 8443
 ./build/example/http/http_showcase
 ./build/example/http-websocket/ws_echo
+./build/example/http-websocket/ws_echo --tls   # WSS on 8443
 ./build/example/http-websocket/ws_chat
 ./build/example/http2/http2_hello
+./build/example/http2/http2_hello --tls
 ./build/example/http2/http2_showcase
 ./build/example/udp/udp_echo
 ./build/example/udp/udp_relay
@@ -346,7 +350,7 @@ porting code from before the restructure.
 - **Server:** High-level server interface; `set_connection_handler` wires up a coroutine dispatcher, `set_connection_factory` wires up a reactor one
 - **Handlers:** Protocol-specific request handlers (UDP, HTTP, HTTP/2, WebSocket, QUIC, HTTP/3), each with a coroutine dispatcher and a reactor dispatcher sharing the same codec
 
-Coroutines are the optional layer, not the foundation: the reactor core (`IoHandler`, `BufferedConnection`, `post()`/timers) builds and runs with zero coroutine dependency, and coroutine support is an adapter on top of it, gated by the `SPAZNET_ENABLE_COROUTINES` CMake option (default `ON`). See *Execution Models* above. Most state on the hot path is held in `std::atomic<…>`; structural mutations are guarded by a small set of mutexes (see *Concurrency Primitives* below).
+Coroutines are the optional layer, not the foundation: the reactor core (`IoHandler`, `BufferedConnection`, `post()`/timers) builds and runs with zero coroutine dependency, and coroutine support is an adapter on top of it, gated by the `SPAZNET_ENABLE_COROUTINES` CMake option (default `ON`). See *Execution Models* above. Most state on the hot path is held in `std::atomic<…>`; structural mutations are guarded by a small set of mutexes (see *Concurrency Primitives* below). TCP TLS follows the same split: reactor connections never take `TlsStream::io_mu_`; coroutine `Socket::attach_tls` enables it only when reader and writer coroutines can share one SSL*.
 
 ### Concurrency Primitives
 
@@ -372,10 +376,11 @@ Coroutines are the optional layer, not the foundation: the reactor core (`IoHand
 | `ResponseWriter<Response>::State::mu`  | `include/libspaznet/reactor/response_writer.hpp`  | —              | both      | the shared completion state (`deliver`, `on_ready`, `completed`) so `complete()` can race safely against `on_ready()` registration from any thread    |
 | `PlatformIOPoll::mutex_`               | `src/platform/platform_io_poll.cpp`               | poll / WSAPoll | both      | interest-set tables (`pollfds_` / `fd_info_`); compiled when `USE_POLL` is selected (non-Windows default fallback, or `-DSPAZNET_FORCE_POLL=ON` on Windows) |
 | `PlatformIOIOCP::mutex_`               | `src/platform/platform_io_iocp.cpp`               | IOCP (Winsock) | both      | IOCP fd/probe tables; compiled when `USE_IOCP` is selected (default on Windows)                                                                        |
+| `detail::TlsStream::io_mu_` (optional) | `include/libspaznet/detail/tls_stream.hpp`        | all            | coroutine | taken only after `Socket::attach_tls` → `enable_serialized_io()`; reactor `BufferedConnection` leaves it off (IO-thread affinity). Protects SSL* + memory-BIO pump when HTTP/2/WS coroutines share a connection |
 | `detail::ensure_winsock()` `once_flag` | `include/libspaznet/detail/socket_compat.hpp`     | Winsock        | both      | process-wide `WSAStartup` / `WSACleanup`; fires at most once (not a `std::mutex`)                                                                      |
 
 
-Everything else in core — coroutine ref-counts, the per-fd generation counter that defeats fd-reuse, statistics, timer ids, `running_` / `active_connections_` flags, etc. — lives in `std::atomic<…>` and never reaches for a mutex. Reactor connection state itself (`BufferedConnection` and everything built on it) needs no lock at all: exactly one thread per `IOContext` ever calls `on_readable()`/`on_writable()` — see [`docs/reactor-threading.md`](docs/reactor-threading.md) and `docs/concurrency-and-coroutines.md`'s "Reactor Threading Model".
+Everything else in core — coroutine ref-counts, the per-fd generation counter that defeats fd-reuse, statistics, timer ids, `running_` / `active_connections_` flags, etc. — lives in `std::atomic<…>` and never reaches for a mutex. Reactor connection state itself (`BufferedConnection` and everything built on it, including TLS under memory BIOs) needs no lock at all: exactly one thread per `IOContext` ever calls `on_readable()`/`on_writable()` — see [`docs/reactor-threading.md`](docs/reactor-threading.md) and `docs/concurrency-and-coroutines.md`'s "Reactor Threading Model". TLS accept→factory handoff is `thread_local` (no global stash map).
 
 See `docs/mutex-vs-atomics.md` for why the core locks are mutexes rather than atomics.
 
@@ -443,6 +448,7 @@ For detailed information about the coroutine execution model, thread scheduling,
 | Mutex vs. atomic posture                      | `[docs/mutex-vs-atomics.md](docs/mutex-vs-atomics.md)`                     |
 | Performance numbers                           | `[docs/performance.md](docs/performance.md)`                               |
 | Integrating libspaznet into your project      | `[docs/integration.md](docs/integration.md)`                               |
+| TCP TLS / HTTPS / WSS build notes             | `[docs/integration.md](docs/integration.md)` (TLS sections)                |
 | Migration / breaking changes                  | `[docs/migration.md](docs/migration.md)`                                   |
 | API reference (Doxygen)                       | `[docs/doxygen.md](docs/doxygen.md)`                                       |
 | Contributing                                  | `[CONTRIBUTING.md](CONTRIBUTING.md)`                                       |
@@ -453,22 +459,23 @@ For detailed information about the coroutine execution model, thread scheduling,
 
 ## Requirements
 
-- C++20 compiler with++ `<format>` ++support: **GCC 13.1+** or **Clang 17+**
-(with libstdc++ from gcc 13+, or libc++).
+- C++20 compiler with `<format>` support: **GCC 13.1+** or **Clang 17+**
+  (with libstdc++ from gcc 13+, or libc++).
 - CMake 3.20+
 - Make (optional, for convenience targets)
 - The `SPAZNET_ENABLE_COROUTINES` CMake option (default `ON`) gates the
-coroutine execution model and its `<coroutine>` dependency; the reactor
-model has no such dependency. Set `-DSPAZNET_ENABLE_COROUTINES=OFF` to
-build the core library, every protocol, every demo, and the full test
-suite with zero coroutine code compiled in — see
-[docs/coro-free-build.md](docs/coro-free-build.md).
-- **OpenSSL 3.5+** — only required when building the QUIC v1 + HTTP/3
-stack. The CMake option `SPAZNET_BUILD_QUIC` (default `ON`) gates this:
-if OpenSSL 3.5+ isn't available, CMake prints a warning and disables
-the QUIC build automatically; the rest of the library (UDP, HTTP/1.1,
-HTTP/2, WebSocket) still builds with no OpenSSL dependency. To turn
-it off explicitly:
+  coroutine execution model and its `<coroutine>` dependency; the reactor
+  model has no such dependency. Set `-DSPAZNET_ENABLE_COROUTINES=OFF` to
+  build the core library, every protocol, every demo, and the full test
+  suite with zero coroutine code compiled in — see
+  [docs/coro-free-build.md](docs/coro-free-build.md).
+- **OpenSSL 1.1.1+** — optional for TCP TLS (`listen_tls` / HTTPS / WSS).
+  `SPAZNET_ENABLE_TLS` defaults `ON` when found; otherwise CMake warns and
+  builds without `SPAZNET_HAS_TLS`. Independent of QUIC.
+- **OpenSSL 3.5+** (or wolfSSL with QUIC) — only required when building
+  the QUIC v1 + HTTP/3 stack. `SPAZNET_BUILD_QUIC` (default `ON`) gates
+  this: if no backend is available, CMake warns and disables QUIC; UDP /
+  HTTP/1.1 / HTTP/2 / WebSocket still build. Explicit off:
   ```
   cmake -B build -DSPAZNET_BUILD_QUIC=OFF
   ```

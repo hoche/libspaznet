@@ -17,7 +17,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace spaznet::detail {
@@ -84,9 +83,17 @@ class TlsStream {
         return handshake_done_;
     }
 
-    // Factory path: Server stashes a completed (or ready-to-claim) stream
-    // keyed by fd; BufferedConnection claims it in its constructor so
-    // ConnectionFactory implementations need no TLS awareness.
+    // Coroutine Socket path: reader and writer coroutines may call into the
+    // same SSL* from different worker threads (HTTP/2 writer_loop, WS
+    // WriteGate). Reactor BufferedConnection is IO-thread-affine and leaves
+    // this off so the hot path takes no mutex.
+    void enable_serialized_io() noexcept {
+        serialize_io_ = true;
+    }
+
+    // Same-thread handoff from TlsHandshakeHandler::finish_ok into
+    // BufferedConnection's constructor (factory runs synchronously on the
+    // handshake's target loop). No mutex — thread_local only.
     static void stash_for_fd(int fd, std::unique_ptr<TlsStream> stream);
     static auto claim_for_fd(int fd) -> std::unique_ptr<TlsStream>;
 
@@ -97,24 +104,28 @@ class TlsStream {
     auto flush_network() -> TlsIoResult;
     auto drain_wbio_to_pending() -> void;
 
+    // RAII: locks io_mu_ only when serialize_io_ is set.
+    struct IoGate {
+        explicit IoGate(const TlsStream& self) {
+            if (self.serialize_io_) {
+                lk_ = std::unique_lock<std::recursive_mutex>(self.io_mu_);
+            }
+        }
+        std::unique_lock<std::recursive_mutex> lk_;
+    };
+
     void* ssl_{nullptr}; // SSL*
     int fd_{-1};
     bool handshake_done_{false};
     bool shutdown_done_{false};
+    bool serialize_io_{false};
 
-    // HTTP/2 (and any future protocol) may run a reader coroutine and a
-    // writer coroutine on the same Socket concurrently. OpenSSL SSL*
-    // objects are not thread-safe; memory-BIO pending_out_ isn't either.
-    // recursive: write()/flush() callers also check wants_write().
     mutable std::recursive_mutex io_mu_;
 
     // Ciphertext waiting for a non-blocking send (partial send residue +
     // anything pulled from the write BIO that has not hit the wire yet).
     std::vector<uint8_t> pending_out_;
     std::size_t pending_out_off_{0};
-
-    static std::mutex stash_mu_;
-    static std::unordered_map<int, std::unique_ptr<TlsStream>> stash_;
 };
 
 } // namespace spaznet::detail

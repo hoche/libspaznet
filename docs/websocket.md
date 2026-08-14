@@ -129,6 +129,10 @@ Demos: `ws_echo --tls` / `ws_chat --tls` listen on 8443
 (`wscat -c wss://127.0.0.1:8443/ --no-check`). The chat page already
 picks `wss:` when loaded over `https:`.
 
+Same core TLS path as HTTPS (memory BIOs, optional coroutine
+serialization, IOCP re-associate after handshake `remove_io`). See
+`docs/integration.md` and `docs/http.md`'s HTTPS section.
+
 One notable difference in shape, not behavior: `reactor::Connection` is
 a small copyable value (a `weak_ptr` plus the connection's fd), unlike
 the coroutine `Connection`, which is deliberately non-copyable because

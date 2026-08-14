@@ -1,7 +1,9 @@
 # WebSocket demos
 
 Two small servers built on `spaznet::websocket::make_dispatcher`, both
-serving plain HTTP/1.1 and WebSocket on the same port (8080).
+serving plain HTTP/1.1 and WebSocket on port 8080. When the core is
+built with `SPAZNET_HAS_TLS`, both accept `--tls` for WSS on 8443
+(self-signed; ALPN `http/1.1`).
 
 ## `echo.cpp` — minimal echo server
 
@@ -10,6 +12,9 @@ serving plain HTTP/1.1 and WebSocket on the same port (8080).
 wscat -c ws://localhost:8080/
 > hi
 < hi
+
+./ws_echo --tls
+wscat -c wss://127.0.0.1:8443/ --no-check
 ```
 
 Every message a client sends is written straight back to that same
@@ -23,6 +28,10 @@ handshake logic in `src/dispatcher.cpp` without any handler-side state.
 ```bash
 ./ws_chat
 # open http://localhost:8080/ in two or more browser tabs
+
+./ws_chat --tls
+# open https://127.0.0.1:8443/ (accept the self-signed warning);
+# the page picks wss: automatically when loaded over https:
 ```
 
 Every client that connects joins a shared room; a text message from one

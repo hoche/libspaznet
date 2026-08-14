@@ -92,6 +92,11 @@ class Socket {
 #ifdef SPAZNET_HAS_TLS
     void attach_tls(std::unique_ptr<detail::TlsStream> tls) {
         tls_ = std::move(tls);
+        // Coroutine path: HTTP/2 writer∥reader and WS WriteGate∥read may
+        // enter SSL_* from different workers. Reactor leaves this off.
+        if (tls_) {
+            tls_->enable_serialized_io();
+        }
     }
     [[nodiscard]] auto has_tls() const noexcept -> bool {
         return static_cast<bool>(tls_);

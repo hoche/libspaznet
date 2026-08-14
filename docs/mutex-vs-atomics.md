@@ -2,10 +2,12 @@
 
 This document explains why `libspaznet` uses mutexes in specific places
 instead of atomic operations. The library's design leans heavily on
-`std::atomic<…>` for cross-thread state, but five locking primitives
-remain. This is the rationale for each.
+`std::atomic<…>` for cross-thread state; the full lock inventory (including
+platform demux, reactor reap/join, optional TLS) lives in `README.md`'s
+*Concurrency Primitives* table. Below is the rationale for the original
+core set that cannot sensibly become atomics.
 
-## Inventory
+## Inventory (core rationale)
 
 | Location | Primitive | Reason it can't be atomics |
 |---|---|---|
@@ -16,7 +18,10 @@ remain. This is the rationale for each.
 | `Server::client_fds_mutex_` | `std::mutex` | `std::unordered_set` is not thread-safe; concurrent insert/erase by `handle_connection` coroutines must serialize with `Server::stop()`'s walk-and-shutdown sweep. |
 
 Plus one `std::once_flag` in the Windows-only WSAStartup helper, which
-fires at most once per process.
+fires at most once per process. TCP TLS adds an **optional**
+`TlsStream::io_mu_` only on the coroutine `Socket` path
+(`enable_serialized_io`); reactor TLS takes no lock. Accept→factory
+TLS handoff is `thread_local` (no stash mutex).
 
 ## 1. TaskQueue — both ends, single mutex
 

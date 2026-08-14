@@ -6,6 +6,13 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
+## 2026-08-13 — fewer TLS locks on the reactor hot path
+
+`TlsStream` locks only when `enable_serialized_io()` was called
+(`Socket::attach_tls` for coroutine HTTP/2∥WS). Reactor connections
+skip the mutex. TLS accept→factory handoff is `thread_local` (no
+`stash_mu_` / global fd map).
+
 ## 2026-08-13 — IOCP re-associate after TLS handshake remove_io
 
 Windows: `CreateIoCompletionPort` on a socket that was associated, then
@@ -23,8 +30,9 @@ not race IOCP's overlapped zero-byte `WSARecv` probes. That race left
 Windows WSS hanging after the 101 response (HTTPS still worked because
 the request was drained in one wake). Also drains pending ciphertext
 when the app `OutputBuffer` is empty, and serializes `SSL_*` / BIO pump
-ops with a per-stream mutex (HTTP/2's concurrent reader+writer
-coroutines otherwise corrupt the TLS state).
+ops with a per-stream mutex for concurrent HTTP/2 reader+writer
+coroutines (later made optional via `enable_serialized_io` — see
+"fewer TLS locks" above; reactor path stays unlocked).
 
 ## 2026-08-13 — TLS-over-TCP for HTTP/1.1, HTTP/2, and WebSocket
 

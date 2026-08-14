@@ -10,9 +10,11 @@ you want to track upstream or pin to a snapshot.
   AppleClang from Xcode 15+. The library uses `<format>`,
   `<coroutine>`, and `<span>`.
 - **CMake 3.20+**.
-- **TCP TLS (HTTPS)** — optional. Default: **OpenSSL 1.1.1+** via
-  `SPAZNET_ENABLE_TLS` (auto-disables with a warning if missing).
-  Enables `Server::listen_tls` for HTTP/1.1 and HTTP/2.
+- **TCP TLS (HTTPS / WSS / h2)** — optional. Default: **OpenSSL 1.1.1+**
+  via `SPAZNET_ENABLE_TLS` (auto-disables with a warning if missing).
+  Enables `Server::listen_tls` for HTTP/1.1, HTTP/2 (`h2`), and
+  WebSocket upgrade over TLS. See *TCP TLS* under *TLS backend
+  location* below.
 - **QUIC TLS backend** — *only* required if you want QUIC + HTTP/3.
   Default: **OpenSSL 3.5+**. Alternate: **wolfSSL** with QUIC
   (`-DSPAZNET_USE_WOLFSSL=ON`). Without a usable backend the rest of
@@ -95,7 +97,8 @@ build QUIC against a QUIC-enabled wolfSSL instead — OpenSSL is then
 not required.
 
 Cleartext HTTP/1.1, HTTP/2 (h2c), WebSocket, and UDP build with
-`-DSPAZNET_ENABLE_TLS=OFF` and no OpenSSL on core. HTTPS needs TLS on.
+`-DSPAZNET_ENABLE_TLS=OFF` and no OpenSSL on core. HTTPS / WSS / h2
+over TLS need TLS on.
 
 To force-disable QUIC:
 
@@ -124,7 +127,45 @@ public interface, so any TU that links it gets the macro.
 
 ## TLS backend location
 
-### OpenSSL 3.5+ (default)
+Two independent stacks: **TCP TLS** on core (`listen_tls`) and **QUIC
+TLS** on `spaznet::quic_http3`. You can enable either, both, or neither.
+
+### TCP TLS (OpenSSL 1.1.1+)
+
+`SPAZNET_ENABLE_TLS` defaults `ON` when `find_package(OpenSSL 1.1.1)`
+succeeds. Distro OpenSSL 3.x packages satisfy this; no separate 3.5
+install is required for HTTPS/WSS.
+
+Internals that matter for integrators:
+
+- Ciphertext rides **memory BIOs** + explicit `recv`/`send` (OpenSSL
+  never owns the socket). Safe with IOCP's zero-byte readiness probes.
+- Handshake runs on the accept path; the live `TlsStream` hands off to
+  the connection factory via `thread_local` (same thread), then lives
+  under `Socket` / `BufferedConnection`. Dispatchers see plaintext.
+- **Reactor** TLS takes no per-connection mutex (IO-thread affinity).
+  **Coroutine** `Socket::attach_tls` calls `enable_serialized_io()` so
+  HTTP/2∥WS reader/writer tasks sharing one `SSL*` serialize.
+- Per-listener ALPN only (`http/1.1` or `h2`); no multi-protocol ALPN
+  mux on one port. WSS uses `alpn={"http/1.1"}`.
+
+```bash
+# Typical: system OpenSSL is enough for TCP TLS
+cmake -B build
+
+# Explicit off
+cmake -B build -DSPAZNET_ENABLE_TLS=OFF
+```
+
+Detect in application code:
+
+```cpp
+#ifdef SPAZNET_HAS_TLS
+    server.listen_tls(8443, std::move(cfg));
+#endif
+```
+
+### QUIC: OpenSSL 3.5+ (default)
 
 On most Linux distros OpenSSL 3.5+ is too new for stock packages —
 you'll need a custom install. On macOS Homebrew ships
@@ -139,9 +180,11 @@ cmake -B build -DOPENSSL_ROOT_DIR=/opt/openssl-3.5
 ```
 
 The CMake check is `find_package(OpenSSL 3.5 QUIET)` — `QUIET` so a
-missing OpenSSL doesn't error; it warns and disables QUIC.
+missing OpenSSL doesn't error; it warns and disables QUIC. A system
+OpenSSL 1.1.1 / 3.0 install can still satisfy **TCP TLS** even when
+QUIC is disabled.
 
-### wolfSSL (alternate)
+### QUIC: wolfSSL (alternate)
 
 Stock distro wolfSSL packages usually lack `--enable-quic`. Build
 from source, then point CMake at the prefix:

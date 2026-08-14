@@ -46,8 +46,13 @@ auto build_alpn_wire(const std::vector<std::string>& alpn) -> std::vector<unsign
 
 } // namespace
 
-std::mutex TlsStream::stash_mu_;
-std::unordered_map<int, std::unique_ptr<TlsStream>> TlsStream::stash_;
+namespace {
+
+// Same-thread handoff: finish_ok → connection_factory → BufferedConnection.
+// No mutex — factory always runs on the handshake's target loop thread.
+thread_local std::unique_ptr<TlsStream> tls_handoff;
+
+} // namespace
 
 TlsContext::TlsContext(void* ctx, std::vector<std::string> alpn,
                        std::vector<unsigned char> alpn_wire)
@@ -279,7 +284,7 @@ auto TlsStream::feed_network() -> TlsIoResult {
 }
 
 auto TlsStream::wants_write() const noexcept -> bool {
-    std::lock_guard<std::recursive_mutex> lock(io_mu_);
+    IoGate gate(*this);
     if (pending_out_off_ < pending_out_.size()) {
         return true;
     }
@@ -292,12 +297,12 @@ auto TlsStream::wants_write() const noexcept -> bool {
 }
 
 auto TlsStream::flush() -> TlsIoResult {
-    std::lock_guard<std::recursive_mutex> lock(io_mu_);
+    IoGate gate(*this);
     return flush_network();
 }
 
 auto TlsStream::handshake() -> TlsIoResult {
-    std::lock_guard<std::recursive_mutex> lock(io_mu_);
+    IoGate gate(*this);
     if (handshake_done_) {
         // Final flight may still be in pending_out_ after SSL_accept
         // returned 1 with WantWrite; keep flushing until the wire is clear.
@@ -346,7 +351,7 @@ auto TlsStream::handshake() -> TlsIoResult {
 }
 
 auto TlsStream::read(void* buf, std::size_t len) -> TlsIoResult {
-    std::lock_guard<std::recursive_mutex> lock(io_mu_);
+    IoGate gate(*this);
     if (!handshake_done_) {
         return {TlsIoResult::Kind::Error, 0};
     }
@@ -395,7 +400,7 @@ auto TlsStream::read(void* buf, std::size_t len) -> TlsIoResult {
 }
 
 auto TlsStream::write(const void* buf, std::size_t len) -> TlsIoResult {
-    std::lock_guard<std::recursive_mutex> lock(io_mu_);
+    IoGate gate(*this);
     if (!handshake_done_) {
         return {TlsIoResult::Kind::Error, 0};
     }
@@ -441,7 +446,7 @@ auto TlsStream::write(const void* buf, std::size_t len) -> TlsIoResult {
 }
 
 void TlsStream::shutdown() noexcept {
-    std::lock_guard<std::recursive_mutex> lock(io_mu_);
+    IoGate gate(*this);
     if (shutdown_done_ || ssl_ == nullptr) {
         return;
     }
@@ -451,20 +456,13 @@ void TlsStream::shutdown() noexcept {
     (void)flush_network();
 }
 
-void TlsStream::stash_for_fd(int fd, std::unique_ptr<TlsStream> stream) {
-    std::lock_guard<std::mutex> lock(stash_mu_);
-    stash_[fd] = std::move(stream);
+void TlsStream::stash_for_fd(int /*fd*/, std::unique_ptr<TlsStream> stream) {
+    // Drop any unclaimed prior handoff (factory declined / forgot claim).
+    tls_handoff = std::move(stream);
 }
 
-auto TlsStream::claim_for_fd(int fd) -> std::unique_ptr<TlsStream> {
-    std::lock_guard<std::mutex> lock(stash_mu_);
-    auto it = stash_.find(fd);
-    if (it == stash_.end()) {
-        return nullptr;
-    }
-    auto out = std::move(it->second);
-    stash_.erase(it);
-    return out;
+auto TlsStream::claim_for_fd(int /*fd*/) -> std::unique_ptr<TlsStream> {
+    return std::move(tls_handoff);
 }
 
 } // namespace spaznet::detail

@@ -50,17 +50,21 @@
 
 ## Progress Summary - 2026-08-13
 
+- [x] **Fewer TLS locks on reactor hot path** — `TlsStream` mutex only
+  after `Socket::attach_tls` (coroutine HTTP/2∥WS); reactor skips it.
+  Accept→factory TLS handoff is `thread_local` (dropped `stash_mu_`).
 - [x] **TLS-over-TCP (HTTPS / WSS)** — `SPAZNET_ENABLE_TLS`,
   `TlsConfig` / `Server::listen_tls`, ALPN per listener. Memory-BIO
   `TlsStream` (OpenSSL never touches the socket; we pump ciphertext)
   under `Socket` / `BufferedConnection`. Demos `--tls`; integration
   tests both dispatchers. Independent of QUIC TLS.
-- [x] **Windows WSS / IOCP green** — (1) memory BIOs + per-stream TLS
-  mutex (HTTP/2 concurrent reader/writer); (2) IOCP
-  `CreateIoCompletionPort` re-associate after handshake `remove_io`
-  (`ERROR_INVALID_PARAMETER` = already associated); (3) reactor
-  drains TLS before arming a read probe. CI green: Linux x64,
-  macOS ARM64, Windows, Linux ARM64 (`d9cf42c`).
+- [x] **Windows WSS / IOCP green** — (1) memory BIOs (OpenSSL never
+  touches the socket); (2) IOCP `CreateIoCompletionPort` re-associate
+  after handshake `remove_io` (`ERROR_INVALID_PARAMETER` = already
+  associated); (3) reactor drains TLS before arming a read probe.
+  Coroutine HTTP/2∥WS later got conditional `enable_serialized_io`
+  (reactor stays unlocked). CI green: Linux x64, macOS ARM64,
+  Windows, Linux ARM64 (`d9cf42c`).
 - [x] **Reactor multi-loop accept-and-shard** — `ServerConfig{loops,N}` /
   `Server(ServerConfig)`; `Server` owns N `IOContext`s; TCP accept on
   loop 0 round-robins client fds onto loops; UDP stays on loop 0.
@@ -608,10 +612,12 @@ Ordered by priority.
   - `SPAZNET_ENABLE_TLS` / `SPAZNET_HAS_TLS` (OpenSSL 1.1.1+),
   `TlsConfig` + `Server::listen_tls`. Internal `detail::TlsStream`
   uses memory BIOs + explicit `recv`/`send` (safe with IOCP
-  readiness probes); per-stream mutex for concurrent HTTP/2
-  reader/writer. Under `Socket` / `BufferedConnection`. Per-protocol
-  ALPN (`http/1.1` vs `h2`); WSS uses `alpn={"http/1.1"}`. Demos:
-  `--tls` on `http_hello` / `http2_hello` / `ws_echo` / `ws_chat`.
-  Windows: IOCP re-associate after handshake `remove_io` so
-  post-101 reads arm correctly. Independent of QUIC TLS.
+  readiness probes). Per-stream mutex only on the coroutine
+  `Socket` path (`enable_serialized_io`); reactor connections are
+  lock-free on the TLS hot path. Accept→factory handoff is
+  thread_local (no global stash map). Under `Socket` /
+  `BufferedConnection`. Per-protocol ALPN (`http/1.1` vs `h2`);
+  WSS uses `alpn={"http/1.1"}`. Demos: `--tls` on `http_hello` /
+  `http2_hello` / `ws_echo` / `ws_chat`. Windows: IOCP re-associate
+  after handshake `remove_io`. Independent of QUIC TLS.
 

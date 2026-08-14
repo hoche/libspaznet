@@ -207,8 +207,8 @@ class BufferedConnection : public IoHandler, public std::enable_shared_from_this
     bool write_interest_armed_{false};
     bool close_after_flush_{false};
 #ifdef SPAZNET_HAS_TLS
-    // Claimed from TlsStream::stash_for_fd in the constructor when this
-    // connection was accepted on a listen_tls() socket.
+    // Claimed via thread-local handoff (stash_for_fd / claim_for_fd) when
+    // this connection was accepted on a listen_tls() socket.
     std::unique_ptr<detail::TlsStream> tls_;
 #endif
 };
