@@ -1,6 +1,6 @@
 #pragma once
 
-// HTTP/1.1 + WebSocket ConnectionHandler factory.
+// HTTP/1.1 + WebSocket CoroutineConnectionHandler factory.
 //
 // Combined dispatcher: the same TCP connection serves plain HTTP/1.1
 // requests until a client asks for a WebSocket upgrade (RFC 6455
@@ -11,19 +11,22 @@
 
 #include <libspaznet/http/handler.hpp>
 #include <libspaznet/server.hpp>
-#include <libspaznet/websocket/handler.hpp>
 #include <libspaznet/websocket/reactor_handler.hpp>
+#ifdef SPAZNET_HAS_COROUTINES
+#include <libspaznet/websocket/coroutine_handler.hpp>
+#endif
 
 #include <memory>
 
 namespace spaznet::websocket {
 
 #ifdef SPAZNET_HAS_COROUTINES
-auto make_dispatcher(std::unique_ptr<::spaznet::http::HTTPHandler> http_handler,
-                     std::unique_ptr<Handler> ws_handler) -> ::spaznet::ConnectionHandler;
+auto make_coroutine_dispatcher(std::unique_ptr<::spaznet::http::HTTPHandler> http_handler,
+                     std::unique_ptr<coroutine::Handler> ws_handler)
+    -> ::spaznet::CoroutineConnectionHandler;
 #endif
 
-// Coroutine-free counterpart of make_dispatcher: same upgrade-sniffing
+// Coroutine-free counterpart of make_coroutine_dispatcher: same upgrade-sniffing
 // behavior (a null http_handler still means "404 to every non-WS
 // request", a null ws_handler still means an upgrade attempt just falls
 // through to the HTTP handler, same as above), same on-the-wire framing
@@ -32,9 +35,9 @@ auto make_dispatcher(std::unique_ptr<::spaznet::http::HTTPHandler> http_handler,
 // a suspended coroutine frame — see reactor_handler.hpp for the
 // synchronous Handler/Connection this one is built against, and
 // dispatcher_reactor.cpp for the state machine itself. Hand the result to
-// Server::set_connection_factory instead of set_connection_handler.
+// Server::set_reactor_connection_factory instead of set_coroutine_connection_handler.
 auto make_reactor_dispatcher(std::unique_ptr<::spaznet::http::HTTPHandler> http_handler,
                              std::unique_ptr<reactor::Handler> ws_handler)
-    -> ::spaznet::ConnectionFactory;
+    -> ::spaznet::ReactorConnectionFactory;
 
 } // namespace spaznet::websocket

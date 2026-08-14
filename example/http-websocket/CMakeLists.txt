@@ -8,7 +8,7 @@ set(SPAZNET_WS_SOURCES
     src/dispatcher_reactor.cpp
 )
 if(SPAZNET_ENABLE_COROUTINES)
-    list(APPEND SPAZNET_WS_SOURCES src/dispatcher.cpp)
+    list(APPEND SPAZNET_WS_SOURCES src/dispatcher_coroutine.cpp)
 endif()
 add_library(spaznet_http_websocket STATIC ${SPAZNET_WS_SOURCES})
 add_library(spaznet::http_websocket ALIAS spaznet_http_websocket)

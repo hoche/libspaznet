@@ -66,14 +66,14 @@ void dispatch_one(QuicHttp3Service& service, ::spaznet::Datagram& dg) {
 } // namespace
 
 #ifdef SPAZNET_HAS_COROUTINES
-auto make_dispatcher(std::unique_ptr<QuicHttp3Service> service)
-    -> ::spaznet::DatagramHandler {
+auto make_coroutine_dispatcher(std::unique_ptr<QuicHttp3Service> service)
+    -> ::spaznet::CoroutineDatagramHandler {
     // shared_ptr so the std::function payload stays copyable.
     std::shared_ptr<QuicHttp3Service> shared(service.release());
     return [shared](::spaznet::Datagram dg) -> ::spaznet::Task {
         // dispatch_one is fully synchronous — no co_await — so this
         // Task never actually suspends; it exists purely to satisfy
-        // DatagramHandler's signature. See make_reactor_dispatcher below
+        // CoroutineDatagramHandler's signature. See make_reactor_dispatcher below
         // for the coroutine-free equivalent.
         dispatch_one(*shared, dg);
         co_return;
@@ -82,7 +82,7 @@ auto make_dispatcher(std::unique_ptr<QuicHttp3Service> service)
 #endif // SPAZNET_HAS_COROUTINES
 
 auto make_reactor_dispatcher(std::unique_ptr<QuicHttp3Service> service)
-    -> ::spaznet::SyncDatagramHandler {
+    -> ::spaznet::ReactorSyncDatagramHandler {
     std::shared_ptr<QuicHttp3Service> shared(service.release());
     return [shared](::spaznet::Datagram dg) { dispatch_one(*shared, dg); };
 }

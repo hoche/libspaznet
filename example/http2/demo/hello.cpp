@@ -52,13 +52,13 @@ int main(int argc, char** argv) {
 
     spaznet::Server server(4);
     if (use_reactor) {
-        server.set_connection_factory(
+        server.set_reactor_connection_factory(
             spaznet::http2::make_reactor_dispatcher(std::make_unique<Hello>()));
     }
 #ifdef SPAZNET_HAS_COROUTINES
     else {
-        server.set_connection_handler(
-            spaznet::http2::make_dispatcher(std::make_unique<Hello>()));
+        server.set_coroutine_connection_handler(
+            spaznet::http2::make_coroutine_dispatcher(std::make_unique<Hello>()));
     }
 #endif
     server.listen_tcp(8080);

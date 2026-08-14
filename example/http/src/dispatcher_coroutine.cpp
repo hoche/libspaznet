@@ -1,7 +1,7 @@
-// HTTP/1.1 ConnectionHandler implementation.
+// HTTP/1.1 CoroutineConnectionHandler implementation.
 //
 // Adapts a user-provided HTTPHandler into a std::function<Task(Socket)>
-// that the Server can dispatch directly via set_connection_handler.
+// that the Server can dispatch directly via set_coroutine_connection_handler.
 // The dispatch loop is a straight HTTP/1.1 keep-alive read/parse/serve
 // cycle — there's no WebSocket upgrade detection here; for that, see
 // example/http-websocket/.
@@ -47,7 +47,7 @@ struct AwaitResponseReady {
 
 } // namespace
 
-auto serve_keep_alive(::spaznet::Socket socket, HTTPHandler& handler,
+auto serve_coroutine_keep_alive(::spaznet::Socket socket, HTTPHandler& handler,
                       std::vector<std::uint8_t> initial_buffer) -> ::spaznet::Task {
     constexpr std::size_t kReadChunk = 8192;
     constexpr std::size_t kMaxRequestBytes = 1024 * 1024; // 1 MiB safety cap
@@ -148,14 +148,14 @@ auto serve_keep_alive(::spaznet::Socket socket, HTTPHandler& handler,
     }
 }
 
-auto make_dispatcher(std::unique_ptr<HTTPHandler> handler) -> ::spaznet::ConnectionHandler {
+auto make_coroutine_dispatcher(std::unique_ptr<HTTPHandler> handler) -> ::spaznet::CoroutineConnectionHandler {
     // std::function requires its callable to be copyable; std::unique_ptr
     // isn't.  Wrap the handler in a shared_ptr so the std::function
     // payload is copyable while still owning a single handler instance
     // shared across all connections.
     std::shared_ptr<HTTPHandler> shared(handler.release());
     return [shared](::spaznet::Socket sock) -> ::spaznet::Task {
-        co_await serve_keep_alive(std::move(sock), *shared, {});
+        co_await serve_coroutine_keep_alive(std::move(sock), *shared, {});
     };
 }
 

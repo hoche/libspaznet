@@ -49,16 +49,16 @@ using spaznet::websocket::testing_support::DispatcherKindName;
 namespace {
 
 #ifdef SPAZNET_HAS_COROUTINES
-class EchoWS : public spaznet::websocket::Handler {
+class EchoWS : public spaznet::websocket::coroutine::Handler {
   public:
-    spaznet::Task on_open(spaznet::websocket::Connection&) override {
+    spaznet::Task on_open(spaznet::websocket::coroutine::Connection&) override {
         co_return;
     }
-    spaznet::Task on_close(spaznet::websocket::Connection&) override {
+    spaznet::Task on_close(spaznet::websocket::coroutine::Connection&) override {
         co_return;
     }
     spaznet::Task handle_message(const spaznet::websocket::Message& m,
-                                 spaznet::websocket::Connection& conn) override {
+                                 spaznet::websocket::coroutine::Connection& conn) override {
         co_await conn.send(m.opcode, m.data);
     }
 };
@@ -253,12 +253,12 @@ class WsTlsTest : public ::testing::TestWithParam<DispatcherKind> {
 
         server_ = std::make_unique<spaznet::Server>(2);
         if (GetParam() == DispatcherKind::Reactor) {
-            server_->set_connection_factory(spaznet::websocket::make_reactor_dispatcher(
+            server_->set_reactor_connection_factory(spaznet::websocket::make_reactor_dispatcher(
                 nullptr, std::make_unique<EchoWSReactor>()));
         }
 #ifdef SPAZNET_HAS_COROUTINES
         else {
-            server_->set_connection_handler(spaznet::websocket::make_dispatcher(
+            server_->set_coroutine_connection_handler(spaznet::websocket::make_coroutine_dispatcher(
                 nullptr, std::make_unique<EchoWS>()));
         }
 #endif

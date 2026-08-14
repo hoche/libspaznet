@@ -125,7 +125,7 @@ class Socket {
 
 namespace spaznet {
 
-// Raw UDP datagram delivered to a DatagramHandler.  The peer fields are
+// Raw UDP datagram delivered to a datagram callback.  The peer fields are
 // filled in from the kernel-reported sockaddr; `peer` + `peer_len` are
 // kept verbatim so a handler can sendto() back without re-resolving.
 struct Datagram {
@@ -142,11 +142,11 @@ struct Datagram {
 // accepted TCP connection, handing ownership of the Socket.  The
 // connection lives until the Task completes; the Socket destructor
 // closes the fd if the handler hasn't already.
-using ConnectionHandler = std::function<Task(Socket)>;
+using CoroutineConnectionHandler = std::function<Task(Socket)>;
 
 // Per-datagram callback: the Server invokes this once for each UDP
 // datagram received on any port it's listening on.
-using DatagramHandler = std::function<Task(Datagram)>;
+using CoroutineDatagramHandler = std::function<Task(Datagram)>;
 #endif // SPAZNET_HAS_COROUTINES
 
 // Reactor-side per-connection callback: invoked once for each accepted TCP
@@ -174,17 +174,17 @@ using DatagramHandler = std::function<Task(Datagram)>;
 // between).
 //
 // A Server has at most one active TCP acceptance strategy: setting a
-// ConnectionFactory here takes precedence over set_connection_handler() —
+// ReactorConnectionFactory here takes precedence over set_coroutine_connection_handler() —
 // accepted connections go to whichever was set most recently.
-using ConnectionFactory =
+using ReactorConnectionFactory =
     std::function<std::shared_ptr<IoHandler>(int, IOContext&, std::function<void()>)>;
 
 // Reactor-side per-datagram callback: invoked synchronously (no coroutine
 // involved) for each UDP datagram received on any port the Server is
 // listening on. Runs on whichever IOContext worker thread received the
-// packet; like ConnectionFactory, setting this takes precedence over
-// set_datagram_handler() for datagrams delivered afterward.
-using SyncDatagramHandler = std::function<void(Datagram)>;
+// packet; like ReactorConnectionFactory, setting this takes precedence over
+// set_coroutine_datagram_handler() for datagrams delivered afterward.
+using ReactorSyncDatagramHandler = std::function<void(Datagram)>;
 
 // Splits the two axes that `Server(N)` used to conflate. Coroutines want
 // workers on one loop; reactors want N independent loops with connections
@@ -212,11 +212,11 @@ class Server {
     std::vector<std::thread> loop_threads_;
     std::atomic<std::size_t> next_accept_loop_{0};
 #ifdef SPAZNET_HAS_COROUTINES
-    ConnectionHandler connection_handler_;
-    DatagramHandler datagram_handler_;
+    CoroutineConnectionHandler coroutine_connection_handler_;
+    CoroutineDatagramHandler coroutine_datagram_handler_;
 #endif
-    ConnectionFactory connection_factory_;
-    SyncDatagramHandler sync_datagram_handler_;
+    ReactorConnectionFactory reactor_connection_factory_;
+    ReactorSyncDatagramHandler reactor_sync_datagram_handler_;
     // Track active listening sockets so stop()/destructor can close them even if coroutines are
     // currently suspended on accept.
     std::mutex listen_fds_mutex_;
@@ -239,7 +239,7 @@ class Server {
     std::atomic<int> active_connections_{0};
 #endif
     // Reactor-side counterpart of active_client_fds_: connections minted by
-    // connection_factory_, keyed by fd. Server owns the shared_ptr from the
+    // reactor_connection_factory_, keyed by fd. Server owns the shared_ptr from the
     // point the factory returns it until the connection reports itself
     // closed (erased from here by finish_reactor_connection, invoked as an
     // on_closed-style hook) or until stop() shuts every remaining one down.
@@ -313,31 +313,31 @@ class Server {
 #endif
 
     // ---- Low-level callbacks (preferred, coroutine runtime only). ----
-    // set_connection_handler is invoked once per accepted TCP
-    // connection.  set_datagram_handler is invoked once per received
+    // set_coroutine_connection_handler is invoked once per accepted TCP
+    // connection.  set_coroutine_datagram_handler is invoked once per received
     // UDP datagram.  Examples under example/<protocol>/ provide
-    // factory helpers (e.g. spaznet::http::make_dispatcher) that
+    // factory helpers (e.g. spaznet::http::make_coroutine_dispatcher) that
     // build these callbacks from higher-level handler interfaces. Only
     // declared when SPAZNET_HAS_COROUTINES is defined — with coroutines
-    // disabled, set_connection_factory/set_sync_datagram_handler below are
+    // disabled, set_reactor_connection_factory/set_reactor_sync_datagram_handler below are
     // the only acceptance strategy.
 #ifdef SPAZNET_HAS_COROUTINES
-    void set_connection_handler(ConnectionHandler handler);
-    void set_datagram_handler(DatagramHandler handler);
+    void set_coroutine_connection_handler(CoroutineConnectionHandler handler);
+    void set_coroutine_datagram_handler(CoroutineDatagramHandler handler);
 #endif
 
     // ---- Reactor-side callbacks. ----
-    // set_connection_factory / set_sync_datagram_handler are the
+    // set_reactor_connection_factory / set_reactor_sync_datagram_handler are the
     // coroutine-free counterparts of the two setters above: no Task, no
     // co_await, just an IoHandler and a synchronous callback respectively.
-    // See the ConnectionFactory / SyncDatagramHandler typedefs above for
+    // See the ReactorConnectionFactory / ReactorSyncDatagramHandler typedefs above for
     // the precedence rules against the coroutine-based setters.
-    void set_connection_factory(ConnectionFactory factory);
-    void set_sync_datagram_handler(SyncDatagramHandler handler);
+    void set_reactor_connection_factory(ReactorConnectionFactory factory);
+    void set_reactor_sync_datagram_handler(ReactorSyncDatagramHandler handler);
 
     // ---- Legacy handler-pattern setters (deprecated). ----
     // These remain as compatibility wrappers around
-    // set_connection_handler / set_datagram_handler while the
+    // set_coroutine_connection_handler / set_coroutine_datagram_handler while the
     // protocol-specific handlers are moved out of the core library.
     // New code should depend on the example/<protocol> libraries
     // and use the low-level setters above instead.

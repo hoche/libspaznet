@@ -1,6 +1,6 @@
 # HTTP/2 demos
 
-Two small servers built on `spaznet::http2::make_dispatcher`, both
+Two small servers built on `spaznet::http2::make_coroutine_dispatcher`, both
 serving h2c (prior-knowledge cleartext HTTP/2) on port 8080. When the
 core is built with `SPAZNET_HAS_TLS`, `hello` also accepts `--tls` for
 ALPN `h2` on 8443 (self-signed).
@@ -17,7 +17,7 @@ curl -k --http2 https://127.0.0.1:8443/
 
 A single route that always returns `200 OK` with a fixed body. This is
 the "hello world" of the `Handler` interface — enough to show how a
-handler is wired into `Server::set_connection_handler`, but nothing
+handler is wired into `Server::set_coroutine_connection_handler`, but nothing
 about what HTTP/2 actually adds over HTTP/1.1. `--tls` uses
 `Server::listen_tls` with `alpn={"h2"}`; the dispatcher is unchanged.
 
@@ -56,7 +56,7 @@ curl --http2-prior-knowledge http://localhost:8080/status/404
 
 This build of `example/http2` does not implement server push
 (`PUSH_PROMISE`), stream `PRIORITY`, or trailers (see the header comment
-in `src/dispatcher.cpp`), so the showcase sticks to what's actually
+in `src/dispatcher_coroutine.cpp`), so the showcase sticks to what's actually
 there: multiplexed streams, HPACK-decoded headers, DATA-frame bodies,
 and dispatcher-enforced `SETTINGS` / `PING` / flow control /
 `MAX_CONCURRENT_STREAMS`.

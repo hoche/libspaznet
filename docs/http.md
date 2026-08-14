@@ -2,8 +2,8 @@
 
 The protocol implementations live in `example/<protocol>/` libraries
 on top of the core `spaznet` target.  They register with `Server` via
-the low-level `set_connection_handler` callback that
-`make_dispatcher(...)` produces.
+the low-level `set_coroutine_connection_handler` callback that
+`make_coroutine_dispatcher(...)` produces.
 
 ## HTTP/1.1 — `example/http`
 
@@ -29,8 +29,8 @@ public:
 
 int main() {
     spaznet::Server server(4);
-    server.set_connection_handler(
-        spaznet::http::make_dispatcher(std::make_unique<MyHandler>()));
+    server.set_coroutine_connection_handler(
+        spaznet::http::make_coroutine_dispatcher(std::make_unique<MyHandler>()));
     server.listen_tcp(8080);
     server.run();
 }
@@ -49,16 +49,16 @@ target_link_libraries(myapp PRIVATE spaznet::spaznet spaznet::http)
 `example/http` ships two interchangeable dispatchers for the same
 `HTTPHandler` interface — pick one, or run both side by side:
 
-- **`make_dispatcher(...)`** (above) — coroutine-based, registered via
-  `Server::set_connection_handler`. Each connection runs as a `Task`
-  (`serve_keep_alive` in `dispatcher.cpp`).
+- **`make_coroutine_dispatcher(...)`** (above) — coroutine-based, registered via
+  `Server::set_coroutine_connection_handler`. Each connection runs as a `Task`
+  (`serve_coroutine_keep_alive` in `dispatcher_coroutine.cpp`).
 - **`make_reactor_dispatcher(...)`** — coroutine-free, registered via
-  `Server::set_connection_factory`. Each connection is a small explicit
+  `Server::set_reactor_connection_factory`. Each connection is a small explicit
   state machine (`Http1Connection` in `dispatcher_reactor.cpp`) built on
   `BufferedConnection` instead of a suspended coroutine frame.
 
 ```cpp
-server.set_connection_factory(
+server.set_reactor_connection_factory(
     spaznet::http::make_reactor_dispatcher(std::make_unique<MyHandler>()));
 ```
 
@@ -168,7 +168,7 @@ coroutine until your `writer.complete()` runs — but that's dispatcher
 plumbing, not something your handler needs to know about.
 
 The handler instance is shared across all connections (a single
-`unique_ptr` is wrapped in a `shared_ptr` inside `make_dispatcher`).
+`unique_ptr` is wrapped in a `shared_ptr` inside `make_coroutine_dispatcher`).
 Don't store per-connection state on `this` — use a local in
 `handle_request`, capture it into whatever you hand `writer` off to,
 or keep a member map keyed by something request-derived.
@@ -196,8 +196,8 @@ These are baked in to defend against Slowloris and oversized requests:
 
 | Limit | Value | Where |
 |---|---:|---|
-| Maximum request size (headers + body) | 1 MiB | `example/http/src/dispatcher.cpp` (`kMaxRequestBytes`) |
-| Read chunk per `async_read` | 8 KiB | `example/http/src/dispatcher.cpp` (`kReadChunk`) |
+| Maximum request size (headers + body) | 1 MiB | `example/http/src/dispatcher_coroutine.cpp` (`kMaxRequestBytes`) |
+| Read chunk per `async_read` | 8 KiB | `example/http/src/dispatcher_coroutine.cpp` (`kReadChunk`) |
 | Maximum number of header fields | 100 | `example/http/src/handler.cpp` (`kMaxHeaders`) |
 | Chunked-encoding chunk-size line | 64 bytes | `example/http/src/handler.cpp` |
 
@@ -223,8 +223,8 @@ holds the concatenated chunks by the time `handle_request` runs.
 
 If the same TCP port should serve both HTTP/1.1 and WebSocket
 upgrades, use `example/http-websocket` instead.  Its
-`make_dispatcher(http_handler, ws_handler)` accepts both an
-`http::HTTPHandler` and a `websocket::Handler`; it sniffs each
+`make_coroutine_dispatcher(http_handler, ws_handler)` accepts both an
+`http::HTTPHandler` and a `websocket::coroutine::Handler`; it sniffs each
 accepted connection and either runs the WS frame loop or hands
 the buffer off to the HTTP dispatcher.  See
 [`websocket.md`](websocket.md) for the WS-specific API.
@@ -253,8 +253,8 @@ public:
 
 int main() {
     spaznet::Server server(4);
-    server.set_connection_handler(
-        spaznet::http2::make_dispatcher(std::make_unique<MyHandler>()));
+    server.set_coroutine_connection_handler(
+        spaznet::http2::make_coroutine_dispatcher(std::make_unique<MyHandler>()));
     server.listen_tcp(8080);
     server.run();
 }
@@ -285,17 +285,17 @@ TLS backend (OpenSSL 3.5+ or wolfSSL).
 Same idea as HTTP/1.1 above — `example/http2` ships two
 interchangeable dispatchers for the same `Handler` interface:
 
-- **`make_dispatcher(...)`** (above) — coroutine-based, registered via
-  `Server::set_connection_handler`. Each stream's request runs as a
-  detached `Task` (`dispatch_request` in `dispatcher.cpp`).
+- **`make_coroutine_dispatcher(...)`** (above) — coroutine-based, registered via
+  `Server::set_coroutine_connection_handler`. Each stream's request runs as a
+  detached `Task` (`dispatch_request` in `dispatcher_coroutine.cpp`).
 - **`make_reactor_dispatcher(...)`** — coroutine-free, registered via
-  `Server::set_connection_factory`. Each connection is a small explicit
+  `Server::set_reactor_connection_factory`. Each connection is a small explicit
   state machine (`Http2Connection` in `dispatcher_reactor.cpp`) built on
   `BufferedConnection` instead of a suspended coroutine frame per
   connection plus a detached one per stream.
 
 ```cpp
-server.set_connection_factory(
+server.set_reactor_connection_factory(
     spaznet::http2::make_reactor_dispatcher(std::make_unique<MyHandler>()));
 ```
 
@@ -348,12 +348,12 @@ how the two execution models differ under the hood.
 > `ResponseWriter` in the reactor-port work): each fully-arrived
 > request dispatches independently of every other stream, so a slow
 > handler on stream A never stalls PING-ACK, WINDOW_UPDATE, or
-> handlers for streams B / C / D — under `make_dispatcher` because it
+> handlers for streams B / C / D — under `make_coroutine_dispatcher` because it
 > runs as a detached coroutine, under `make_reactor_dispatcher`
 > because `handle_request()` is a synchronous call that returns
 > immediately whether the handler answers inline or defers. Wire
 > writes funnel through a single per-connection writer (a writer
-> coroutine + queue for `make_dispatcher`, `BufferedConnection::write()`
+> coroutine + queue for `make_coroutine_dispatcher`, `BufferedConnection::write()`
 > directly for `make_reactor_dispatcher`) to keep individual frames
 > atomic on the wire. Handlers only ever talk to the connection through
 > `ResponseWriter` — there's no socket handle to misuse.

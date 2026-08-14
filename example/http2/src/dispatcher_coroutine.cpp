@@ -1,4 +1,4 @@
-// HTTP/2 (h2c, prior-knowledge cleartext) ConnectionHandler.
+// HTTP/2 (h2c, prior-knowledge cleartext) CoroutineConnectionHandler.
 //
 // Implements RFC 9113 §3.4 "HTTP/2 over cleartext TCP" plus enough of
 // the rest of RFC 9113 to interop with `curl --http2-prior-knowledge`
@@ -164,9 +164,9 @@ auto goaway_payload(std::uint32_t last_stream, std::uint32_t error_code)
 }
 
 // Bridges a ResponseWriter's completion into dispatch_request's
-// resumption — same idea as example/http/src/dispatcher.cpp's
+// resumption — same idea as example/http/src/dispatcher_coroutine.cpp's
 // AwaitResponseReady, plus one addition dispatch_request specifically
-// needs: example/http's serve_keep_alive is always the *awaited* side of
+// needs: example/http's serve_coroutine_keep_alive is always the *awaited* side of
 // some caller's `co_await` on its Task, which keeps its frame alive
 // (via that caller's own TaskAwaiter/CoroutineHandle) for as long as it
 // hasn't finished, regardless of what it suspends on internally.
@@ -691,7 +691,7 @@ loop_end:
 
 } // namespace
 
-auto make_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::ConnectionHandler {
+auto make_coroutine_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::CoroutineConnectionHandler {
     std::shared_ptr<Handler> shared(handler.release());
     return [shared](::spaznet::Socket sock) -> ::spaznet::Task {
         co_await serve(std::move(sock), *shared);

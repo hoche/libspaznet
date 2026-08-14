@@ -50,6 +50,10 @@
 
 ## Progress Summary - 2026-08-13
 
+- [x] **Coroutine / reactor naming symmetry** — `make_coroutine_dispatcher`,
+  `serve_coroutine_keep_alive`, `websocket::coroutine::*`,
+  `set_coroutine_*` / `set_reactor_*` Server hooks, and
+  `dispatcher_coroutine.cpp` sources. No aliases. See `docs/migration.md`.
 - [x] **Fewer TLS locks on reactor hot path** — `TlsStream` mutex only
   after `Socket::attach_tls` (coroutine HTTP/2∥WS); reactor skips it.
   Accept→factory TLS handoff is `thread_local` (dropped `stash_mu_`).
@@ -102,7 +106,7 @@ libraries, every demo, and the full test suite. SHAs below are on
   movable completion token. HTTP/1.1 `handle_request` is now
   `void(const HTTPRequest&, ResponseWriter)`.
 - [x] `**Server` reactor entry points** (same commit) —
-  `set_connection_factory` / `set_sync_datagram_handler`, destroy-based
+  `set_reactor_connection_factory` / `set_reactor_sync_datagram_handler`, destroy-based
   shutdown, `Statistics::active_connections` / `bytes_buffered`.
 
 ### Per-protocol reactor dispatchers
@@ -200,8 +204,8 @@ over `DispatcherKind {Coroutine, Reactor}`.
   `example/<protocol>/` with its own headers, sources, tests, and
   `CMakeLists.txt`.
   - **Phase 1 — ✅ shipped (a7fab2d)**: low-level
-  `Server::set_connection_handler(std::function<Task(Socket)>)` and
-  `Server::set_datagram_handler(std::function<Task(Datagram)>)`.
+  `Server::set_coroutine_connection_handler(std::function<Task(Socket)>)` and
+  `Server::set_coroutine_datagram_handler(std::function<Task(Datagram)>)`.
   `Datagram` struct added. Legacy `set_http_handler` /
   `set_websocket_handler` / etc. still work as compatibility
   wrappers while the move happens.
@@ -209,7 +213,7 @@ over `DispatcherKind {Coroutine, Reactor}`.
   WebSocket). Types in `spaznet::http::` namespace, names
   verbatim (`HTTPHandler`, `HTTPRequest`, `HTTPResponse`,
   `HTTPParser`). Factory:
-  `spaznet::http::make_dispatcher(unique_ptr<HTTPHandler>) -> ConnectionHandler`. Dispatcher reads requests, runs
+  `spaznet::http::make_coroutine_dispatcher(unique_ptr<HTTPHandler>) -> CoroutineConnectionHandler`. Dispatcher reads requests, runs
   keep-alive loop, calls the user's handler — no WS upgrade
   detection. Demos: `http_hello`, plus later `http_showcase`
   (1.0 vs 1.1 feature routes).
@@ -220,20 +224,20 @@ over `DispatcherKind {Coroutine, Reactor}`.
   (`Handler`, `Frame`, `Message`, `Opcode`).
   `spaznet::websocket::send_message(Socket&, Opcode, span, bool fin=true)` is the free-function replacement for
   `Socket::send_websocket_message`. Factory:
-  `spaznet::websocket::make_dispatcher( unique_ptr<spaznet::http::HTTPHandler>, unique_ptr<spaznet::websocket::Handler>) -> ConnectionHandler`. Dispatcher reads first request,
+  `spaznet::websocket::make_coroutine_dispatcher( unique_ptr<spaznet::http::HTTPHandler>, unique_ptr<spaznet::websocket::coroutine::Handler>) -> CoroutineConnectionHandler`. Dispatcher reads first request,
   detects WS upgrade, either runs the WS frame loop or hands
   to the HTTP dispatcher (composing example/http's
   machinery). Demos: `ws_echo`, plus later `ws_chat` (broadcast
   room + browser page) and the `Connection` write gate. This phase
   is where the ~400-line WS frame loop previously inline in
   `src/server_impl.cpp::handle_connection` ends up — it moved to
-  `example/http-websocket/src/dispatcher.cpp`.
+  `example/http-websocket/src/dispatcher_coroutine.cpp`.
   - **Phase 3 — HTTP/2 →** `example/http2/`. Status quo: dispatch
   isn't wired into `Server::handle_connection` today; move keeps
   the parser/HPACK code visible without changing behavior.
   Demos added later: `http2_hello`, `http2_showcase` (multiplexing).
   - **Phase 4 — UDP →** `example/udp/`. Becomes a thin wrapper
-  around `set_datagram_handler` for code that prefers the
+  around `set_coroutine_datagram_handler` for code that prefers the
   handler-interface idiom. Demos added later: `udp_echo`,
   `udp_relay`, `udp_statsd`.
   - **Phase 5 — QUIC + HTTP/3 →** `example/quic-http3/`. The
@@ -241,7 +245,7 @@ over `DispatcherKind {Coroutine, Reactor}`.
   files and update `add_subdirectory` wiring.
   - **Phase 6 — Strip dispatch from** `src/server_impl.cpp` and
   remove legacy setters. `handle_connection` collapses to "call
-  `connection_handler_` if set, else close". `receive_udp`
+  `coroutine_connection_handler_` if set, else close". `receive_udp`
   similarly.
   - **Phase 7 — CMake**: new top-level option
   `SPAZNET_BUILD_EXAMPLES` (default ON). Each example/ has its
@@ -250,7 +254,7 @@ over `DispatcherKind {Coroutine, Reactor}`.
   - **Phase 8 — Docs**: update `api-status.md`, `http.md`,
   `websocket.md`, `quic-http3.md`, `integration.md`,
   `migration.md`, README. All `set_http_handler` references
-  become `set_connection_handler + spaznet::http::make_dispatcher`.
+  become `set_coroutine_connection_handler + spaznet::http::make_coroutine_dispatcher`.
   - **Phase 9 — netbench**: depend on `add_subdirectory(libspaznet/example/http)`
   and link against the example target.
   - **Phase 10 — Verify** on Mac + meep: all unit / integration /

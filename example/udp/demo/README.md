@@ -1,6 +1,6 @@
 # UDP demos
 
-Three small servers built on `spaznet::udp::make_dispatcher`, each on
+Three small servers built on `spaznet::udp::make_coroutine_dispatcher`, each on
 its own port so they can run side by side. Each also accepts a
 `--reactor` flag to run against `spaznet::udp::make_reactor_dispatcher`
 instead — the coroutine-free counterpart, same `Handler` either way (see

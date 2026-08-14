@@ -153,16 +153,16 @@ std::string handshake_request(const std::string& key) {
 }
 
 #ifdef SPAZNET_HAS_COROUTINES
-class EchoWSHandler : public spaznet::websocket::Handler {
+class EchoWSHandler : public spaznet::websocket::coroutine::Handler {
   public:
-    Task on_open(spaznet::websocket::Connection&) override {
+    Task on_open(spaznet::websocket::coroutine::Connection&) override {
         co_return;
     }
     Task handle_message(const spaznet::websocket::Message& message,
-                        spaznet::websocket::Connection& conn) override {
+                        spaznet::websocket::coroutine::Connection& conn) override {
         co_await conn.send(message.opcode, message.data);
     }
-    Task on_close(spaznet::websocket::Connection&) override {
+    Task on_close(spaznet::websocket::coroutine::Connection&) override {
         co_return;
     }
 };
@@ -184,9 +184,9 @@ TEST(WebSocketPerformance, EchoesHundredsOfFramesQuickly) {
     const uint16_t port = 7999;
     Server server(4);
 #ifdef SPAZNET_HAS_COROUTINES
-    server.set_connection_handler(spaznet::websocket::make_dispatcher(nullptr, std::make_unique<EchoWSHandler>()));
+    server.set_coroutine_connection_handler(spaznet::websocket::make_coroutine_dispatcher(nullptr, std::make_unique<EchoWSHandler>()));
 #else
-    server.set_connection_factory(
+    server.set_reactor_connection_factory(
         spaznet::websocket::make_reactor_dispatcher(nullptr, std::make_unique<EchoWSHandlerReactor>()));
 #endif
     server.listen_tcp(port);

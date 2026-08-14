@@ -24,7 +24,7 @@
 //
 // This build of example/http2 does NOT implement server push
 // (PUSH_PROMISE), stream PRIORITY, or trailers — see the header
-// comment in src/dispatcher.cpp — so this showcase sticks to features
+// comment in src/dispatcher_coroutine.cpp — so this showcase sticks to features
 // that are actually there: multiplexed streams, HPACK-decoded headers,
 // DATA-frame request bodies, and dispatcher-enforced
 // MAX_CONCURRENT_STREAMS / SETTINGS / PING / flow control.
@@ -249,13 +249,13 @@ int main(int argc, char** argv) {
 
     spaznet::Server server(4);
     if (use_reactor) {
-        server.set_connection_factory(
+        server.set_reactor_connection_factory(
             spaznet::http2::make_reactor_dispatcher(std::make_unique<Showcase>()));
     }
 #ifdef SPAZNET_HAS_COROUTINES
     else {
-        server.set_connection_handler(
-            spaznet::http2::make_dispatcher(std::make_unique<Showcase>()));
+        server.set_coroutine_connection_handler(
+            spaznet::http2::make_coroutine_dispatcher(std::make_unique<Showcase>()));
     }
 #endif
     server.listen_tcp(8080);

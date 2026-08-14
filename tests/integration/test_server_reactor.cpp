@@ -1,5 +1,5 @@
 // End-to-end coverage for Server's reactor entry points (Milestone 5):
-// ConnectionFactory, SyncDatagramHandler, and destroy-based shutdown.
+// ReactorConnectionFactory, ReactorSyncDatagramHandler, and destroy-based shutdown.
 // Deliberately protocol-agnostic — BufferedConnection is the only
 // dispatcher involved, so this exercises exactly the new Server plumbing
 // without any HTTP/WS/etc. parsing in the way.
@@ -42,8 +42,8 @@ template <typename Pred> auto wait_until(Pred pred, std::chrono::milliseconds ti
 }
 
 // Echoes whatever it receives; hands `on_closed` straight through to
-// BufferedConnection, exactly as ConnectionFactory's contract expects.
-auto make_echo_factory() -> ConnectionFactory {
+// BufferedConnection, exactly as ReactorConnectionFactory's contract expects.
+auto make_echo_factory() -> ReactorConnectionFactory {
     return [](int fd, IOContext& ctx, std::function<void()> on_closed) -> std::shared_ptr<IoHandler> {
         auto conn = std::make_shared<BufferedConnection>(ctx, fd);
         conn->set_on_data([weak = std::weak_ptr<BufferedConnection>(conn)]() {
@@ -99,9 +99,9 @@ class ServerReactorTest : public ::testing::Test {
 
 } // namespace
 
-TEST_F(ServerReactorTest, ConnectionFactoryEchoesEndToEnd) {
+TEST_F(ServerReactorTest, ReactorConnectionFactoryEchoesEndToEnd) {
     server = std::make_unique<Server>(2);
-    server->set_connection_factory(make_echo_factory());
+    server->set_reactor_connection_factory(make_echo_factory());
     server->listen_tcp(19900);
     server_thread = std::thread([this]() { server->run(); });
     std::this_thread::sleep_for(100ms);
@@ -129,7 +129,7 @@ TEST_F(ServerReactorTest, ConnectionFactoryEchoesEndToEnd) {
 // it already does for coroutine connections.
 TEST_F(ServerReactorTest, StopShutsDownReactorConnectionsPromptly) {
     server = std::make_unique<Server>(2);
-    server->set_connection_factory(make_echo_factory());
+    server->set_reactor_connection_factory(make_echo_factory());
     server->listen_tcp(19901);
     server_thread = std::thread([this]() { server->run(); });
     std::this_thread::sleep_for(100ms);
@@ -153,10 +153,10 @@ TEST_F(ServerReactorTest, StopShutsDownReactorConnectionsPromptly) {
     close_socket(sock);
 }
 
-TEST_F(ServerReactorTest, SyncDatagramHandlerReceivesAndRepliesSynchronously) {
+TEST_F(ServerReactorTest, ReactorSyncDatagramHandlerReceivesAndRepliesSynchronously) {
     server = std::make_unique<Server>(1);
     std::atomic<int> packets_received{0};
-    server->set_sync_datagram_handler([&](Datagram dg) {
+    server->set_reactor_sync_datagram_handler([&](Datagram dg) {
         packets_received.fetch_add(1);
         std::string reply = "ack:" + std::string(dg.data.begin(), dg.data.end());
         sendto(dg.fd, reply.data(), reply.size(), 0,
@@ -186,15 +186,15 @@ TEST_F(ServerReactorTest, SyncDatagramHandlerReceivesAndRepliesSynchronously) {
     close_socket(sock);
 }
 
-// A ConnectionFactory that returns nullptr for every connection: the
+// A ReactorConnectionFactory that returns nullptr for every connection: the
 // listening accept loop must close the raw fd itself rather than leaking
-// it, since nothing else took ownership. (Per ConnectionFactory's
+// it, since nothing else took ownership. (Per ReactorConnectionFactory's
 // contract, the factory must NOT close the fd itself in this case — that
 // would race Server's own close_socket() call against whatever fd number
 // the kernel reassigns in between.)
 TEST_F(ServerReactorTest, FactoryDecliningConnectionDoesNotLeakOrHang) {
     server = std::make_unique<Server>(1);
-    server->set_connection_factory(
+    server->set_reactor_connection_factory(
         [](int, IOContext&, std::function<void()>) -> std::shared_ptr<IoHandler> { return nullptr; });
     server->listen_tcp(19903);
     server_thread = std::thread([this]() { server->run(); });
@@ -222,7 +222,7 @@ TEST_F(ServerReactorTest, MultiLoopAcceptAndShardEchoesAndStops) {
 
     std::mutex seen_mu;
     std::unordered_set<IOContext*> seen_contexts;
-    server->set_connection_factory(
+    server->set_reactor_connection_factory(
         [&](int fd, IOContext& ctx,
             std::function<void()> on_closed) -> std::shared_ptr<IoHandler> {
             {

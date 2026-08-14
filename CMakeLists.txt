@@ -245,7 +245,7 @@ endif()
 # SPAZNET_HAS_COROUTINES inside server.hpp/server_impl.cpp, but
 # listen_tcp()/listen_udp() themselves drive a reactor-native
 # ListenHandler/DatagramReadHandler (IoHandler, no coroutine) either way,
-# so Server::set_connection_factory/set_sync_datagram_handler work with
+# so Server::set_reactor_connection_factory/set_reactor_sync_datagram_handler work with
 # SPAZNET_ENABLE_COROUTINES=OFF. See the reactor-port plan's
 # coro-free-build milestone note.
 list(APPEND SOURCES src/server_impl.cpp)
@@ -449,8 +449,8 @@ spaznet_apply_test_warnings(test_unit)
 
 # Most core integration tests have moved to example/<protocol>/tests
 # alongside their handler implementations. test_server_reactor is the
-# exception: it drives Server's reactor entry points (ConnectionFactory /
-# SyncDatagramHandler / destroy-based shutdown) directly, with no protocol
+# exception: it drives Server's reactor entry points (ReactorConnectionFactory /
+# ReactorSyncDatagramHandler / destroy-based shutdown) directly, with no protocol
 # parsing involved, so it belongs here rather than under any one example.
 
 add_test(NAME UnitTests COMMAND test_unit)
@@ -466,8 +466,8 @@ spaznet_apply_test_warnings(test_performance)
 add_test(NAME PerformanceTests COMMAND test_performance)
 
 # Server is always built now (see the SOURCES/HEADERS comment above), and
-# this test only exercises its reactor entry points (ConnectionFactory /
-# SyncDatagramHandler / destroy-based shutdown), so it builds either way too.
+# this test only exercises its reactor entry points (ReactorConnectionFactory /
+# ReactorSyncDatagramHandler / destroy-based shutdown), so it builds either way too.
 add_executable(test_server_reactor
     tests/test_main.cpp
     tests/integration/test_server_reactor.cpp

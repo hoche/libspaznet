@@ -40,13 +40,13 @@ class HttpFallback : public spaznet::http::HTTPHandler {
 };
 
 #ifdef SPAZNET_HAS_COROUTINES
-class Echo : public spaznet::websocket::Handler {
+class Echo : public spaznet::websocket::coroutine::Handler {
   public:
-    spaznet::Task on_open(spaznet::websocket::Connection&) override { co_return; }
-    spaznet::Task on_close(spaznet::websocket::Connection&) override { co_return; }
+    spaznet::Task on_open(spaznet::websocket::coroutine::Connection&) override { co_return; }
+    spaznet::Task on_close(spaznet::websocket::coroutine::Connection&) override { co_return; }
 
     spaznet::Task handle_message(const spaznet::websocket::Message& m,
-                                 spaznet::websocket::Connection& conn) override {
+                                 spaznet::websocket::coroutine::Connection& conn) override {
         co_await conn.send(m.opcode, m.data);
     }
 };
@@ -84,12 +84,12 @@ int main(int argc, char** argv) {
 
     spaznet::Server server(4);
     if (use_reactor) {
-        server.set_connection_factory(spaznet::websocket::make_reactor_dispatcher(
+        server.set_reactor_connection_factory(spaznet::websocket::make_reactor_dispatcher(
             std::make_unique<HttpFallback>(), std::make_unique<EchoReactor>()));
     }
 #ifdef SPAZNET_HAS_COROUTINES
     else {
-        server.set_connection_handler(spaznet::websocket::make_dispatcher(
+        server.set_coroutine_connection_handler(spaznet::websocket::make_coroutine_dispatcher(
             std::make_unique<HttpFallback>(), std::make_unique<Echo>()));
     }
 #endif

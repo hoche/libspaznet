@@ -661,7 +661,7 @@ class Http2Connection : public std::enable_shared_from_this<Http2Connection> {
 
 } // namespace
 
-auto make_reactor_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::ConnectionFactory {
+auto make_reactor_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::ReactorConnectionFactory {
     std::shared_ptr<Handler> shared(handler.release());
     return [shared](int fd, ::spaznet::IOContext& ctx,
                     std::function<void()> on_closed) -> std::shared_ptr<::spaznet::IoHandler> {

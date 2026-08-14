@@ -36,7 +36,7 @@ class QuicHttp3Service {
     // Self-routing constructor — the service installs its own
     // `SendFn` that calls `::sendto(fd, ...)` on the listening UDP
     // socket.  The fd is supplied later via `bind_fd()` (typically
-    // by `make_dispatcher`, which pulls it out of the first
+    // by `make_coroutine_dispatcher`, which pulls it out of the first
     // incoming `Datagram`).  Until `bind_fd` runs the SendFn is a
     // no-op, which is fine: the very first datagram from a peer
     // triggers the bind before any outbound packet is built.
@@ -76,31 +76,31 @@ class QuicHttp3Service {
     auto ensure_http3_for(uint64_t /*placeholder*/) -> void {}
 };
 
-// Build a ::spaznet::DatagramHandler that owns `service` and forwards
+// Build a ::spaznet::CoroutineDatagramHandler that owns `service` and forwards
 // every received datagram into it.  Hand the result to
-// Server::set_datagram_handler:
+// Server::set_coroutine_datagram_handler:
 //
 //   auto svc = std::make_unique<QuicHttp3Service>(...);
-//   server.set_datagram_handler(spaznet::http3::make_dispatcher(std::move(svc)));
+//   server.set_coroutine_datagram_handler(spaznet::http3::make_coroutine_dispatcher(std::move(svc)));
 //   server.listen_udp(4433);
 //
 // The Listener's SendFn (configured inside QuicHttp3Service) should
 // route outbound datagrams via `::sendto(datagram.fd, ...)` so the
 // reply goes back through the same listening socket.
 #ifdef SPAZNET_HAS_COROUTINES
-auto make_dispatcher(std::unique_ptr<QuicHttp3Service> service) -> ::spaznet::DatagramHandler;
+auto make_coroutine_dispatcher(std::unique_ptr<QuicHttp3Service> service) -> ::spaznet::CoroutineDatagramHandler;
 #endif // SPAZNET_HAS_COROUTINES
 
-// Coroutine-free counterpart of make_dispatcher: same QuicHttp3Service,
+// Coroutine-free counterpart of make_coroutine_dispatcher: same QuicHttp3Service,
 // same per-datagram work — bind_fd() then handle_datagram() — just
 // invoked directly as a plain function instead of wrapped in a Task.
-// make_dispatcher's Task never actually suspends (the entire QUIC/HTTP3
+// make_coroutine_dispatcher's Task never actually suspends (the entire QUIC/HTTP3
 // transport underneath is already a synchronous pump; see
 // QuicHttp3Service::handle_datagram/pump_all), so this is a mechanical
 // swap with no behavioral difference. Hand the result to
-// Server::set_sync_datagram_handler instead of set_datagram_handler.
+// Server::set_reactor_sync_datagram_handler instead of set_coroutine_datagram_handler.
 auto make_reactor_dispatcher(std::unique_ptr<QuicHttp3Service> service)
-    -> ::spaznet::SyncDatagramHandler;
+    -> ::spaznet::ReactorSyncDatagramHandler;
 
 } // namespace http3
 } // namespace spaznet

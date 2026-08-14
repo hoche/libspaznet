@@ -1,6 +1,6 @@
 // Coroutine-free counterpart of dispatcher.cpp: adapts the exact same
-// spaznet::udp::Handler into ::spaznet::SyncDatagramHandler instead of
-// ::spaznet::DatagramHandler. Handler::handle_packet is already a plain
+// spaznet::udp::Handler into ::spaznet::ReactorSyncDatagramHandler instead of
+// ::spaznet::CoroutineDatagramHandler. Handler::handle_packet is already a plain
 // synchronous function (see handler.hpp) with no completion token to
 // bridge — unlike HTTP/1.1's ResponseWriter dance, there is nothing here
 // for a "reactor" adapter to do beyond calling it directly.
@@ -29,7 +29,7 @@ auto to_packet(::spaznet::Datagram dg) -> Packet {
 
 } // namespace
 
-auto make_reactor_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::SyncDatagramHandler {
+auto make_reactor_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::ReactorSyncDatagramHandler {
     std::shared_ptr<Handler> shared(handler.release());
     return [shared](::spaznet::Datagram dg) { shared->handle_packet(to_packet(std::move(dg))); };
 }

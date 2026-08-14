@@ -44,8 +44,8 @@ gap.
 
 | `SPAZNET_ENABLE_COROUTINES` | What you get |
 |---|---|
-| `ON` (default) | Everything: both dispatchers per protocol, `Server::set_connection_handler`/`set_datagram_handler` (coroutine) *and* `set_connection_factory`/`set_sync_datagram_handler` (reactor), `make_dispatcher(...)` *and* `make_reactor_dispatcher(...)` in every protocol header. |
-| `OFF` | Reactor only. `make_dispatcher(...)`, `ConnectionHandler`, `DatagramHandler`, and `Server::set_connection_handler`/`set_datagram_handler` are `#ifdef SPAZNET_HAS_COROUTINES`'d out of the public headers — not just unused, genuinely absent, so a downstream build can't accidentally reintroduce the dependency by calling them. `make_reactor_dispatcher(...)` and `set_connection_factory`/`set_sync_datagram_handler` are unaffected. |
+| `ON` (default) | Everything: both dispatchers per protocol, `Server::set_coroutine_connection_handler`/`set_coroutine_datagram_handler` (coroutine) *and* `set_reactor_connection_factory`/`set_reactor_sync_datagram_handler` (reactor), `make_coroutine_dispatcher(...)` *and* `make_reactor_dispatcher(...)` in every protocol header. |
+| `OFF` | Reactor only. `make_coroutine_dispatcher(...)`, `CoroutineConnectionHandler`, `CoroutineDatagramHandler`, and `Server::set_coroutine_connection_handler`/`set_coroutine_datagram_handler` are `#ifdef SPAZNET_HAS_COROUTINES`'d out of the public headers — not just unused, genuinely absent, so a downstream build can't accidentally reintroduce the dependency by calling them. `make_reactor_dispatcher(...)` and `set_reactor_connection_factory`/`set_reactor_sync_datagram_handler` are unaffected. |
 
 `SPAZNET_HAS_COROUTINES` is the corresponding preprocessor define,
 set `PUBLIC` on the `spaznet` CMake target when the option is `ON` so
@@ -65,7 +65,7 @@ This is exercised on every push/PR: the `Linux x64` CI workflow
 twice, once per value of `SPAZNET_ENABLE_COROUTINES`.
 
 Per-protocol source files that are entirely coroutine (a whole
-`dispatcher.cpp`, never a `dispatcher_reactor.cpp`) are excluded from
+`dispatcher_coroutine.cpp`, never a `dispatcher_reactor.cpp`) are excluded from
 the CMake source list rather than `#ifdef`'d internally — see e.g.
 `example/http2/CMakeLists.txt`'s `SPAZNET_HTTP2_SOURCES` — so the
 `OFF` build never even attempts to compile a translation unit that
@@ -78,7 +78,7 @@ guidance for a new project:
 
 - **Coroutine runtime** — if your toolchain has C++20 coroutines and
   you're comfortable with them, this is the more ergonomic one to
-  *read*: `serve_keep_alive`, `Http2Connection`'s coroutine sibling,
+  *read*: `serve_coroutine_keep_alive`, `Http2Connection`'s coroutine sibling,
   etc. read top-to-bottom like the wire protocol they implement, with
   suspension points where the protocol actually waits for I/O.
   Multi-threaded scaling is "free" — `IOContext` round-robins
@@ -95,7 +95,7 @@ guidance for a new project:
   `http2_showcase`, `udp_echo`, ...) accepts a `--reactor` flag and
   runs the same handler object under whichever dispatcher you pick.
   There's no requirement to choose one for an entire process; a
-  `Server` just dispatches whatever `ConnectionFactory`/`ConnectionHandler`
+  `Server` just dispatches whatever `ReactorConnectionFactory`/`CoroutineConnectionHandler`
   you installed.
 
 ## Authoring a reactor state machine
@@ -141,10 +141,10 @@ callback, and QUIC/HTTP3's `dispatch_one`):
    coroutine `Handler` — see `reactor_handler.hpp`. UDP's
    `handle_packet` was already synchronous everywhere in this tree, so
    its "reactor adapter" is a direct call with no wrapping at all.
-5. **Register with `Server` via a `ConnectionFactory`** (`std::function<std::shared_ptr<IoHandler>(int fd, IOContext&, std::function<void()> on_closed)>`,
-   set with `Server::set_connection_factory()`) for anything
-   connection-oriented, or a `SyncDatagramHandler` (`std::function<void(Datagram)>`,
-   `Server::set_sync_datagram_handler()`) for datagram protocols. The
+5. **Register with `Server` via a `ReactorConnectionFactory`** (`std::function<std::shared_ptr<IoHandler>(int fd, IOContext&, std::function<void()> on_closed)>`,
+   set with `Server::set_reactor_connection_factory()`) for anything
+   connection-oriented, or a `ReactorSyncDatagramHandler` (`std::function<void(Datagram)>`,
+   `Server::set_reactor_sync_datagram_handler()`) for datagram protocols. The
    factory builds whatever `IoHandler` drives the connection — almost
    always a `BufferedConnection` plus your state machine holding a
    `weak_ptr` back to it (see "Ownership" below) — and must arrange for
@@ -159,7 +159,7 @@ real bugs this codebase has already hit and fixed (see `CHANGELOG.md`'s
 written to prevent).
 
 - **No reference cycle between the buffer and the state machine.**
-  `Server`'s `ConnectionFactory` returns a `shared_ptr<IoHandler>` —
+  `Server`'s `ReactorConnectionFactory` returns a `shared_ptr<IoHandler>` —
   conventionally a `BufferedConnection` — that both `Server` and
   `IOContext`'s fd table hold onto. Your protocol state machine
   (`Http1Connection`, etc.) is a *separate* object that holds only a
@@ -244,7 +244,7 @@ cmake -B build-off -DSPAZNET_ENABLE_COROUTINES=OFF && cmake --build build-off &&
 ```
 
 A change that touches only one dispatcher (e.g. a coroutine-only bug
-fix in `serve_keep_alive`) only needs the matching configuration, but
+fix in `serve_coroutine_keep_alive`) only needs the matching configuration, but
 if the fix reveals a matching bug in the reactor sibling — as happened
 during the `http2-reactor` milestone — fix both and re-run the
 differential test suite for that protocol.

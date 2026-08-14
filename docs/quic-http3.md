@@ -21,7 +21,7 @@ The pieces, top to bottom:
 | Type | Header | Role |
 |---|---|---|
 | `http3::Http3Server::RequestFn` | `<libspaznet/http3/server.hpp>` | Your code — a callable invoked with each fully-arrived HTTP/3 request. |
-| `http3::QuicHttp3Service` | `<libspaznet/http3/service.hpp>` | Owns the `Listener` + per-connection `Http3Server`. Wrap with `http3::make_dispatcher` and hand to `Server::set_datagram_handler`. |
+| `http3::QuicHttp3Service` | `<libspaznet/http3/service.hpp>` | Owns the `Listener` + per-connection `Http3Server`. Wrap with `http3::make_coroutine_dispatcher` and hand to `Server::set_coroutine_datagram_handler`. |
 | `http3::Http3Server` | `<libspaznet/http3/server.hpp>` | One per active QUIC connection. Speaks HTTP/3 framing, QPACK-decodes headers, dispatches to `HTTP3Handler`. |
 | `quic::Listener` | `<libspaznet/quic/listener.hpp>` | UDP-side dispatcher. Demuxes datagrams by Destination Connection ID, creates new `quic::Connection`s on incoming Initials, emits Version Negotiation / Retry as configured. |
 | `quic::Connection` | `<libspaznet/quic/connection.hpp>` | Per-peer state machine. Three PN spaces (Initial / Handshake / Application), streams, recovery, congestion. |
@@ -79,10 +79,10 @@ int main() {
     auto service = std::make_unique<http3::QuicHttp3Service>(
         std::move(lcfg), send_fn, on_request);
 
-    // 4. Hand it to a Server via the new DatagramHandler factory.
+    // 4. Hand it to a Server via the new CoroutineDatagramHandler factory.
     Server server(4);
-    server.set_datagram_handler(
-        spaznet::http3::make_dispatcher(std::move(service)));
+    server.set_coroutine_datagram_handler(
+        spaznet::http3::make_coroutine_dispatcher(std::move(service)));
     server.listen_udp(4433);
     udp_fd = /* obtain via Server stats / IOContext if needed */ 0;
     server.run();
@@ -93,8 +93,8 @@ Three things to notice:
 
 1. **`listen_udp`, not `listen_tcp`.** QUIC runs over UDP. The
    `Server` routes incoming datagrams via the
-   `DatagramHandler` callback installed with
-   `set_datagram_handler`.
+   `CoroutineDatagramHandler` callback installed with
+   `set_coroutine_datagram_handler`.
 2. **Link against `spaznet::quic_http3`** to use any of the
    `spaznet::quic::` / `spaznet::http3::` types — the QUIC stack
    is in `example/quic-http3` and isn't part of the core
@@ -102,15 +102,15 @@ Three things to notice:
 
 There's also a coroutine-free counterpart,
 `http3::make_reactor_dispatcher(...)`, registered via
-`Server::set_sync_datagram_handler` instead of `set_datagram_handler`:
+`Server::set_reactor_sync_datagram_handler` instead of `set_coroutine_datagram_handler`:
 
 ```cpp
-server.set_sync_datagram_handler(
+server.set_reactor_sync_datagram_handler(
     spaznet::http3::make_reactor_dispatcher(std::move(service)));
 ```
 
 Both wrap the exact same `QuicHttp3Service::handle_datagram` call —
-`make_dispatcher`'s `Task` never actually suspends, since the whole
+`make_coroutine_dispatcher`'s `Task` never actually suspends, since the whole
 QUIC/HTTP3 transport underneath is already a synchronous pump, so the two
 dispatchers are behaviorally identical. Pick whichever matches the rest of
 your `Server` setup (or run both, on separate `Server`s / ports, if you're

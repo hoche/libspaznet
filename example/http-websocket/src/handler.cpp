@@ -3,6 +3,7 @@
 #include <cstring>
 #include <libspaznet/websocket/handler.hpp>
 #include <limits>
+#include <stdexcept>
 
 namespace spaznet::websocket {
 

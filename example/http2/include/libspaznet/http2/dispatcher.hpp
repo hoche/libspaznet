@@ -1,9 +1,9 @@
 #pragma once
 
-// HTTP/2 (h2c, prior-knowledge cleartext) ConnectionHandler factory.
+// HTTP/2 (h2c, prior-knowledge cleartext) CoroutineConnectionHandler factory.
 //
-// Hand `make_dispatcher` an http2::Handler implementation and pass
-// the result to `Server::set_connection_handler`.  Each accepted TCP
+// Hand `make_coroutine_dispatcher` an http2::Handler implementation and pass
+// the result to `Server::set_coroutine_connection_handler`.  Each accepted TCP
 // connection runs the full h2c serve loop: connection preface,
 // SETTINGS exchange, multiplexed stream handling, HPACK header
 // decode/encode, flow-control window tracking, and dispatch through
@@ -21,19 +21,19 @@
 namespace spaznet::http2 {
 
 #ifdef SPAZNET_HAS_COROUTINES
-auto make_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::ConnectionHandler;
+auto make_coroutine_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::CoroutineConnectionHandler;
 #endif // SPAZNET_HAS_COROUTINES
 
-// Coroutine-free counterpart of make_dispatcher: identical wire behavior
+// Coroutine-free counterpart of make_coroutine_dispatcher: identical wire behavior
 // (preface, SETTINGS, multiplexed streams, HPACK, flow control, PING,
 // GOAWAY, RST_STREAM — see dispatcher_reactor.cpp's header comment) built
 // on Http2Connection, an explicit {Preface, FrameHeader, FramePayload}
 // state machine driven by BufferedConnection's callbacks instead of a
 // suspended coroutine frame per connection plus a detached one per
-// stream. Same Handler interface as make_dispatcher above — a single
+// stream. Same Handler interface as make_coroutine_dispatcher above — a single
 // Handler implementation works unchanged under either runtime. Hand the
-// result to Server::set_connection_factory instead of
-// set_connection_handler.
-auto make_reactor_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::ConnectionFactory;
+// result to Server::set_reactor_connection_factory instead of
+// set_coroutine_connection_handler.
+auto make_reactor_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::ReactorConnectionFactory;
 
 } // namespace spaznet::http2

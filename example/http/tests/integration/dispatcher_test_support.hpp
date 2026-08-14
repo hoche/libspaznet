@@ -1,8 +1,8 @@
 #pragma once
 
 // Shared helper for parameterizing HTTP/1.1 integration tests over both
-// dispatchers: the coroutine one (dispatcher.cpp, Server::set_connection_handler)
-// and the reactor one (dispatcher_reactor.cpp, Server::set_connection_factory).
+// dispatchers: the coroutine one (dispatcher.cpp, Server::set_coroutine_connection_handler)
+// and the reactor one (dispatcher_reactor.cpp, Server::set_reactor_connection_factory).
 // Both speak the exact same protocol against the exact same HTTPHandler
 // interface, so running the same test body against each is a differential
 // check — any behavioral divergence is a bug in whichever one disagrees.
@@ -34,18 +34,18 @@ namespace spaznet::http::testing_support {
 enum class DispatcherKind { Coroutine, Reactor };
 
 // Installs `handler` on `server` using whichever of
-// set_connection_handler/set_connection_factory matches `kind`. The
+// set_coroutine_connection_handler/set_reactor_connection_factory matches `kind`. The
 // Coroutine arm only exists when SPAZNET_HAS_COROUTINES is defined —
 // AllDispatcherKinds() below never hands a test Coroutine otherwise, so
 // this is unreachable rather than a runtime fallback.
 inline void install_dispatcher(::spaznet::Server& server, std::unique_ptr<HTTPHandler> handler,
                                DispatcherKind kind) {
     if (kind == DispatcherKind::Reactor) {
-        server.set_connection_factory(make_reactor_dispatcher(std::move(handler)));
+        server.set_reactor_connection_factory(make_reactor_dispatcher(std::move(handler)));
         return;
     }
 #ifdef SPAZNET_HAS_COROUTINES
-    server.set_connection_handler(make_dispatcher(std::move(handler)));
+    server.set_coroutine_connection_handler(make_coroutine_dispatcher(std::move(handler)));
 #else
     (void)server;
     (void)handler;

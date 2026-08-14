@@ -1,6 +1,6 @@
 # HTTP/1.x demos
 
-Two small servers built on `spaznet::http::make_dispatcher`, both
+Two small servers built on `spaznet::http::make_coroutine_dispatcher`, both
 serving plain HTTP/1.1 on port 8080. When the core is built with
 `SPAZNET_HAS_TLS`, `hello` also accepts `--tls` for HTTPS on 8443
 (self-signed cert).
@@ -17,7 +17,7 @@ curl -k https://127.0.0.1:8443/
 
 A single route that always returns `200 OK` with a fixed body. This is
 the "hello world" of the `HTTPHandler` interface — enough to show how a
-handler is wired into `Server::set_connection_handler`, but nothing about
+handler is wired into `Server::set_coroutine_connection_handler`, but nothing about
 the protocol itself. `--tls` uses `Server::listen_tls` with ALPN
 `http/1.1`; the dispatcher is unchanged.
 

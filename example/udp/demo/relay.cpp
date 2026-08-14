@@ -54,7 +54,7 @@ class Relay : public spaznet::udp::Handler {
         const std::string key = peer_key(pkt);
         std::string join_notice;
 
-        // The dispatcher (example/udp/src/dispatcher.cpp) shares this one
+        // The dispatcher (example/udp/src/dispatcher_coroutine.cpp) shares this one
         // Handler instance across every datagram on every worker thread,
         // so the peer table needs its own lock — nothing upstream
         // serializes access to it the way a per-connection object would.
@@ -103,11 +103,11 @@ int main(int argc, char** argv) {
 
     spaznet::Server server(2);
     if (use_reactor) {
-        server.set_sync_datagram_handler(spaznet::udp::make_reactor_dispatcher(std::make_unique<Relay>()));
+        server.set_reactor_sync_datagram_handler(spaznet::udp::make_reactor_dispatcher(std::make_unique<Relay>()));
     }
 #ifdef SPAZNET_HAS_COROUTINES
     else {
-        server.set_datagram_handler(spaznet::udp::make_dispatcher(std::make_unique<Relay>()));
+        server.set_coroutine_datagram_handler(spaznet::udp::make_coroutine_dispatcher(std::make_unique<Relay>()));
     }
 #endif
     server.listen_udp(8080);

@@ -1,7 +1,7 @@
 // HTTP/1.1 reactor dispatcher: the coroutine-free counterpart of
-// dispatcher.cpp's serve_keep_alive. Same protocol, same HTTPParser, same
+// dispatcher_coroutine.cpp's serve_coroutine_keep_alive. Same protocol, same HTTPParser, same
 // HTTPRequest/HTTPResponse, same HTTPHandler interface — only the
-// execution model differs. Where serve_keep_alive keeps its buffer and
+// execution model differs. Where serve_coroutine_keep_alive keeps its buffer and
 // request/response state implicitly in a coroutine frame across
 // suspension points, Http1Connection keeps the same state in explicit
 // members and is re-entered from the top by BufferedConnection's
@@ -9,7 +9,7 @@
 //
 // Phase state machine:
 //   ReadingRequest -> accumulating bytes via on_data(), reparsing the
-//     whole buffered prefix each time (mirrors serve_keep_alive's
+//     whole buffered prefix each time (mirrors serve_coroutine_keep_alive's
 //     "insert new bytes, reparse" loop exactly; HTTPParser is stateless
 //     across calls either way).
 //   Dispatching -> a request was parsed and handed to the handler; we're
@@ -50,7 +50,7 @@ namespace spaznet::http {
 
 namespace {
 
-// Same Transfer-Encoding sniff serve_keep_alive uses, factored out so
+// Same Transfer-Encoding sniff serve_coroutine_keep_alive uses, factored out so
 // both dispatchers stay in sync if the rule ever changes.
 auto serialize_response(const HTTPResponse& response) -> std::vector<std::uint8_t> {
     auto te = response.get_header("Transfer-Encoding");
@@ -74,7 +74,7 @@ class Http1Connection : public std::enable_shared_from_this<Http1Connection> {
     // Wires this dispatcher onto `conn` (captured weak in this object,
     // captured strong in conn's own callbacks — see the class comment
     // below on why that direction avoids a reference cycle) and starts
-    // the read loop. `initial_buffer` mirrors serve_keep_alive's
+    // the read loop. `initial_buffer` mirrors serve_coroutine_keep_alive's
     // parameter of the same name: bytes already read off the wire by a
     // caller that peeked before handing off (e.g. a future WebSocket
     // upgrade sniff). Call exactly once, immediately after construction.
@@ -102,7 +102,7 @@ class Http1Connection : public std::enable_shared_from_this<Http1Connection> {
     }
 
   private:
-    // Protocol bounds mirroring serve_keep_alive's exactly (see there for
+    // Protocol bounds mirroring serve_coroutine_keep_alive's exactly (see there for
     // rationale); kept in sync deliberately rather than shared via a
     // constant so each dispatcher can diverge later without surprising
     // the other.
@@ -206,7 +206,7 @@ class Http1Connection : public std::enable_shared_from_this<Http1Connection> {
                 handler_->handle_request(request, writer);
             } catch (...) {
                 dispatch_call_active_ = false;
-                // Match serve_keep_alive's bookkeeping (it decrements
+                // Match serve_coroutine_keep_alive's bookkeeping (it decrements
                 // then rethrows into the Task machinery); here there's
                 // nowhere sensible to rethrow to, so just tear the
                 // connection down rather than leave it stuck
@@ -303,7 +303,7 @@ auto attach_reactor_dispatcher(::spaznet::IOContext& ctx,
     dispatcher->start(std::move(initial_buffer), std::move(on_closed));
 }
 
-auto make_reactor_dispatcher(std::unique_ptr<HTTPHandler> handler) -> ::spaznet::ConnectionFactory {
+auto make_reactor_dispatcher(std::unique_ptr<HTTPHandler> handler) -> ::spaznet::ReactorConnectionFactory {
     std::shared_ptr<HTTPHandler> shared(handler.release());
     return [shared](int fd, ::spaznet::IOContext& ctx,
                     std::function<void()> on_closed) -> std::shared_ptr<::spaznet::IoHandler> {

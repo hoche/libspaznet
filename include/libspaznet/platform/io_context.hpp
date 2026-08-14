@@ -62,7 +62,7 @@ struct Statistics {
     std::size_t active_coroutines{0};        // Currently active coroutines (0 if coroutines disabled)
     std::size_t total_memory_bytes{0};       // Estimated memory in use (bytes; coroutine frames only)
     // Live connection count, tracked by Server for both runtimes: the
-    // coroutine path's ConnGuard and the reactor path's ConnectionFactory
+    // coroutine path's ConnGuard and the reactor path's ReactorConnectionFactory
     // accept/finish hooks both feed the same counter, so this is accurate
     // regardless of which (or both) a given Server uses.
     std::size_t active_connections{0};
@@ -1173,7 +1173,7 @@ class IOContext {
     }
 
     // Connection-count tracking, shared by both runtimes (Server's
-    // coroutine ConnGuard and reactor ConnectionFactory hooks both call
+    // coroutine ConnGuard and reactor ReactorConnectionFactory hooks both call
     // these; see Statistics::active_connections above).
     void increment_active_connections() {
         statistics_.active_connections.fetch_add(1, std::memory_order_relaxed);

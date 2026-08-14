@@ -1,15 +1,15 @@
 #pragma once
 
-// Coroutine-free counterpart of handler.hpp's Handler/Connection, used by
-// websocket::make_reactor_dispatcher (see dispatcher.hpp). Reuses Opcode,
-// Message, and Frame from handler.hpp unchanged -- only the
+// Coroutine-free counterpart of coroutine_handler.hpp's Handler/Connection,
+// used by websocket::make_reactor_dispatcher (see dispatcher.hpp). Reuses
+// Opcode, Message, and Frame from handler.hpp unchanged — only the
 // connection/handler shape differs, because sending here is a direct,
 // synchronous write into a BufferedConnection's OutputBuffer instead of a
 // co_await'd socket write behind a WriteGate. The OutputBuffer already
 // serializes writes by construction (see reactor/buffered_connection.hpp),
 // which is what lets the WriteGate disappear entirely on this side.
 //
-// Unlike the coroutine Connection (deliberately non-copyable: it aliases
+// Unlike coroutine::Connection (deliberately non-copyable: it aliases
 // state living in a suspended coroutine frame that dies with the
 // connection), this Connection is a small, cheap value type — just a
 // weak_ptr and a stable fd — safe to copy and store anywhere (e.g. in a
@@ -90,8 +90,8 @@ class Handler {
     Handler(Handler&&) = delete;
     auto operator=(Handler&&) -> Handler& = delete;
 
-    // Same rvalue-first dispatch contract as the coroutine Handler (see
-    // handler.hpp): override exactly one of the two handle_message
+    // Same rvalue-first dispatch contract as coroutine::Handler (see
+    // coroutine_handler.hpp): override exactly one of the two handle_message
     // overloads.
     virtual void handle_message(const Message& message, Connection& conn) = 0;
     virtual void handle_message(Message&& message, Connection& conn) {

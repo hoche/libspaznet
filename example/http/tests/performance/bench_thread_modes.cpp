@@ -848,8 +848,8 @@ int main(int argc, char** argv) {
 #ifdef SPAZNET_HAS_COROUTINES
             if (kind == DispatcherKind::Coroutine) {
                 server = std::make_unique<Server>(threads);
-                server->set_connection_handler(
-                    spaznet::http::make_dispatcher(std::make_unique<BenchHandler>()));
+                server->set_coroutine_connection_handler(
+                    spaznet::http::make_coroutine_dispatcher(std::make_unique<BenchHandler>()));
             } else
 #endif
             {
@@ -857,7 +857,7 @@ int main(int argc, char** argv) {
                     .loops = threads == 0 ? 1 : threads,
                     .workers_per_loop = 0,
                 });
-                server->set_connection_factory(
+                server->set_reactor_connection_factory(
                     spaznet::http::make_reactor_dispatcher(std::make_unique<BenchHandler>()));
             }
             uint16_t port = listen_on_random_port(*server);

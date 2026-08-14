@@ -29,7 +29,7 @@
 // Concurrency model
 // ------------------
 // `Socket` is owned by the per-connection coroutine (see
-// src/dispatcher.cpp's serve_websocket) for the life of the connection, and
+// src/dispatcher_coroutine.cpp's serve_websocket) for the life of the connection, and
 // is not copyable. If handle_message on connection A tried to call
 // send_message() directly on connection B's socket, two application
 // coroutines could end up writing the same fd concurrently (a data race on
@@ -169,11 +169,11 @@ class HttpFallback : public spaznet::http::HTTPHandler {
 // Per-connection state: an outbound queue fed by *other* connections'
 // handle_message calls, drained only by this connection's own writer_loop.
 struct Session {
-    Session(int id_param, spaznet::websocket::Connection* conn_param)
+    Session(int id_param, spaznet::websocket::coroutine::Connection* conn_param)
         : id(id_param), conn(conn_param) {}
 
     const int id;
-    spaznet::websocket::Connection* const conn;
+    spaznet::websocket::coroutine::Connection* const conn;
 
     std::mutex mu;
     std::deque<std::vector<uint8_t>> outbox;
@@ -223,9 +223,9 @@ spaznet::Task writer_loop(std::shared_ptr<Session> session) {
     session->writer_done.store(true, std::memory_order_release);
 }
 
-class ChatRoom : public spaznet::websocket::Handler {
+class ChatRoom : public spaznet::websocket::coroutine::Handler {
   public:
-    spaznet::Task on_open(spaznet::websocket::Connection& conn) override {
+    spaznet::Task on_open(spaznet::websocket::coroutine::Connection& conn) override {
         auto session = std::make_shared<Session>(conn.id(), &conn);
         std::size_t online = 0;
         {
@@ -245,7 +245,7 @@ class ChatRoom : public spaznet::websocket::Handler {
     // the rvalue overload's default forwarder calls it, which is fine here
     // since we don't need to move the payload out of `message`.
     spaznet::Task handle_message(const spaznet::websocket::Message& message,
-                                 spaznet::websocket::Connection& conn) override {
+                                 spaznet::websocket::coroutine::Connection& conn) override {
         if (message.opcode != spaznet::websocket::Opcode::Text) {
             co_return;
         }
@@ -255,7 +255,7 @@ class ChatRoom : public spaznet::websocket::Handler {
         co_return;
     }
 
-    spaznet::Task on_close(spaznet::websocket::Connection& conn) override {
+    spaznet::Task on_close(spaznet::websocket::coroutine::Connection& conn) override {
         std::shared_ptr<Session> session;
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -408,12 +408,12 @@ int main(int argc, char** argv) {
 
     spaznet::Server server(4);
     if (use_reactor) {
-        server.set_connection_factory(spaznet::websocket::make_reactor_dispatcher(
+        server.set_reactor_connection_factory(spaznet::websocket::make_reactor_dispatcher(
             std::make_unique<HttpFallback>(), std::make_unique<ChatRoomReactor>()));
     }
 #ifdef SPAZNET_HAS_COROUTINES
     else {
-        server.set_connection_handler(spaznet::websocket::make_dispatcher(
+        server.set_coroutine_connection_handler(spaznet::websocket::make_coroutine_dispatcher(
             std::make_unique<HttpFallback>(), std::make_unique<ChatRoom>()));
     }
 #endif

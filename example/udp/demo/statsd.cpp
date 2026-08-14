@@ -139,11 +139,11 @@ int main(int argc, char** argv) {
     auto handler = std::make_unique<StatsdAggregator>();
     StatsdAggregator* handler_raw = handler.get();
     if (use_reactor) {
-        server.set_sync_datagram_handler(spaznet::udp::make_reactor_dispatcher(std::move(handler)));
+        server.set_reactor_sync_datagram_handler(spaznet::udp::make_reactor_dispatcher(std::move(handler)));
     }
 #ifdef SPAZNET_HAS_COROUTINES
     else {
-        server.set_datagram_handler(spaznet::udp::make_dispatcher(std::move(handler)));
+        server.set_coroutine_datagram_handler(spaznet::udp::make_coroutine_dispatcher(std::move(handler)));
     }
 #endif
     server.listen_udp(8081);
@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
     // udp::Handler is a plain callback with no IOContext handed to it,
     // so a periodic flush/report is simplest as its own thread rather
     // than a coroutine timer. handler_raw stays valid for the process
-    // lifetime — make_dispatcher holds the Handler in a shared_ptr that
+    // lifetime — make_coroutine_dispatcher holds the Handler in a shared_ptr that
     // outlives this thread.
     std::thread reporter([handler_raw]() {
         while (true) {

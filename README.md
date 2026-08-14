@@ -10,7 +10,7 @@ A high-performance, cross-platform network server library written in C++20 that 
   - poll on other Unix systems
   - readiness-style IOCP on Windows (force poll with `-DSPAZNET_FORCE_POLL=ON`)
 - **Two execution models, your choice per connection:**
-  - **Coroutines** (`make_dispatcher(...)`) — `Task`/`co_await`, the original model. Connection state lives implicitly in the coroutine frame, which can migrate freely between worker threads.
+  - **Coroutines** (`make_coroutine_dispatcher(...)`) — `Task`/`co_await`, the original model. Connection state lives implicitly in the coroutine frame, which can migrate freely between worker threads.
   - **Reactor** (`make_reactor_dispatcher(...)`) — plain callbacks over an explicit state machine (`BufferedConnection` + phase enum), no `<coroutine>` dependency, no coroutine-frame allocation. Works with `-DSPAZNET_ENABLE_COROUTINES=OFF`.
   - Both hit the identical protocol codec and the identical handler object where the handler shape allows it (HTTP/1.1, HTTP/2, UDP, QUIC/HTTP3); only the execution model differs. See *Execution Models* below.
 - **Thread-safe:** Single-threaded by default, or multi-threaded with a small fixed set of mutexes (see *Concurrency Primitives* below and `docs/mutex-vs-atomics.md`). Reactor TLS I/O takes no per-connection mutex (IO-thread affinity); coroutine TLS serializes only when needed.
@@ -30,21 +30,21 @@ Every protocol under `example/<protocol>/` exposes two dispatcher factories that
 
 ```cpp
 // Coroutine dispatcher: Task/co_await under the hood.
-server.set_connection_handler(
-    spaznet::http::make_dispatcher(std::make_unique<MyHTTPHandler>()));
+server.set_coroutine_connection_handler(
+    spaznet::http::make_coroutine_dispatcher(std::make_unique<MyHTTPHandler>()));
 
 // Reactor dispatcher: plain callbacks, no coroutine dependency.
-server.set_connection_factory(
+server.set_reactor_connection_factory(
     spaznet::http::make_reactor_dispatcher(std::make_unique<MyHTTPHandler>()));
 ```
 
-| | Coroutine (`make_dispatcher`) | Reactor (`make_reactor_dispatcher`) |
+| | Coroutine (`make_coroutine_dispatcher`) | Reactor (`make_reactor_dispatcher`) |
 |---|---|---|
 | Connection state lives in | the coroutine frame (implicit, across `co_await`) | ordinary member variables of a phase state machine (explicit) |
 | Requires C++20 `<coroutine>` | Yes | No |
 | Builds with `-DSPAZNET_ENABLE_COROUTINES=OFF` | No | Yes |
 | Can migrate between `Server(N)` worker threads | Yes, at every `co_await` | No — see below |
-| Registered via | `Server::set_connection_handler` | `Server::set_connection_factory` |
+| Registered via | `Server::set_coroutine_connection_handler` | `Server::set_reactor_connection_factory` |
 
 Pick coroutines when you want `co_await`-style linear code and don't mind the C++20 coroutine dependency. Pick the reactor model when you need a coroutine-free build (older toolchains, embedded targets, or code that just prefers explicit state machines), or when you're calling into `libspaznet` from a context where `<coroutine>` isn't available at all.
 
@@ -271,8 +271,8 @@ public:
 
 int main() {
     spaznet::Server server(4);  // 4 worker threads (0 = single-threaded)
-    server.set_connection_handler(
-        spaznet::http::make_dispatcher(std::make_unique<MyHTTPHandler>()));
+    server.set_coroutine_connection_handler(
+        spaznet::http::make_coroutine_dispatcher(std::make_unique<MyHTTPHandler>()));
     server.listen_tcp(8080);
 
     // Optional: Monitor server statistics
@@ -290,7 +290,7 @@ int main() {
 int main() {
     // loops=N scales reactor I/O via accept-and-shard; workers_per_loop is unused here.
     spaznet::Server server(spaznet::ServerConfig{.loops = 4, .workers_per_loop = 0});
-    server.set_connection_factory(
+    server.set_reactor_connection_factory(
         spaznet::http::make_reactor_dispatcher(std::make_unique<MyHTTPHandler>()));
     server.listen_tcp(8080);
     server.run();
@@ -347,7 +347,7 @@ porting code from before the restructure.
 - **IOContext:** Manages the event loop, the fd readiness table, timers, and — for the coroutine model — coroutine scheduling across worker threads
 - **PlatformIO:** Platform-specific I/O multiplexing abstraction (epoll/kqueue/poll/IOCP), shared by both execution models
 - **IoHandler:** The reactor primitive underneath both models — a plain `on_readable`/`on_writable`/`on_error` interface. Coroutine resumption is implemented as one `IoHandler` (`CoroutineResumeHandler`); a reactor connection's `BufferedConnection` is another. Neither is a privileged special case.
-- **Server:** High-level server interface; `set_connection_handler` wires up a coroutine dispatcher, `set_connection_factory` wires up a reactor one
+- **Server:** High-level server interface; `set_coroutine_connection_handler` wires up a coroutine dispatcher, `set_reactor_connection_factory` wires up a reactor one
 - **Handlers:** Protocol-specific request handlers (UDP, HTTP, HTTP/2, WebSocket, QUIC, HTTP/3), each with a coroutine dispatcher and a reactor dispatcher sharing the same codec
 
 Coroutines are the optional layer, not the foundation: the reactor core (`IoHandler`, `BufferedConnection`, `post()`/timers) builds and runs with zero coroutine dependency, and coroutine support is an adapter on top of it, gated by the `SPAZNET_ENABLE_COROUTINES` CMake option (default `ON`). See *Execution Models* above. Most state on the hot path is held in `std::atomic<…>`; structural mutations are guarded by a small set of mutexes (see *Concurrency Primitives* below). TCP TLS follows the same split: reactor connections never take `TlsStream::io_mu_`; coroutine `Socket::attach_tls` enables it only when reader and writer coroutines can share one SSL*.
@@ -372,7 +372,7 @@ Coroutines are the optional layer, not the foundation: the reactor core (`IoHand
 | `IOContext::worker_join_mutex_`        | `include/libspaznet/platform/io_context.hpp`      | all            | both      | serializes `join_workers()` between `run()`'s exit path and `~IOContext`                                                                               |
 | `Server::listen_fds_mutex_`            | `include/libspaznet/server.hpp`                   | all            | both      | listening-socket vector                                                                                                                                |
 | `Server::client_fds_mutex_`            | `include/libspaznet/server.hpp`                   | all            | coroutine | active-client-fd set used by `Server::stop()` to drain in-flight coroutine connections                                                                |
-| `Server::reactor_conns_mutex_`         | `include/libspaznet/server.hpp`                   | all            | reactor   | `reactor_connections_` (fd → `{IoHandler, IOContext*}`) registry backing `set_connection_factory`; under multi-loop accept-and-shard the `IOContext*` is the loop the connection was pinned to, so `stop()` can `post_to_io_thread` shutdown on the right loop |
+| `Server::reactor_conns_mutex_`         | `include/libspaznet/server.hpp`                   | all            | reactor   | `reactor_connections_` (fd → `{IoHandler, IOContext*}`) registry backing `set_reactor_connection_factory`; under multi-loop accept-and-shard the `IOContext*` is the loop the connection was pinned to, so `stop()` can `post_to_io_thread` shutdown on the right loop |
 | `ResponseWriter<Response>::State::mu`  | `include/libspaznet/reactor/response_writer.hpp`  | —              | both      | the shared completion state (`deliver`, `on_ready`, `completed`) so `complete()` can race safely against `on_ready()` registration from any thread    |
 | `PlatformIOPoll::mutex_`               | `src/platform/platform_io_poll.cpp`               | poll / WSAPoll | both      | interest-set tables (`pollfds_` / `fd_info_`); compiled when `USE_POLL` is selected (non-Windows default fallback, or `-DSPAZNET_FORCE_POLL=ON` on Windows) |
 | `PlatformIOIOCP::mutex_`               | `src/platform/platform_io_iocp.cpp`               | IOCP (Winsock) | both      | IOCP fd/probe tables; compiled when `USE_IOCP` is selected (default on Windows)                                                                        |
@@ -391,8 +391,8 @@ These ship with the optional protocol stacks under `example/`; they are not part
 
 | Location        | File                                        | Backend | Runtime   | Guards                                                                                                                                                                                                             |
 | --------------- | ------------------------------------------- | ------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `WriteGate::m`  | `example/http-websocket/src/dispatcher.cpp` | —       | coroutine | fair async write gate so dispatcher control frames and application `send()` cannot interleave on one connection — the reactor dispatcher's `OutputBuffer` serializes writes by construction, so it needs no gate |
-| `ConnState::mu` | `example/http2/src/dispatcher.cpp`          | —       | coroutine | per-connection HTTP/2 state and the serialized outbound frame queue — the reactor dispatcher's `Http2Connection` needs no lock, since every mutating entry point is provably reached from the IO thread alone via `post_to_io_thread()` (`assert(ctx_.is_io_thread())` instead) |
+| `WriteGate::m`  | `example/http-websocket/src/dispatcher_coroutine.cpp` | —       | coroutine | fair async write gate so dispatcher control frames and application `send()` cannot interleave on one connection — the reactor dispatcher's `OutputBuffer` serializes writes by construction, so it needs no gate |
+| `ConnState::mu` | `example/http2/src/dispatcher_coroutine.cpp`          | —       | coroutine | per-connection HTTP/2 state and the serialized outbound frame queue — the reactor dispatcher's `Http2Connection` needs no lock, since every mutating entry point is provably reached from the IO thread alone via `post_to_io_thread()` (`assert(ctx_.is_io_thread())` instead) |
 
 
 Neither of these has a reactor-side counterpart lock: the reactor dispatchers for WebSocket and HTTP/2 achieve the same single-writer/single-mutator guarantee through `OutputBuffer` and IO-thread affinity instead of a mutex.

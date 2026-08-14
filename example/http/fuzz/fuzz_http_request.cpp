@@ -5,8 +5,8 @@
 // We feed the fuzzer arbitrary bytes as if they were a freshly-arrived
 // HTTP/1.1 request and look for crashes / UB / sanitizer hits.
 // HTTPParser::parse_request is the surface a network-facing peer can
-// reach through Server::set_connection_handler +
-// spaznet::http::make_dispatcher, so anything reachable here is
+// reach through Server::set_coroutine_connection_handler +
+// spaznet::http::make_coroutine_dispatcher, so anything reachable here is
 // reachable from a hostile client.
 
 #include <libspaznet/http/handler.hpp>

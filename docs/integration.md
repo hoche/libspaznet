@@ -117,8 +117,8 @@ To detect from your own code whether you got the QUIC API:
 
 ```cpp
 #ifdef SPAZNET_HAS_QUIC
-    server.set_datagram_handler(
-        spaznet::http3::make_dispatcher(std::move(svc)));
+    server.set_coroutine_datagram_handler(
+        spaznet::http3::make_coroutine_dispatcher(std::move(svc)));
 #endif
 ```
 
@@ -244,8 +244,8 @@ public:
 
 int main() {
     spaznet::Server server(4);
-    server.set_connection_handler(
-        spaznet::http::make_dispatcher(std::make_unique<Hello>()));
+    server.set_coroutine_connection_handler(
+        spaznet::http::make_coroutine_dispatcher(std::make_unique<Hello>()));
     server.listen_tcp(8080);
     server.run();
 }

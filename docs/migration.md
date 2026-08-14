@@ -4,8 +4,28 @@ What to do when a libspaznet bump breaks your build. One section per
 incompatible change, newest first. Pair with [`CHANGELOG.md`](../CHANGELOG.md)
 for the full list of what changed.
 
-The library has not yet shipped versioned releases — pin a SHA, read
+The library does not (yet) ship versioned releases — pin a SHA, read
 this page, and re-run your test suite when you bump.
+
+## 2026-08-13 — coroutine / reactor naming symmetry
+
+Hard rename so both execution models embed their name the same way.
+No compatibility aliases.
+
+| Before | After |
+|---|---|
+| `make_dispatcher` | `make_coroutine_dispatcher` |
+| `http::serve_keep_alive` | `http::serve_coroutine_keep_alive` |
+| `websocket::Handler` / `Connection` | `websocket::coroutine::Handler` / `Connection` (`coroutine_handler.hpp`) |
+| `ConnectionHandler` / `DatagramHandler` | `CoroutineConnectionHandler` / `CoroutineDatagramHandler` |
+| `ConnectionFactory` / `SyncDatagramHandler` | `ReactorConnectionFactory` / `ReactorSyncDatagramHandler` |
+| `set_connection_handler` / `set_datagram_handler` | `set_coroutine_connection_handler` / `set_coroutine_datagram_handler` |
+| `set_connection_factory` / `set_sync_datagram_handler` | `set_reactor_connection_factory` / `set_reactor_sync_datagram_handler` |
+| `example/*/src/dispatcher.cpp` | `dispatcher_coroutine.cpp` |
+
+Unchanged: `make_reactor_dispatcher`, `attach_reactor_dispatcher`,
+`websocket::reactor::*`. Shared wire types (`Opcode` / `Frame` /
+`Message`) stay in `websocket/handler.hpp`.
 
 ## 2026-08-12 — `spaznet::udp::Handler::handle_packet` is now synchronous
 
@@ -27,11 +47,11 @@ void handle_packet(const spaznet::udp::Packet& pkt) override {
 }
 ```
 
-`make_dispatcher(...)` (coroutine runtime, `Server::set_datagram_handler`)
+`make_coroutine_dispatcher(...)` (coroutine runtime, `Server::set_coroutine_datagram_handler`)
 is unchanged at the call site — it now just calls the synchronous
 `handle_packet` and wraps it in a `Task` that never suspends. A new
 `make_reactor_dispatcher(...)` is also available for the coroutine-free
-runtime (`Server::set_sync_datagram_handler`); same `Handler`, either
+runtime (`Server::set_reactor_sync_datagram_handler`); same `Handler`, either
 dispatcher.
 
 ## 2026-05-31 — protocol handlers pulled out of core (Phases 1–5)
@@ -48,16 +68,16 @@ server.
 
 The `Server::set_*_handler` setters and the
 `<libspaznet/handlers/*.hpp>` headers are **all gone**. Replace with
-the new low-level `set_connection_handler` / `set_datagram_handler`
-callbacks and per-protocol `make_dispatcher(...)` factories.
+the new low-level `set_coroutine_connection_handler` / `set_coroutine_datagram_handler`
+callbacks and per-protocol `make_coroutine_dispatcher(...)` factories.
 
 | Removed | Replacement |
 |---|---|
-| `Server::set_http_handler(unique_ptr<HTTPHandler>)` | `Server::set_connection_handler(spaznet::http::make_dispatcher(unique_ptr<spaznet::http::HTTPHandler>))` |
-| `Server::set_websocket_handler(unique_ptr<WebSocketHandler>)` | `Server::set_connection_handler(spaznet::websocket::make_dispatcher(http_handler, ws_handler))` (combined dispatcher) |
-| `Server::set_http2_handler(unique_ptr<HTTP2Handler>)` | `Server::set_connection_handler(spaznet::http2::make_dispatcher(unique_ptr<spaznet::http2::Handler>))` |
-| `Server::set_udp_handler(unique_ptr<UDPHandler>)` | `Server::set_datagram_handler(spaznet::udp::make_dispatcher(unique_ptr<spaznet::udp::Handler>))` |
-| `Server::set_quic_http3_service(unique_ptr<QuicHttp3Service>)` | `Server::set_datagram_handler(spaznet::http3::make_dispatcher(unique_ptr<spaznet::http3::QuicHttp3Service>))` |
+| `Server::set_http_handler(unique_ptr<HTTPHandler>)` | `Server::set_coroutine_connection_handler(spaznet::http::make_coroutine_dispatcher(unique_ptr<spaznet::http::HTTPHandler>))` |
+| `Server::set_websocket_handler(unique_ptr<WebSocketHandler>)` | `Server::set_coroutine_connection_handler(spaznet::websocket::make_coroutine_dispatcher(http_handler, ws_handler))` (combined dispatcher) |
+| `Server::set_http2_handler(unique_ptr<HTTP2Handler>)` | `Server::set_coroutine_connection_handler(spaznet::http2::make_coroutine_dispatcher(unique_ptr<spaznet::http2::Handler>))` |
+| `Server::set_udp_handler(unique_ptr<UDPHandler>)` | `Server::set_coroutine_datagram_handler(spaznet::udp::make_coroutine_dispatcher(unique_ptr<spaznet::udp::Handler>))` |
+| `Server::set_quic_http3_service(unique_ptr<QuicHttp3Service>)` | `Server::set_coroutine_datagram_handler(spaznet::http3::make_coroutine_dispatcher(unique_ptr<spaznet::http3::QuicHttp3Service>))` |
 | `Socket::send_websocket_message(opcode, payload, fin)` | `spaznet::websocket::send_message(socket, opcode, payload, fin)` (free function) |
 | `<libspaznet/handlers/http_handler.hpp>` | `<libspaznet/http/handler.hpp>` + `<libspaznet/http/dispatcher.hpp>` |
 | `<libspaznet/handlers/websocket_handler.hpp>` | `<libspaznet/websocket/handler.hpp>` + `<libspaznet/websocket/dispatcher.hpp>` + `<libspaznet/websocket/send.hpp>` |
@@ -65,7 +85,7 @@ callbacks and per-protocol `make_dispatcher(...)` factories.
 | `<libspaznet/handlers/udp_handler.hpp>` | `<libspaznet/udp/handler.hpp>` + `<libspaznet/udp/dispatcher.hpp>` |
 | `<libspaznet/http3/huffman.hpp>` (RFC 7541 §B codec) | `<libspaznet/codec/huffman.hpp>` — same codec, new namespace `spaznet::codec::huffman_{encode,decode}`. Stays in core. |
 | `spaznet::HTTPHandler` / `HTTPRequest` / `HTTPResponse` / `HTTPParser` | `spaznet::http::HTTPHandler` / `HTTPRequest` / `HTTPResponse` / `HTTPParser` |
-| `spaznet::WebSocketHandler` / `WebSocketFrame` / `WebSocketMessage` / `WebSocketOpcode` | `spaznet::websocket::Handler` / `Frame` / `Message` / `Opcode` (prefix dropped) |
+| `spaznet::WebSocketHandler` / `WebSocketFrame` / `WebSocketMessage` / `WebSocketOpcode` | `spaznet::websocket::Handler` / `Frame` / `Message` / `Opcode` (prefix dropped; coroutine `Handler`/`Connection` later moved to `websocket::coroutine::` — see 2026-08-13) |
 | `spaznet::HTTP2Handler` / `HTTP2Request` / `HTTP2Response` / `HTTP2Frame` / … | `spaznet::http2::Handler` / `Request` / `Response` / `Frame` / … |
 | `spaznet::UDPHandler` / `UDPPacket` | `spaznet::udp::Handler` / `Packet`. The `Packet` no longer takes a `Socket&` — it carries `listen_fd` + raw `sockaddr_storage` for direct `::sendto()`. |
 
@@ -86,7 +106,7 @@ target_link_libraries(myapp PRIVATE
 ```
 
 Code: switch handler base classes to the namespaced names and
-replace setter calls with `make_dispatcher`. The
+replace setter calls with `make_coroutine_dispatcher`. The
 [`http.md`](http.md), [`websocket.md`](websocket.md), and
 [`quic-http3.md`](quic-http3.md) guides each have a complete
 minimal example.
@@ -99,7 +119,7 @@ minimal example.
   `listen_tls`) landed later on core — see `docs/integration.md`.
 - HTTP/2 dispatch is now **actually wired up** —
   `set_http2_handler` used to be a no-op (the parser existed but
-  the connection coroutine never invoked it); `spaznet::http2::make_dispatcher`
+  the connection coroutine never invoked it); `spaznet::http2::make_coroutine_dispatcher`
   is the first version of an HTTP/2 server that actually serves
   HTTP/2 requests. Verified against `curl --http2-prior-knowledge`.
 - HPACK rewritten to actual RFC 7541 (proper varints + Huffman

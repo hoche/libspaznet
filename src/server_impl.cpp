@@ -54,7 +54,7 @@ namespace {
 
 // (WebSocket / RFC 6455 helpers — sha1, base64_encode, header_has_token,
 // parse_websocket_request, compute_websocket_accept — moved to
-// example/http-websocket/src/dispatcher.cpp along with the rest of the
+// example/http-websocket/src/dispatcher_coroutine.cpp along with the rest of the
 // WS dispatch.)
 
 } // namespace
@@ -491,21 +491,21 @@ auto Server::get_statistics() const -> Statistics {
 }
 
 #ifdef SPAZNET_HAS_COROUTINES
-void Server::set_connection_handler(ConnectionHandler handler) {
-    connection_handler_ = std::move(handler);
+void Server::set_coroutine_connection_handler(CoroutineConnectionHandler handler) {
+    coroutine_connection_handler_ = std::move(handler);
 }
 
-void Server::set_datagram_handler(DatagramHandler handler) {
-    datagram_handler_ = std::move(handler);
+void Server::set_coroutine_datagram_handler(CoroutineDatagramHandler handler) {
+    coroutine_datagram_handler_ = std::move(handler);
 }
 #endif // SPAZNET_HAS_COROUTINES
 
-void Server::set_connection_factory(ConnectionFactory factory) {
-    connection_factory_ = std::move(factory);
+void Server::set_reactor_connection_factory(ReactorConnectionFactory factory) {
+    reactor_connection_factory_ = std::move(factory);
 }
 
-void Server::set_sync_datagram_handler(SyncDatagramHandler handler) {
-    sync_datagram_handler_ = std::move(handler);
+void Server::set_reactor_sync_datagram_handler(ReactorSyncDatagramHandler handler) {
+    reactor_sync_datagram_handler_ = std::move(handler);
 }
 
 void Server::finish_reactor_connection(int fd, IOContext* ctx) {
@@ -651,8 +651,8 @@ void Server::listen_tls(uint16_t port, TlsConfig cfg) {
 }
 
 // Completes SSL_accept on a freshly accepted fd, then hands the connection
-// to connection_factory_ (stashing the TlsStream for BufferedConnection) or
-// to the coroutine connection_handler_ path.
+// to reactor_connection_factory_ (stashing the TlsStream for BufferedConnection) or
+// to the coroutine coroutine_connection_handler_ path.
 class Server::TlsHandshakeHandler : public IoHandler,
                                     public std::enable_shared_from_this<TlsHandshakeHandler> {
   public:
@@ -711,7 +711,7 @@ class Server::TlsHandshakeHandler : public IoHandler,
             server_.reactor_connections_.erase(fd_);
         }
 
-        if (server_.connection_factory_) {
+        if (server_.reactor_connection_factory_) {
             detail::TlsStream::stash_for_fd(fd_, std::move(stream_));
             const int fd = fd_;
             IOContext* target = target_;
@@ -721,7 +721,7 @@ class Server::TlsHandshakeHandler : public IoHandler,
             auto on_closed = [server, fd, target]() {
                 server->finish_reactor_connection(fd, target);
             };
-            auto handler = server_.connection_factory_(fd, *target, std::move(on_closed));
+            auto handler = server_.reactor_connection_factory_(fd, *target, std::move(on_closed));
             if (handler) {
                 {
                     std::lock_guard<std::mutex> lock(server_.reactor_conns_mutex_);
@@ -864,10 +864,10 @@ bool Server::datagram_ready(int udp_fd) {
 
         // Reactor path takes precedence: a plain synchronous call, no
         // coroutine involved. Falls back to the coroutine-based
-        // datagram_handler_ (fire-and-forget via schedule(), matching how
-        // accept_ready() below hands off connection_handler_) if no sync
+        // coroutine_datagram_handler_ (fire-and-forget via schedule(), matching how
+        // accept_ready() below hands off coroutine_connection_handler_) if no sync
         // handler is installed.
-        if (sync_datagram_handler_) {
+        if (reactor_sync_datagram_handler_) {
             Datagram dg;
             dg.data = buffer;
             dg.peer_addr = host;
@@ -876,12 +876,12 @@ bool Server::datagram_ready(int udp_fd) {
             dg.peer_len = addr_len;
             dg.fd = udp_fd;
             try {
-                sync_datagram_handler_(std::move(dg));
+                reactor_sync_datagram_handler_(std::move(dg));
             } catch (...) {
             }
         }
 #ifdef SPAZNET_HAS_COROUTINES
-        else if (datagram_handler_) {
+        else if (coroutine_datagram_handler_) {
             Datagram dg;
             dg.data = buffer;
             dg.peer_addr = host;
@@ -890,7 +890,7 @@ bool Server::datagram_ready(int udp_fd) {
             dg.peer_len = addr_len;
             dg.fd = udp_fd;
             try {
-                primary_context().schedule(datagram_handler_(std::move(dg)));
+                primary_context().schedule(coroutine_datagram_handler_(std::move(dg)));
             } catch (...) {
             }
         }
@@ -931,7 +931,7 @@ bool Server::accept_ready(int listen_fd) {
             try {
                 auto stream = detail::TlsStream::create_server(tls_ctx, client_fd);
                 IOContext* target =
-                    connection_factory_ ? &pick_accept_loop() : &primary_context();
+                    reactor_connection_factory_ ? &pick_accept_loop() : &primary_context();
                 auto hs = std::make_shared<TlsHandshakeHandler>(*this, client_fd, target,
                                                                 std::move(stream));
                 {
@@ -953,14 +953,14 @@ bool Server::accept_ready(int listen_fd) {
 #endif
 
         // Reactor path takes precedence over the coroutine-based
-        // connection_handler_ (see ConnectionFactory's docs above).
+        // coroutine_connection_handler_ (see ReactorConnectionFactory's docs above).
         // Accept-and-shard: the listen fd stays on loop 0; the client fd is
         // handed to a target loop and never registered on the accept loop.
-        if (connection_factory_) {
+        if (reactor_connection_factory_) {
             int fd = client_fd; // captured by value below; client_fd is reused next loop iteration
             IOContext* target = &pick_accept_loop();
             auto on_closed = [this, fd, target]() { finish_reactor_connection(fd, target); };
-            auto handler = connection_factory_(client_fd, *target, std::move(on_closed));
+            auto handler = reactor_connection_factory_(client_fd, *target, std::move(on_closed));
             if (handler) {
                 {
                     std::lock_guard<std::mutex> lock(reactor_conns_mutex_);
@@ -983,7 +983,7 @@ bool Server::accept_ready(int listen_fd) {
         Socket socket(client_fd, &primary_context());
         primary_context().schedule(handle_connection(std::move(socket)));
 #else
-        // No connection_factory_ installed and no coroutine runtime to
+        // No reactor_connection_factory_ installed and no coroutine runtime to
         // fall back to — nothing can drive this connection, so drop it
         // rather than leak the fd.
         close_socket(client_fd);
@@ -1018,12 +1018,12 @@ bool Server::accept_ready(int listen_fd) {
 
 #ifdef SPAZNET_HAS_COROUTINES
 Task Server::handle_connection(Socket socket) {
-    // Low-level path: if the user installed a connection_handler_,
+    // Low-level path: if the user installed a coroutine_connection_handler_,
     // hand the Socket over and let them speak whatever protocol they
     // want.  The Socket is moved into a guard so cleanup is correct
     // whether the user's coroutine completes normally, throws, or
     // unwinds via Server::stop().
-    if (connection_handler_) {
+    if (coroutine_connection_handler_) {
         struct ConnGuard {
             Server* server;
             int fd;
@@ -1064,14 +1064,14 @@ Task Server::handle_connection(Socket socket) {
         }
 #endif
         try {
-            co_await connection_handler_(std::move(socket));
+            co_await coroutine_connection_handler_(std::move(socket));
         } catch (...) {
             // Swallow; the Socket's destructor closes the fd if the
             // handler didn't already.
         }
         co_return;
     }
-    // No connection_handler_ installed — drop the connection.
+    // No coroutine_connection_handler_ installed — drop the connection.
     socket.close();
     co_return;
 }

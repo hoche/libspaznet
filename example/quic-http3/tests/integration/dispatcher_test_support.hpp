@@ -1,9 +1,9 @@
 #pragma once
 
 // Shared helper for parameterizing QUIC/HTTP3 integration tests over both
-// dispatchers: the coroutine one (service.cpp's make_dispatcher,
-// Server::set_datagram_handler) and the reactor one (service.cpp's
-// make_reactor_dispatcher, Server::set_sync_datagram_handler). See
+// dispatchers: the coroutine one (service.cpp's make_coroutine_dispatcher,
+// Server::set_coroutine_datagram_handler) and the reactor one (service.cpp's
+// make_reactor_dispatcher, Server::set_reactor_sync_datagram_handler). See
 // example/http/tests/integration/dispatcher_test_support.hpp for the
 // pattern this mirrors.
 
@@ -24,11 +24,11 @@ enum class DispatcherKind { Coroutine, Reactor };
 inline void install_dispatcher(::spaznet::Server& server,
                                std::unique_ptr<QuicHttp3Service> service, DispatcherKind kind) {
     if (kind == DispatcherKind::Reactor) {
-        server.set_sync_datagram_handler(make_reactor_dispatcher(std::move(service)));
+        server.set_reactor_sync_datagram_handler(make_reactor_dispatcher(std::move(service)));
         return;
     }
 #ifdef SPAZNET_HAS_COROUTINES
-    server.set_datagram_handler(make_dispatcher(std::move(service)));
+    server.set_coroutine_datagram_handler(make_coroutine_dispatcher(std::move(service)));
 #else
     (void)server;
     (void)service;

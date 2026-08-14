@@ -1,6 +1,6 @@
 # WebSocket demos
 
-Two small servers built on `spaznet::websocket::make_dispatcher`, both
+Two small servers built on `spaznet::websocket::make_coroutine_dispatcher`, both
 serving plain HTTP/1.1 and WebSocket on port 8080. When the core is
 built with `SPAZNET_HAS_TLS`, both accept `--tls` for WSS on 8443
 (self-signed; ALPN `http/1.1`).
@@ -21,7 +21,7 @@ Every message a client sends is written straight back to that same
 client. `handle_message` reads `Connection& conn` and `on_open`/`on_close`
 do nothing. This is the "hello world" of the `Handler` interface: it
 shows the frame parsing, masking/unmasking, fragmentation handling, and
-handshake logic in `src/dispatcher.cpp` without any handler-side state.
+handshake logic in `src/dispatcher_coroutine.cpp` without any handler-side state.
 
 ## `chat.cpp` — broadcast chat room
 
@@ -64,6 +64,6 @@ demo's `Session`/`ChatRoom`/`writer_loop` machinery (see the comment block
 at the top of `chat.cpp`) exists to solve exactly that — each connection
 queues outbound data for its peers and only ever writes its own socket,
 serialized against the dispatcher's own control-frame writes (Pong,
-Close) via the `Connection` write gate in `src/dispatcher.cpp`. Echo never
+Close) via the `Connection` write gate in `src/dispatcher_coroutine.cpp`. Echo never
 needs any of this because it only ever writes back to the connection that
 is already asking it to.

@@ -36,11 +36,11 @@ int main(int argc, char** argv) {
 
     spaznet::Server server(2);
     if (use_reactor) {
-        server.set_sync_datagram_handler(spaznet::udp::make_reactor_dispatcher(std::make_unique<Echo>()));
+        server.set_reactor_sync_datagram_handler(spaznet::udp::make_reactor_dispatcher(std::make_unique<Echo>()));
     }
 #ifdef SPAZNET_HAS_COROUTINES
     else {
-        server.set_datagram_handler(spaznet::udp::make_dispatcher(std::make_unique<Echo>()));
+        server.set_coroutine_datagram_handler(spaznet::udp::make_coroutine_dispatcher(std::make_unique<Echo>()));
     }
 #endif
     server.listen_udp(8080);

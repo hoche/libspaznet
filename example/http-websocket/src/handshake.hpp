@@ -1,10 +1,10 @@
 #pragma once
 
 // WebSocket handshake (RFC 6455 §4.2) parsing and Sec-WebSocket-Accept
-// computation. Shared by both dispatchers -- dispatcher.cpp's coroutine
-// serve_websocket/make_dispatcher and dispatcher_reactor.cpp's
+// computation. Shared by both dispatchers -- dispatcher_coroutine.cpp's coroutine
+// serve_websocket/make_coroutine_dispatcher and dispatcher_reactor.cpp's
 // WsConnection -- so the upgrade-detection rules can't drift between
-// them. Originally lived inline in dispatcher.cpp; moved here verbatim
+// them. Originally lived inline in dispatcher_coroutine.cpp; moved here verbatim
 // (no behavior change) when the reactor dispatcher needed the same
 // logic.
 

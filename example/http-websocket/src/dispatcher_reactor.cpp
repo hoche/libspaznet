@@ -1,5 +1,5 @@
 // Combined HTTP/1.1 + WebSocket reactor dispatcher: the coroutine-free
-// counterpart of dispatcher.cpp's make_dispatcher/serve_websocket. Same
+// counterpart of dispatcher.cpp's make_coroutine_dispatcher/serve_websocket. Same
 // upgrade-sniffing rules, same handshake computation (handshake.hpp,
 // shared with the coroutine dispatcher), same on-the-wire frame format
 // (handler.cpp's Frame::serialize/parse, unchanged) -- only the
@@ -198,7 +198,7 @@ class WsConnection : public std::enable_shared_from_this<WsConnection> {
         auto hs_end = request_str.find("\r\n\r\n");
         if (hs_end == std::string::npos) {
             if (buffer_.size() >= kMaxHandshakeBytes) {
-                // Mirrors make_dispatcher: an over-long handshake attempt
+                // Mirrors make_coroutine_dispatcher: an over-long handshake attempt
                 // just falls through to the HTTP path below (whatever
                 // the HTTPHandler makes of the still-incomplete buffer is
                 // its business), rather than a dedicated WS-layer error.
@@ -482,7 +482,7 @@ class WsConnection : public std::enable_shared_from_this<WsConnection> {
 
 auto make_reactor_dispatcher(std::unique_ptr<::spaznet::http::HTTPHandler> http_handler,
                              std::unique_ptr<reactor::Handler> ws_handler)
-    -> ::spaznet::ConnectionFactory {
+    -> ::spaznet::ReactorConnectionFactory {
     std::shared_ptr<::spaznet::http::HTTPHandler> http_shared(http_handler.release());
     std::shared_ptr<reactor::Handler> ws_shared(ws_handler.release());
 

@@ -13,14 +13,14 @@
 namespace spaznet::udp {
 
 #ifdef SPAZNET_HAS_COROUTINES
-// Coroutine runtime: install via Server::set_datagram_handler.
-auto make_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::DatagramHandler;
+// Coroutine runtime: install via Server::set_coroutine_datagram_handler.
+auto make_coroutine_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::CoroutineDatagramHandler;
 #endif // SPAZNET_HAS_COROUTINES
 
 // Coroutine-free reactor runtime: install via
-// Server::set_sync_datagram_handler. See dispatcher.hpp's HTTP/1.1
+// Server::set_reactor_sync_datagram_handler. See dispatcher.hpp's HTTP/1.1
 // counterpart (example/http) for the pattern this follows; UDP's is
 // simpler since Handler has no completion token to bridge.
-auto make_reactor_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::SyncDatagramHandler;
+auto make_reactor_dispatcher(std::unique_ptr<Handler> handler) -> ::spaznet::ReactorSyncDatagramHandler;
 
 } // namespace spaznet::udp

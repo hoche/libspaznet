@@ -8,7 +8,7 @@ set(SPAZNET_HTTP2_SOURCES
     src/dispatcher_reactor.cpp
 )
 if(SPAZNET_ENABLE_COROUTINES)
-    list(APPEND SPAZNET_HTTP2_SOURCES src/dispatcher.cpp)
+    list(APPEND SPAZNET_HTTP2_SOURCES src/dispatcher_coroutine.cpp)
 endif()
 add_library(spaznet_http2 STATIC ${SPAZNET_HTTP2_SOURCES})
 add_library(spaznet::http2 ALIAS spaznet_http2)

@@ -1,4 +1,4 @@
-// Combined HTTP/1.1 + WebSocket ConnectionHandler.
+// Combined HTTP/1.1 + WebSocket CoroutineConnectionHandler.
 //
 // Sniffs the first ~2 KiB of each accepted connection: if the client
 // is asking for a WebSocket upgrade (RFC 6455 §4.2), we complete the
@@ -13,6 +13,7 @@
 #include <libspaznet/io_context.hpp>
 #include <libspaznet/server.hpp>
 #include <libspaznet/websocket/dispatcher.hpp>
+#include <libspaznet/websocket/coroutine_handler.hpp>
 #include <libspaznet/websocket/handler.hpp>
 #include <libspaznet/websocket/send.hpp>
 
@@ -33,6 +34,8 @@ using detail::HandshakeRequest;
 using detail::compute_accept;
 using detail::is_upgrade;
 using detail::parse_handshake;
+
+namespace coroutine {
 
 // Per-connection async write gate. Every write to a connection's socket is
 // serialized through here: the dispatcher's reader coroutine (Pong/Close) and
@@ -89,6 +92,8 @@ struct WriteGate {
     }
 };
 
+} // namespace coroutine
+
 namespace {
 
 // Build a server-origin (unmasked) WebSocket frame in one allocation.
@@ -131,7 +136,7 @@ auto build_frame(Opcode opcode, std::span<const std::uint8_t> payload, bool fin)
 
 // ---- WS frame loop --------------------------------------------------
 
-auto serve_websocket(::spaznet::Socket socket, Handler& handler,
+auto serve_websocket(::spaznet::Socket socket, coroutine::Handler& handler,
                      const HandshakeRequest& req, std::vector<uint8_t> initial)
     -> ::spaznet::Task {
     std::string client_key = req.headers.at("sec-websocket-key");
@@ -154,8 +159,8 @@ auto serve_websocket(::spaznet::Socket socket, Handler& handler,
     // serializes them via `gate`. gate/conn live on this coroutine frame for
     // the whole connection, so handlers that stash `&conn` must not use it
     // after on_close returns (the frame is destroyed right after).
-    WriteGate gate;
-    Connection conn{socket, gate};
+    coroutine::WriteGate gate;
+    coroutine::Connection conn{socket, gate};
 
     co_await handler.on_open(conn);
 
@@ -382,21 +387,21 @@ auto send_message(::spaznet::Socket& socket, Opcode opcode,
     // Low-level, UNSERIALIZED write. Safe only when the caller guarantees it
     // is the sole writer of `socket` (e.g. a handler that writes exclusively
     // from its own inline handle_message). Handlers with an independent writer
-    // coroutine must use Connection::send instead, which serializes writes.
+    // coroutine must use coroutine::Connection::send instead, which serializes writes.
     co_await socket.async_write(build_frame(opcode, payload, fin));
 }
 
 // ---- Connection (serialized per-connection sender) ------------------
 
-auto Connection::id() const -> int {
+auto coroutine::Connection::id() const -> int {
     return socket_->fd();
 }
 
-auto Connection::context() const -> ::spaznet::IOContext* {
+auto coroutine::Connection::context() const -> ::spaznet::IOContext* {
     return socket_->context();
 }
 
-auto Connection::send(Opcode opcode, std::span<const std::uint8_t> payload, bool fin)
+auto coroutine::Connection::send(Opcode opcode, std::span<const std::uint8_t> payload, bool fin)
     -> ::spaznet::Task {
     // Build first (no shared state touched), then serialize the actual write
     // through the per-connection gate so this never interleaves with the
@@ -409,11 +414,12 @@ auto Connection::send(Opcode opcode, std::span<const std::uint8_t> payload, bool
 
 // ---- combined dispatcher --------------------------------------------
 
-auto make_dispatcher(std::unique_ptr<::spaznet::http::HTTPHandler> http_handler,
-                     std::unique_ptr<Handler> ws_handler) -> ::spaznet::ConnectionHandler {
+auto make_coroutine_dispatcher(std::unique_ptr<::spaznet::http::HTTPHandler> http_handler,
+                     std::unique_ptr<coroutine::Handler> ws_handler)
+    -> ::spaznet::CoroutineConnectionHandler {
     // Wrap into shared_ptr so the std::function payload stays copyable.
     std::shared_ptr<::spaznet::http::HTTPHandler> http_shared(http_handler.release());
-    std::shared_ptr<Handler> ws_shared(ws_handler.release());
+    std::shared_ptr<coroutine::Handler> ws_shared(ws_handler.release());
 
     return [http_shared, ws_shared](::spaznet::Socket sock) -> ::spaznet::Task {
         // Read the first chunk and decide HTTP vs WS upgrade.
@@ -459,7 +465,7 @@ auto make_dispatcher(std::unique_ptr<::spaznet::http::HTTPHandler> http_handler,
         }
 
         if (http_shared) {
-            co_await ::spaznet::http::serve_keep_alive(std::move(sock), *http_shared,
+            co_await ::spaznet::http::serve_coroutine_keep_alive(std::move(sock), *http_shared,
                                                       std::move(buffer));
             co_return;
         }

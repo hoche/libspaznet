@@ -64,7 +64,7 @@ Accept-and-shard (what is implemented):
 
 - One listen fd, registered on **loop 0**
 - `accept_ready` round-robins each client fd onto a target loop
-- `connection_factory_(fd, *target_ctx, on_closed)` registers the
+- `reactor_connection_factory_(fd, *target_ctx, on_closed)` registers the
   handler on **that** context — the client fd is never registered on
   the accept loop
 - `Server::run()` starts loops `1..N-1` on their own threads, then

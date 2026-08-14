@@ -28,9 +28,9 @@ struct Packet {
 
 // Handler-interface idiom over the low-level Server callbacks.  Subclass
 // + override handle_packet, then wrap with either
-// spaznet::udp::make_dispatcher (coroutine runtime,
-// Server::set_datagram_handler) or spaznet::udp::make_reactor_dispatcher
-// (coroutine-free, Server::set_sync_datagram_handler) — same Handler,
+// spaznet::udp::make_coroutine_dispatcher (coroutine runtime,
+// Server::set_coroutine_datagram_handler) or spaznet::udp::make_reactor_dispatcher
+// (coroutine-free, Server::set_reactor_sync_datagram_handler) — same Handler,
 // same protocol behavior, pick a runtime.
 //
 // Runtime-neutral by design: plain synchronous function, no Task, no

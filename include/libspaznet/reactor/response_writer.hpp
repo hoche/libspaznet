@@ -12,7 +12,7 @@
 // This is the runtime-neutral half of the handler API: it has no
 // coroutine dependency and works identically whether the caller is a
 // coroutine dispatcher (see the awaiter bridge in
-// example/http/src/dispatcher.cpp), a future reactor state machine polling
+// example/http/src/dispatcher_coroutine.cpp), a future reactor state machine polling
 // is_completed(), or a plain synchronous caller that always completes
 // inline. on_ready() is the generic hook either of the latter two build on.
 

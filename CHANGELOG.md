@@ -6,6 +6,24 @@ Notable changes since the QUIC rewrite. SHAs are commit prefixes;
 The library does not (yet) ship versioned releases — downstream
 consumers should pin a SHA and re-test on bumps.
 
+## 2026-08-13 — coroutine / reactor naming symmetry
+
+Hard rename for parallel naming across both execution models (no
+aliases). Highlights:
+
+- `make_dispatcher` → `make_coroutine_dispatcher`; `serve_keep_alive` →
+  `serve_coroutine_keep_alive`.
+- Server typedefs/setters: `CoroutineConnectionHandler` /
+  `set_coroutine_connection_handler` / `set_coroutine_datagram_handler`
+  and `ReactorConnectionFactory` / `set_reactor_connection_factory` /
+  `set_reactor_sync_datagram_handler`.
+- WebSocket coroutine types move to `websocket::coroutine::*` in
+  `coroutine_handler.hpp` (mirrors `reactor_handler.hpp`).
+- Coroutine sources renamed `dispatcher.cpp` →
+  `dispatcher_coroutine.cpp`.
+
+See `docs/migration.md`.
+
 ## 2026-08-13 — fewer TLS locks on the reactor hot path
 
 `TlsStream` locks only when `enable_serialized_io()` was called
@@ -135,7 +153,7 @@ full test suite.
 - `Server`/`Socket` (`include/libspaznet/server.hpp` / `src/server_impl.cpp`)
   no longer require `SPAZNET_ENABLE_COROUTINES=ON` to compile at all —
   previously the entire `Server` class was gated on it, even though
-  `set_connection_factory`/`set_sync_datagram_handler` and every reactor
+  `set_reactor_connection_factory`/`set_reactor_sync_datagram_handler` and every reactor
   dispatcher have had no coroutine dependency since Milestone 5. Only
   `Socket`, the `Task`-returning handler typedefs, and the
   coroutine-specific accept/datagram/shutdown code paths are now
@@ -148,8 +166,8 @@ full test suite.
 - Every protocol's public dispatcher header (`http/dispatcher.hpp`,
   `http2/dispatcher.hpp`, `udp/dispatcher.hpp`, `http3/service.hpp`,
   `websocket/dispatcher.hpp`) now `#ifdef SPAZNET_HAS_COROUTINES`s its
-  `make_dispatcher(...)` declaration — previously these declared a
-  function returning a `Task`-based `ConnectionHandler`/`DatagramHandler`
+  `make_coroutine_dispatcher(...)` declaration — previously these declared a
+  function returning a `Task`-based `CoroutineConnectionHandler`/`CoroutineDatagramHandler`
   unconditionally, which meant *declaring* the coroutine-only half of
   the API leaked into a coroutine-free build even where nothing called
   it.
@@ -163,7 +181,7 @@ full test suite.
   exist just to name three plain structs. `websocket/send.hpp` (entirely
   a coroutine `Task`-returning free function) is now `#ifdef`'d in full.
 - Each protocol's `CMakeLists.txt` now excludes its coroutine-only
-  `dispatcher.cpp` from the source list when `SPAZNET_ENABLE_COROUTINES`
+  `dispatcher_coroutine.cpp` from the source list when `SPAZNET_ENABLE_COROUTINES`
   is `OFF` (`example/http`, `example/http2`, `example/http-websocket`,
   `example/udp`) — these files have no non-coroutine content at all
   (unlike `example/quic-http3/src/http3/service.cpp`, which is `#ifdef`'d
@@ -220,7 +238,7 @@ progress note" in the reactor-port plan). Resolves the threading gap the
   `PlatformIO::wait()`, so affinity reduces to "the `run()` thread," not
   sharding across independent loops.
 - `example/http/tests/performance/bench_thread_modes.cpp` now runs its
-  HTTP matrix against both `make_dispatcher` (coroutine) and
+  HTTP matrix against both `make_coroutine_dispatcher` (coroutine) and
   `make_reactor_dispatcher` (reactor) at every thread count, reporting
   both as interleaved rows in the same table for direct comparison.
 - New unit tests in `tests/unit/test_reactor_primitives.cpp` covering
@@ -295,7 +313,7 @@ earlier milestones.
   handler used it for anything but the connection the request already
   arrived on, and keeping it would let a handler race the frame loop's
   own writes.
-- The coroutine dispatcher (`example/http2/src/dispatcher.cpp`) now calls
+- The coroutine dispatcher (`example/http2/src/dispatcher_coroutine.cpp`) now calls
   `handle_request()` as a plain synchronous call and `co_await`s a small
   `AwaitResponseReady` awaiter — same pattern HTTP/1.1's dispatcher
   already uses.
@@ -307,8 +325,8 @@ earlier milestones.
 
 ### Added
 - `spaznet::http2::make_reactor_dispatcher(std::unique_ptr<Handler>) ->
-  ConnectionFactory` (`example/http2/src/dispatcher_reactor.cpp`) — same
-  wire protocol as `make_dispatcher` (preface, SETTINGS, multiplexed
+  ReactorConnectionFactory` (`example/http2/src/dispatcher_reactor.cpp`) — same
+  wire protocol as `make_coroutine_dispatcher` (preface, SETTINGS, multiplexed
   streams, HPACK, flow control, PING, GOAWAY, RST_STREAM), same
   `codec.cpp` unchanged, built on an `Http2Connection` state machine
   (`Preface` / `FrameHeader` / `FramePayload`) driven by
@@ -343,7 +361,7 @@ earlier milestones.
   `AwaitResponseReady::await_suspend`, found while wiring up the same
   `ResponseWriter`-based `handle_request()` there: it only captured the
   bare coroutine handle, not a reference keeping the coroutine frame
-  alive, and `dispatch_request` (unlike HTTP/1.1's `serve_keep_alive`)
+  alive, and `dispatch_request` (unlike HTTP/1.1's `serve_coroutine_keep_alive`)
   has no caller of its own holding it alive across suspension. Fixed the
   same way `TimerAwaiter` already does: wrap the handle in a
   `std::shared_ptr<Task>` captured by the completion callback.
@@ -368,7 +386,7 @@ synchronous handler interface rather than changing the existing one.
 ### Added
 - `spaznet::websocket::reactor::Handler` / `Connection`
   (`example/http-websocket/include/libspaznet/websocket/reactor_handler.hpp`)
-  — the coroutine-free counterpart of `websocket::Handler`/`Connection`.
+  — the coroutine-free counterpart of `websocket::coroutine::Handler`/`Connection`.
   `Connection::send()` writes a `Frame` (handler.cpp's `Frame::serialize()`,
   unchanged) straight into the target's `BufferedConnection::OutputBuffer` —
   no suspension possible or needed, so there's no `WriteGate` equivalent on
@@ -376,9 +394,9 @@ synchronous handler interface rather than changing the existing one.
   `weak_ptr` + fd + `IOContext*`), so a handler can stash one for later
   (e.g. a broadcast) without risking a dangling pointer.
 - `spaznet::websocket::make_reactor_dispatcher(std::unique_ptr<HTTPHandler>,
-  std::unique_ptr<reactor::Handler>) -> ConnectionFactory`
+  std::unique_ptr<reactor::Handler>) -> ReactorConnectionFactory`
   (`example/http-websocket/src/dispatcher_reactor.cpp`) — same
-  upgrade-sniffing rules and on-the-wire framing as `make_dispatcher`, built
+  upgrade-sniffing rules and on-the-wire framing as `make_coroutine_dispatcher`, built
   on a `WsConnection` state machine (`Sniffing` / `ReadingHeader` /
   `ReadingPayload`) instead of a suspended coroutine frame. Falls through to
   `http::attach_reactor_dispatcher` (new, see below) for the non-WS-upgrade
@@ -386,13 +404,13 @@ synchronous handler interface rather than changing the existing one.
 - `spaznet::http::attach_reactor_dispatcher(ctx, conn, handler,
   initial_buffer, on_closed)`
   (`example/http/include/libspaznet/http/dispatcher.hpp`) — the reactor-side
-  counterpart of the already-public `http::serve_keep_alive`: attaches the
+  counterpart of the already-public `http::serve_coroutine_keep_alive`: attaches the
   HTTP/1.1 reactor loop to an already-constructed `BufferedConnection`,
   seeded with bytes a caller already peeked at. `make_reactor_dispatcher`
   now calls this internally; behavior is unchanged.
 - `example/http-websocket/src/handshake.hpp`/`.cpp` — RFC 6455 §4.2
   handshake parsing and `Sec-WebSocket-Accept` computation, extracted
-  verbatim out of `dispatcher.cpp`'s anonymous namespace so both dispatchers
+  verbatim out of `dispatcher_coroutine.cpp`'s anonymous namespace so both dispatchers
   share one implementation instead of risking drift.
 - `ws_echo --reactor` / `ws_chat --reactor` — opt-in CLI flag on both demos.
   `ws_chat --reactor`'s `ChatRoomReactor` is notably simpler than the
@@ -433,17 +451,17 @@ entry point.
   implementation (`echo`, `relay`, `statsd`, the test harness) already ran
   to completion synchronously with no `co_await`, so this is a signature
   change with no behavioral change. The coroutine dispatcher
-  (`example/udp/src/dispatcher.cpp`) now calls the synchronous method and
+  (`example/udp/src/dispatcher_coroutine.cpp`) now calls the synchronous method and
   `co_return`s immediately afterward. See `docs/migration.md`.
 
 ### Added
 - `spaznet::udp::make_reactor_dispatcher(std::unique_ptr<Handler>) ->
-  SyncDatagramHandler` (`example/udp/src/dispatcher_reactor.cpp`) — calls
+  ReactorSyncDatagramHandler` (`example/udp/src/dispatcher_reactor.cpp`) — calls
   `handle_packet` directly, no `Task` involved. Install via
-  `Server::set_sync_datagram_handler()`.
+  `Server::set_reactor_sync_datagram_handler()`.
 - `spaznet::http3::make_reactor_dispatcher(std::unique_ptr<QuicHttp3Service>)
-  -> SyncDatagramHandler` (`example/quic-http3/src/http3/service.cpp`) —
-  the coroutine-free counterpart of `make_dispatcher`. `make_dispatcher`'s
+  -> ReactorSyncDatagramHandler` (`example/quic-http3/src/http3/service.cpp`) —
+  the coroutine-free counterpart of `make_coroutine_dispatcher`. `make_coroutine_dispatcher`'s
   `Task` never actually suspends (the whole QUIC/HTTP3 transport underneath
   is already a synchronous pump), so this is a mechanical swap: both now
   share a `dispatch_one()` helper, one wrapped in a no-op-suspend `Task`,
@@ -471,17 +489,17 @@ parameterizations rather than only covering the coroutine path.
 
 Sixth milestone of the reactor port (see the "Milestone http1-reactor
 progress note" in the reactor-port plan). `example/http` gains a second,
-coroutine-free dispatcher that plugs into `Server::set_connection_factory`
+coroutine-free dispatcher that plugs into `Server::set_reactor_connection_factory`
 from Milestone 5, speaking the exact same HTTP/1.1 protocol against the
 exact same `HTTPHandler`/`HTTPParser`/`HTTPRequest`/`HTTPResponse` as the
 existing coroutine dispatcher — unchanged, not forked. Non-breaking:
-`make_dispatcher`/`serve_keep_alive` and every existing caller are
+`make_coroutine_dispatcher`/`serve_coroutine_keep_alive` and every existing caller are
 untouched.
 
 ### Added
-- `spaznet::http::make_reactor_dispatcher(std::unique_ptr<HTTPHandler>) -> ConnectionFactory`
+- `spaznet::http::make_reactor_dispatcher(std::unique_ptr<HTTPHandler>) -> ReactorConnectionFactory`
   (`example/http/src/dispatcher_reactor.cpp`) — the reactor counterpart of
-  `make_dispatcher`. Internally, `Http1Connection` is a small phase state
+  `make_coroutine_dispatcher`. Internally, `Http1Connection` is a small phase state
   machine (`ReadingRequest` / `Dispatching`) built on `BufferedConnection`;
   handles keep-alive, pipelining (answered in place, without recursion —
   see the plan note), chunked responses, and the 400-Bad-Request/parse-error
@@ -519,27 +537,27 @@ Verified under both `-DSPAZNET_ENABLE_COROUTINES=ON` (full suite, 13
 ctest targets, `HttpIntegrationTests` now covering 66 tests) and `=OFF`
 (core `UnitTests`, including the new `close_after_flush()` coverage).
 
-## 2026-08-12 — reactor entry points on Server (ConnectionFactory, sync UDP, destroy-based shutdown)
+## 2026-08-12 — reactor entry points on Server (ReactorConnectionFactory, sync UDP, destroy-based shutdown)
 
 Fifth milestone of the reactor port (see the "Milestone 5 progress note"
 in the reactor-port plan for full design rationale). `Server` gains a
 coroutine-free way to accept TCP connections and receive UDP datagrams,
 alongside — not instead of — its existing `Task`-based API. Non-breaking:
-nothing changes for existing `set_connection_handler`/`set_datagram_handler`
+nothing changes for existing `set_coroutine_connection_handler`/`set_coroutine_datagram_handler`
 users.
 
 ### Added
-- `Server::set_connection_factory(ConnectionFactory)` —
-  `ConnectionFactory = std::function<std::shared_ptr<IoHandler>(int fd, IOContext&, std::function<void()> on_closed)>`.
-  Takes precedence over `set_connection_handler` for newly accepted
+- `Server::set_reactor_connection_factory(ReactorConnectionFactory)` —
+  `ReactorConnectionFactory = std::function<std::shared_ptr<IoHandler>(int fd, IOContext&, std::function<void()> on_closed)>`.
+  Takes precedence over `set_coroutine_connection_handler` for newly accepted
   connections. The factory mints whatever `IoHandler` drives the
   connection (typically a `BufferedConnection`) and must arrange for
   `on_closed` to fire exactly once when it's done; returning `nullptr`
   declines the connection (`Server` closes the fd itself in that case).
-- `Server::set_sync_datagram_handler(SyncDatagramHandler)` —
-  `SyncDatagramHandler = std::function<void(Datagram)>`, called as a
+- `Server::set_reactor_sync_datagram_handler(ReactorSyncDatagramHandler)` —
+  `ReactorSyncDatagramHandler = std::function<void(Datagram)>`, called as a
   plain function with no coroutine involved. Takes precedence over
-  `set_datagram_handler` for datagrams received afterward.
+  `set_coroutine_datagram_handler` for datagrams received afterward.
 - `IoHandler::shutdown()` — new virtual hook (default no-op) letting
   callers holding a `shared_ptr<IoHandler>` tear it down generically.
   `BufferedConnection::shutdown()` overrides it to call `close()`.
@@ -551,9 +569,9 @@ users.
   connections, which have no equivalent buffer).
 - `tests/integration/test_server_reactor.cpp` — core-level,
   protocol-agnostic coverage of the above: an echoing
-  `ConnectionFactory` end to end over a real socket,
+  `ReactorConnectionFactory` end to end over a real socket,
   `active_connections` tracking, `stop()` tearing down a live reactor
-  connection within its bounded deadline, a `SyncDatagramHandler`
+  connection within its bounded deadline, a `ReactorSyncDatagramHandler`
   round trip, and a declined-connection fd-leak check.
   `BufferedConnectionTest.BytesBufferedStat*` unit tests cover the new
   gauge.
@@ -595,7 +613,7 @@ this same treatment alongside its own reactor-dispatcher milestone.
   `Task`, no `co_await`, no `Socket&`. All demos (`http_hello`,
   `http_showcase`, `ws_echo`'s/`ws_chat`'s HTTP fallback) and tests
   updated. See `docs/http.md` for the new contract.
-- `example/http/src/dispatcher.cpp`'s `serve_keep_alive` (still a
+- `example/http/src/dispatcher_coroutine.cpp`'s `serve_coroutine_keep_alive` (still a
   coroutine itself — its own reactor dispatcher is a later milestone)
   now calls `handle_request()` synchronously and only suspends
   (`co_await`s a small internal `AwaitResponseReady` bridge) if the
@@ -658,22 +676,22 @@ Across `a7fab2d`, `aefbd64`, `e8f372f`, `d812849`, `63da693`,
 `05f818f`, `2253437`.
 
 ### Added
-- `Server::set_connection_handler(std::function<Task(Socket)>)` and
-  `Server::set_datagram_handler(std::function<Task(Datagram)>)` —
+- `Server::set_coroutine_connection_handler(std::function<Task(Socket)>)` and
+  `Server::set_coroutine_datagram_handler(std::function<Task(Datagram)>)` —
   the low-level dispatch hooks every protocol example now plugs
   into.
 - `spaznet::Datagram` struct (data + peer addr + raw sockaddr +
   listen fd).
-- `spaznet::ConnectionHandler` / `spaznet::DatagramHandler`
+- `spaznet::CoroutineConnectionHandler` / `spaznet::CoroutineDatagramHandler`
   typedefs.
 - `spaznet::codec::huffman_{encode,decode}` — shared RFC 7541 §B
   Huffman codec used by both HPACK (HTTP/2) and QPACK (HTTP/3).
 - `example/http/` — HTTP/1.1, `spaznet::http::` namespace.
-  `make_dispatcher(unique_ptr<HTTPHandler>) -> ConnectionHandler`.
+  `make_coroutine_dispatcher(unique_ptr<HTTPHandler>) -> CoroutineConnectionHandler`.
 - `example/http-websocket/` — combined HTTP/1.1 + WebSocket on the
   same port.  `spaznet::websocket::` namespace, names stripped of
   the `WebSocket` prefix (`Handler`, `Frame`, `Message`, `Opcode`).
-  `make_dispatcher(http_handler, ws_handler)`.
+  `make_coroutine_dispatcher(http_handler, ws_handler)`.
   `spaznet::websocket::send_message()` replaces the old
   `Socket::send_websocket_message` method.
 - `example/http2/` — HTTP/2 over h2c (RFC 9113 §3.4, prior-
@@ -683,14 +701,14 @@ Across `a7fab2d`, `aefbd64`, `e8f372f`, `d812849`, `63da693`,
   multiplexed streams, HPACK with proper RFC 7541 varints +
   Huffman decode, per-stream and connection-level flow control.
   Verified against `curl --http2-prior-knowledge`.
-- `example/udp/` — handler-interface idiom over `set_datagram_handler`.
+- `example/udp/` — handler-interface idiom over `set_coroutine_datagram_handler`.
   `spaznet::udp::Packet` carries `listen_fd` + raw `sockaddr_storage`
   so handlers `sendto()` directly.
 - `example/quic-http3/` — full QUIC v1 + HTTP/3 + QPACK stack moved
   out of core into its own library (`spaznet_quic_http3`).
   Namespaces `spaznet::quic::` + `spaznet::http3::` unchanged.
-  New `spaznet::http3::make_dispatcher(unique_ptr<QuicHttp3Service>)
-  -> DatagramHandler` for symmetry with the other examples.
+  New `spaznet::http3::make_coroutine_dispatcher(unique_ptr<QuicHttp3Service>)
+  -> CoroutineDatagramHandler` for symmetry with the other examples.
 - Working demos under `example/<protocol>/demo/`:
   `http_hello`, `ws_echo`, `http2_hello`, `udp_echo`.
 
@@ -698,8 +716,8 @@ Across `a7fab2d`, `aefbd64`, `e8f372f`, `d812849`, `63da693`,
 - `Server::set_http_handler`, `set_websocket_handler`,
   `set_http2_handler`, `set_udp_handler`,
   `set_quic_http3_service` — all gone.  Replace with the
-  per-protocol `make_dispatcher(...)` factory + the new
-  low-level `set_connection_handler` / `set_datagram_handler`.
+  per-protocol `make_coroutine_dispatcher(...)` factory + the new
+  low-level `set_coroutine_connection_handler` / `set_coroutine_datagram_handler`.
 - `Socket::send_websocket_message` method —
   `spaznet::websocket::send_message(socket, ...)` free function
   is the replacement.

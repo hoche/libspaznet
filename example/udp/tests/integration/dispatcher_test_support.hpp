@@ -1,8 +1,8 @@
 #pragma once
 
 // Shared helper for parameterizing UDP integration tests over both
-// dispatchers: the coroutine one (dispatcher.cpp, Server::set_datagram_handler)
-// and the reactor one (dispatcher_reactor.cpp, Server::set_sync_datagram_handler).
+// dispatchers: the coroutine one (dispatcher.cpp, Server::set_coroutine_datagram_handler)
+// and the reactor one (dispatcher_reactor.cpp, Server::set_reactor_sync_datagram_handler).
 // See example/http/tests/integration/dispatcher_test_support.hpp for the
 // pattern this mirrors.
 
@@ -24,11 +24,11 @@ enum class DispatcherKind { Coroutine, Reactor };
 inline void install_dispatcher(::spaznet::Server& server, std::unique_ptr<Handler> handler,
                                DispatcherKind kind) {
     if (kind == DispatcherKind::Reactor) {
-        server.set_sync_datagram_handler(make_reactor_dispatcher(std::move(handler)));
+        server.set_reactor_sync_datagram_handler(make_reactor_dispatcher(std::move(handler)));
         return;
     }
 #ifdef SPAZNET_HAS_COROUTINES
-    server.set_datagram_handler(make_dispatcher(std::move(handler)));
+    server.set_coroutine_datagram_handler(make_coroutine_dispatcher(std::move(handler)));
 #else
     (void)server;
     (void)handler;

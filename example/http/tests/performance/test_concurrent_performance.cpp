@@ -38,9 +38,9 @@ class ConcurrentPerformanceTest : public ::testing::Test {
     void SetUp() override {
         server = std::make_unique<Server>(8); // More threads for concurrency
 #ifdef SPAZNET_HAS_COROUTINES
-        server->set_connection_handler(spaznet::http::make_dispatcher(std::make_unique<ConcurrentPerformanceHandler>()));
+        server->set_coroutine_connection_handler(spaznet::http::make_coroutine_dispatcher(std::make_unique<ConcurrentPerformanceHandler>()));
 #else
-        server->set_connection_factory(
+        server->set_reactor_connection_factory(
             spaznet::http::make_reactor_dispatcher(std::make_unique<ConcurrentPerformanceHandler>()));
 #endif
         server->listen_tcp(9002);

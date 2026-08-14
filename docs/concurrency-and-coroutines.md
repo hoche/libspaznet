@@ -22,7 +22,7 @@ This document explains how `libspaznet` schedules work, how coroutines move betw
 > which is lambdas and callbacks by design and has no coroutine
 > dependency at all. `Server`/`Socket` still only speak the coroutine
 > runtime internally (see `CHANGELOG.md`'s Milestone 5 entry), though
-> `Server::set_connection_factory`/`set_sync_datagram_handler` let a
+> `Server::set_reactor_connection_factory`/`set_reactor_sync_datagram_handler` let a
 > reactor-side handler ride along without needing one. HTTP/1.1, HTTP/2,
 > UDP, QUIC/HTTP3, and WebSocket dispatchers now each have a
 > coroutine-free reactor counterpart (`make_reactor_dispatcher`, see

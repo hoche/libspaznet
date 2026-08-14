@@ -1,11 +1,11 @@
 # example/udp — handler-interface idiom over the core
-# Server::set_datagram_handler callback.  Tiny.
+# Server::set_coroutine_datagram_handler callback.  Tiny.
 
 set(SPAZNET_UDP_SOURCES
     src/dispatcher_reactor.cpp
 )
 if(SPAZNET_ENABLE_COROUTINES)
-    list(APPEND SPAZNET_UDP_SOURCES src/dispatcher.cpp)
+    list(APPEND SPAZNET_UDP_SOURCES src/dispatcher_coroutine.cpp)
 endif()
 add_library(spaznet_udp STATIC ${SPAZNET_UDP_SOURCES})
 add_library(spaznet::udp ALIAS spaznet_udp)

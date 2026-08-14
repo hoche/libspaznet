@@ -1,6 +1,6 @@
 # WebSocket — `example/http-websocket`
 
-`spaznet::websocket::Handler` is the entry point for RFC 6455
+`spaznet::websocket::coroutine::Handler` is the entry point for RFC 6455
 WebSocket connections.  The combined dispatcher in
 `example/http-websocket` sniffs the first request on each accepted
 connection and either runs the WS frame loop (if it's an upgrade) or
@@ -11,24 +11,23 @@ hands the buffer off to the HTTP/1.1 dispatcher from
 #include <libspaznet/http/handler.hpp>
 #include <libspaznet/server.hpp>
 #include <libspaznet/websocket/dispatcher.hpp>
+#include <libspaznet/websocket/coroutine_handler.hpp>
 #include <libspaznet/websocket/handler.hpp>
-#include <libspaznet/websocket/send.hpp>
 
-class EchoWS : public spaznet::websocket::Handler {
+class EchoWS : public spaznet::websocket::coroutine::Handler {
 public:
-    spaznet::Task on_open(spaznet::Socket&) override { co_return; }
-    spaznet::Task on_close(spaznet::Socket&) override { co_return; }
+    spaznet::Task on_open(spaznet::websocket::coroutine::Connection&) override {
+        co_return;
+    }
+    spaznet::Task on_close(spaznet::websocket::coroutine::Connection&) override {
+        co_return;
+    }
 
     // Take by rvalue so we can move the payload into the outgoing
     // frame without copying.
     spaznet::Task handle_message(spaznet::websocket::Message&& m,
-                                 spaznet::Socket& s) override {
-        co_await spaznet::websocket::send_message(s, m.opcode, m.data);
-    }
-
-    spaznet::Task handle_message(const spaznet::websocket::Message& m,
-                                 spaznet::Socket& s) override {
-        co_await spaznet::websocket::send_message(s, m.opcode, m.data);
+                                 spaznet::websocket::coroutine::Connection& conn) override {
+        co_await conn.send(m.opcode, m.data);
     }
 };
 
@@ -45,7 +44,7 @@ public:
 
 int main() {
     spaznet::Server server(4);
-    server.set_connection_handler(spaznet::websocket::make_dispatcher(
+    server.set_coroutine_connection_handler(spaznet::websocket::make_coroutine_dispatcher(
         std::make_unique<HttpFallback>(),
         std::make_unique<EchoWS>()));
     server.listen_tcp(8080);
@@ -70,12 +69,12 @@ the same handler class runs under either dispatcher — WebSocket's two
 runtimes have genuinely different `Handler` interfaces, because sending
 a frame is a real suspension point on the coroutine side:
 
-- **`make_dispatcher(...)`** (above) — coroutine-based, registered via
-  `Server::set_connection_handler`. Handlers implement
-  `spaznet::websocket::Handler` (`handler.hpp`); `Connection::send()`
+- **`make_coroutine_dispatcher(...)`** (above) — coroutine-based, registered via
+  `Server::set_coroutine_connection_handler`. Handlers implement
+  `spaznet::websocket::coroutine::Handler` (`coroutine_handler.hpp`); `Connection::send()`
   `co_await`s the socket write behind a per-connection `WriteGate`.
 - **`make_reactor_dispatcher(...)`** — coroutine-free, registered via
-  `Server::set_connection_factory`. Handlers implement
+  `Server::set_reactor_connection_factory`. Handlers implement
   `spaznet::websocket::reactor::Handler` (`reactor_handler.hpp`);
   `Connection::send()` writes straight into the target connection's
   `OutputBuffer` — nothing to suspend on, so no `WriteGate` either.
@@ -94,7 +93,7 @@ public:
     }
 };
 
-server.set_connection_factory(spaznet::websocket::make_reactor_dispatcher(
+server.set_reactor_connection_factory(spaznet::websocket::make_reactor_dispatcher(
     std::make_unique<HttpFallback>(), std::make_unique<EchoWSReactor>()));
 ```
 
@@ -316,4 +315,4 @@ handler; the dispatcher will tear down the connection after.
   through the same dispatcher)
 - [threading.md](threading.md) — `Server(N)` thread count tuning
 - [migration.md](migration.md) — names changed in the restructure
-  (`spaznet::WebSocketHandler` → `spaznet::websocket::Handler`, etc.)
+  (`spaznet::WebSocketHandler` → `spaznet::websocket::coroutine::Handler`, etc.)

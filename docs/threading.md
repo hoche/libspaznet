@@ -142,7 +142,7 @@ instances on different ports and pin each via the OS (`taskset`,
 ![Reactor multi-loop layout](svgs/threading-reactor-loops.svg)
 
 Everything above about workers describes the coroutine dispatchers
-(`make_dispatcher(...)`). The coroutine-free reactor counterparts
+(`make_coroutine_dispatcher(...)`). The coroutine-free reactor counterparts
 (`make_reactor_dispatcher(...)`, see `docs/http.md` / `docs/websocket.md`)
 keep connection state (`Http1Connection`, `Http2Connection`,
 `WsConnection`, ...) as ordinary member data, not a coroutine frame, so
@@ -161,7 +161,7 @@ multiple loops — not workers:
 
 ```cpp
 Server server(ServerConfig{.loops = 4, .workers_per_loop = 0});
-server.set_connection_factory(http::make_reactor_dispatcher(...));
+server.set_reactor_connection_factory(http::make_reactor_dispatcher(...));
 ```
 
 TCP accept stays on loop 0 and round-robins client fds onto the loops
